@@ -1330,7 +1330,10 @@ public def Module.declDepsFacetConfig : ModuleFacetConfig declDepsFacet :=
     impsJob.mapM fun imps => do
       newTrace s!"{mod.name.toString}:declDeps"
       let out := mod.pkg.lakeDir / "decldeps" / s!"{mod.name}.json"
-      let deps := imps.map fun m => (m.name, m.oleanFile)
+      -- only modules of the same package: the producers a scheduler can still be waiting for
+      -- (dependency packages are built before the package's first module starts)
+      let deps := imps.filterMap fun m =>
+        if m.pkg.keyName == mod.pkg.keyName then some (m.name, m.oleanFile) else none
       let j ← DeclDeps.compute mod.name olean ilean deps input.trace.hash.toString
       createParentDirs out
       IO.FS.writeFile out j.compress
