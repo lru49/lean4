@@ -1332,7 +1332,11 @@ blocking on realizations, which should always be brought into scope by running `
 does its own, optimized existence check.
 -/
 def contains (env : Environment) (n : Name) (skipRealize := true) : Bool :=
-  env.findAsync? (skipRealize := skipRealize) n |>.isSome
+  -- `findAsync?` without materializing its result: an imported hit is answered by the scalar
+  -- (module-index) variant of the cached lookup, with no reference counting and no
+  -- `AsyncConstantInfo` allocation
+  (env.base.get env |>.constants.map₁.findConstModIdxCached? n).isSome ||
+    (env.findAsyncCore? n (skipRealize := skipRealize)).isSome
 
 /--
 Checks whether the given declaration is known on the current branch, in which case `findAsync?` will
