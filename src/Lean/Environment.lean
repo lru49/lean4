@@ -2490,8 +2490,17 @@ private abbrev ExtTask := Task (Except IO.Error (EnvExtensionState × Nat × Nat
 private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options)
     (par : Bool := false) : IO Environment := do
   let tasks ← if par then spawnTasks env 0 #[] else pure #[]
+  joinAndMark tasks
   loop 0 env tasks
 where
+  /-- lean-perf (L02 crash fix v2 B): waits for every state task and then marks the states persistent on the
+  import thread, serially, while no task runs (the only safe moment for a plain `rc := 0` over objects that
+  other threads may share); the final `markPersistent` of the environment then skips them as before. -/
+  joinAndMark (tasks : Array (Option ExtTask)) : IO Unit := do
+    for t? in tasks do
+      if let some t := t? then
+        let (st, _, _) ← IO.ofExcept t.get
+        discard <| unsafe (ParallelImport.markPersistentSeq st : BaseIO EnvExtensionState)
   /-- lean-perf: spawns the `addImportedFn` of every extension with index `≥ start` that is registered
   in `parallelImportExtsRef` on the current environment: such a function is pure in its imported
   entries, so it does not observe which other extension states are already finalized. Called at the
@@ -2519,8 +2528,8 @@ where
         let t ← IO.asTask (prio := prio) (do
           let ta ← IO.monoNanosNow
           let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
-          -- `par` implies `leakEnv`: the state ends up persistent anyway, do it on the task's thread
-          let st : EnvExtensionState ← unsafe (ParallelImport.markPersistentSeq st : BaseIO EnvExtensionState)
+          -- lean-perf (L02 crash fix v2 B): NOT marked persistent here (the state shares objects with other
+          -- tasks and the import thread; a plain `rc := 0` races with their reference counting); see `joinAndMark`
           let tb ← IO.monoNanosNow
           pure (st, ta, tb) : IO (EnvExtensionState × Nat × Nat))
         tasks := if i < tasks.size then tasks.set! i (some t) else tasks.push (some t)
@@ -2578,10 +2587,12 @@ where
         -- lean-perf: the new extensions now have their imported entries
         if par then
           tasks ← spawnTasks env prevSize tasks
+          joinAndMark tasks
       if par && extDescr.name == `Lean.regularInitAttr then
         -- lean-perf (L05): the `[init]` declarations have run; the environment's constants and IR are
         -- final, so the after-init extensions (all indices after this one) may be evaluated on tasks
         tasks ← spawnTasks env (i + 1) tasks (afterInit := true)
+        joinAndMark tasks
       loop (i + 1) env tasks
     else
       return env
