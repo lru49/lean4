@@ -673,13 +673,20 @@ where
         else
           let e := if f == f' then e else e.updateFn f'
           unless cfg.iota do return e
-          match (← reduceMatcher? e) with
+          -- `f'` is the head of `e` (`whnfCore` never returns an application or `mdata`), so
+          -- when it is a constant without matcher info `reduceMatcher? e` is `.notMatcher`;
+          -- skipping the call saves its spine walk and matcher lookup on every application step
+          let env ← getEnv
+          let matcherRes ← match f' with
+            | .const n _ => if (getMatcherInfoCore? env n).isNone then pure .notMatcher else reduceMatcher? e
+            | _ => reduceMatcher? e
+          match matcherRes with
           | .reduced eNew => go eNew
           | .partialApp   => pure e
           | .stuck _      => pure e
           | .notMatcher   =>
             let .const cname lvls := f'.getAppFn | return e
-            let some cinfo := (← getEnv).find? cname | return e
+            let some cinfo := env.find? cname | return e
             match cinfo with
             | .recInfo rec    => reduceRec rec lvls e.getAppArgs (fun _ => return e) (fun e => do recordUnfold cinfo.name; go e)
             | .quotInfo rec   => reduceQuotRec rec e.getAppArgs (fun _ => return e) (fun e => do recordUnfold cinfo.name; go e)
