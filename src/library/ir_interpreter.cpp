@@ -32,6 +32,10 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <shared_mutex>
 #include <deque>
 #include <utility>
+#include <cstdlib>
+#include <cstring>
+#include <new>
+#include <type_traits>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #include <psapi.h>
@@ -536,6 +540,46 @@ void * lookup_symbol_in_cur_exe(char const * sym) {
 #endif
 }
 
+/** \brief Growable stack of trivially copyable slots for the interpreter's variable and join-point stacks.
+    The interface is the subset of `std::vector` the interpreter uses, with the same element semantics: `resize`
+    value-initializes new elements exactly like `std::vector::resize` (a no-op for `value`, whose default constructor
+    is empty; null for pointers), references are invalidated only by growth. `push_back` and `resize` are inline, and
+    shrinking (every frame pop) and growing within the capacity (almost every call) are a size update. */
+template<class T> class interp_stack {
+    static_assert(std::is_trivially_copyable<T>::value && std::is_trivially_destructible<T>::value, "interp_stack");
+    T *    m_data = nullptr;
+    size_t m_size = 0;
+    size_t m_cap  = 0;
+    void grow(size_t n) {
+        size_t cap = m_cap ? m_cap : 16;
+        while (cap < n) cap *= 2;
+        T * d = static_cast<T *>(std::malloc(cap * sizeof(T)));
+        if (!d) throw std::bad_alloc();
+        if (m_size) std::memcpy(static_cast<void *>(d), static_cast<void const *>(m_data), m_size * sizeof(T));
+        std::free(m_data);
+        m_data = d; m_cap = cap;
+    }
+public:
+    interp_stack() {}
+    interp_stack(interp_stack const &) = delete;
+    interp_stack & operator=(interp_stack const &) = delete;
+    ~interp_stack() { std::free(m_data); }
+    size_t size() const { return m_size; }
+    T & operator[](size_t i) { return m_data[i]; }
+    T const & operator[](size_t i) const { return m_data[i]; }
+    void push_back(T const & v) {
+        if (LEAN_UNLIKELY(m_size == m_cap)) { T tmp = v; grow(m_size + 1); m_data[m_size++] = tmp; return; }
+        m_data[m_size++] = v;
+    }
+    void resize(size_t n) {
+        if (n > m_size) {
+            if (LEAN_UNLIKELY(n > m_cap)) grow(n);
+            for (size_t i = m_size; i < n; i++) new (&m_data[i]) T();
+        }
+        m_size = n;
+    }
+};
+
 class interpreter;
 LEAN_THREAD_PTR(interpreter, g_interpreter);
 
@@ -709,9 +753,9 @@ public:
 
 class interpreter {
     // stack of IR variable slots
-    std::vector<value> m_arg_stack;
+    interp_stack<value> m_arg_stack;
     // stack of join points
-    std::vector<fn_body const *> m_jp_stack;
+    interp_stack<fn_body const *> m_jp_stack;
     struct frame {
         name m_fn;
         // base pointers into the stack above
