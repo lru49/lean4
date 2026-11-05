@@ -847,6 +847,31 @@ private:
        });
     }
 
+    /** \brief `false` if the compiler cannot have emitted a `_boxed` variant of `d`, mirroring
+        `Lean.Compiler.LCNF.requiresBoxedVersion` conservatively: an IR function whose parameters and result
+        are all non-scalar, owned (not borrowed) and non-void and which has at most `LEAN_CLOSURE_MAX_ARGS`
+        parameters needs no boxed wrapper. For such a function, calling the unboxed symbol directly is
+        exactly what the boxed wrapper would do, so skipping the probe is correct even if a wrapper exists;
+        what it saves is a failing `dlsym` (glibc formats an error message on every miss), the dominant
+        cost of first-time symbol resolution for the thousands of functions an import touches. */
+    static bool may_have_boxed_version(decl const & d) {
+        if (decl_tag(d) != decl_kind::Fun)
+            return true;
+        array_ref<param> const & ps = decl_params(d);
+        if (ps.size() > LEAN_CLOSURE_MAX_ARGS)
+            return true;
+        if (ps.size() == 0)
+            return false;
+        if (type_is_scalar(decl_type(d)) || decl_type(d) == type::Void)
+            return true;
+        for (param const & p : ps) {
+            type t = param_type(p);
+            if (type_is_scalar(t) || t == type::Void || param_borrow(p))
+                return true;
+        }
+        return false;
+    }
+
     /** \brief Return cached lookup result for given unmangled function name in the current binary. */
     const symbol_cache_entry& lookup_symbol(name const & fn) {
         auto e = m_symbol_cache.find(fn);
@@ -868,9 +893,13 @@ private:
         // the expensive part), then publish
         if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
             string_ref mangled = get_symbol_stem(m_env, fn);
-            string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
-            // check for boxed version first
-            if (void *p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data())) {
+            void * p_boxed = nullptr;
+            // check for boxed version first (only if the compiler may have emitted one)
+            if (may_have_boxed_version(e_new.m_decl)) {
+                string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
+                p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data());
+            }
+            if (p_boxed) {
                 e_new.m_native.m_addr = p_boxed;
                 e_new.m_native.m_boxed = true;
             } else {
