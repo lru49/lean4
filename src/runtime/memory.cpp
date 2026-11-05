@@ -111,7 +111,7 @@ size_t get_current_rss() {
 #endif
 
 namespace lean {
-static size_t g_max_memory = 0;
+size_t g_max_memory = 0;
 LEAN_THREAD_VALUE(size_t, g_counter, 0);
 
 extern "C" LEAN_EXPORT lean_obj_res lean_internal_get_default_max_memory() {

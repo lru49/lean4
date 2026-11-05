@@ -27,6 +27,7 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 `call/lookup_symbol` below.
 
 */
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <shared_mutex>
@@ -52,6 +53,8 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include "runtime/flet.h"
 #include "runtime/apply.h"
 #include "runtime/interrupt.h"
+#include "runtime/stackinfo.h"
+#include "runtime/memory.h"
 #include "runtime/io.h"
 #include "runtime/option_ref.h"
 #include "runtime/array_ref.h"
@@ -783,6 +786,9 @@ class interpreter {
     };
     // caches symbol lookup successes _and_ failures
     name_table<symbol_cache_entry> m_symbol_cache;
+    // `check_system` fast path: frame addresses at or above this are far enough from this thread's stack threshold
+    // that `lean::check_stack` cannot throw (an instance is only ever used on the thread that created it)
+    size_t m_stack_fast_limit;
 
     /** \brief Get current stack frame */
     inline frame & get_frame() {
@@ -1004,6 +1010,14 @@ private:
     }
 
     void check_system() {
+#if defined(__GNUC__) || defined(__clang__)
+        // Fast path for the common case, without the out-of-line `lean::check_system` -> `check_stack` (thread-local
+        // reads) -> `check_memory` calls: the stack is far from the threshold (a 4 KiB margin covers the few frames
+        // between this frame and `check_stack`'s, so near the threshold the exact check below decides as before) and
+        // no memory limit is set (`check_memory` returns at once).
+        if (LEAN_LIKELY(reinterpret_cast<size_t>(__builtin_frame_address(0)) >= m_stack_fast_limit && !memory_check_enabled()))
+            return;
+#endif
         try {
             lean::check_system("interpreter");
         } catch (stack_space_exception & ex) {
@@ -1485,6 +1499,8 @@ private:
 public:
     explicit interpreter(elab_environment const & env, options const & opts) : m_env(env), m_opts(opts) {
         m_prefer_native = opts.get_bool(*g_interpreter_prefer_native, LEAN_DEFAULT_INTERPRETER_PREFER_NATIVE);
+        size_t threshold = get_stack_threshold();
+        m_stack_fast_limit = threshold > SIZE_MAX - 4096 ? SIZE_MAX : threshold + 4096;
     }
 
     interpreter(interpreter const &) = delete;
