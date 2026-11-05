@@ -2421,11 +2421,6 @@ def envNat? (var : String) : BaseIO (Option Nat) := do
 def envEnabled (var : String) : BaseIO Bool := do
   return (← envNat? var).getD 1 != 0
 
-/-- `Runtime.markPersistent` with the single-threaded walk; used inside tasks so that their results
-are neither marked MT on completion nor walked again by the environment's final `markPersistent`. -/
-@[extern "lean_runtime_mark_persistent_seq"]
-unsafe def markPersistentSeq (a : α) : BaseIO α := return a
-
 def debugEnabled : BaseIO Bool := do
   return (← envNat? "LEAN_IMPORT_DEBUG").getD 0 != 0
 
@@ -2489,8 +2484,14 @@ where
         let t ← IO.asTask (prio := .default) (do
           let ta ← IO.monoNanosNow
           let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
-          -- `par` implies `leakEnv`: the state ends up persistent anyway, do it on the task's thread
-          let st : EnvExtensionState ← unsafe (ParallelImport.markPersistentSeq st : BaseIO EnvExtensionState)
+          -- The state is NOT marked persistent here: the task's result graph is not private to the task
+          -- (it shares the extension's initial state and other interpreted constants with the other
+          -- tasks and with the import thread, e.g. `Aesop.BaseRuleSet.empty` as the state of every empty
+          -- Aesop rule set), and `markPersistent`'s plain `rc := 0` races with the atomic reference-count
+          -- updates of those threads (lean-perf L02-interp-symtab-crash: reference count corrupted,
+          -- object freed while in use). The task manager marks the result multi-threaded on completion,
+          -- and the environment's final `markPersistent` (parallel) covers the states with every other
+          -- thread idle, exactly as upstream does.
           let tb ← IO.monoNanosNow
           pure (st, ta, tb) : IO (EnvExtensionState × Nat × Nat))
         tasks := tasks.push (some t)
