@@ -29,6 +29,7 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 #include "util/io.h"
 #include "util/name_map.h"
 #include "library/module.h"
+#include "library/native_cache.h"
 #include "library/constants.h"
 #include "library/time_task.h"
 #include "library/util.h"
@@ -476,6 +477,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             return io_result_mk_error((sstream() << "failed to stat file '" << olean_fn << "': " << strerror(errno)).str());
         }
         size_t size = st.st_size;
+        native_cache_note_olean(olean_fn, st);
 
         olean_header default_header = {};
         olean_header header;

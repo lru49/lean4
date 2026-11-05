@@ -5,6 +5,7 @@ add_library(
   constants.cpp
   module.cpp
   dynlib.cpp
+  native_cache.cpp
   util.cpp
   print.cpp
   init_module.cpp
