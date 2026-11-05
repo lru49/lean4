@@ -807,7 +807,7 @@ theorem Pos.Raw.isValidForSlice_iff_exists_append {s : Slice} {p : Pos.Raw} :
   rw [← isValid_copy_iff, isValid_iff_exists_append]
 
 /-- Efficiently checks whether a position is at a UTF-8 character boundary of the slice `s`. -/
-@[expose]
+@[expose, inline]
 def Pos.Raw.isValidForSlice (s : Slice) (p : Pos.Raw) : Bool :=
   if h : p < s.rawEndPos then
     (s.getUTF8Byte p h).IsUTF8FirstByte
