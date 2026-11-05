@@ -536,6 +536,18 @@ public def collectDuplicates (trees : Array (Nat × ConstTrie α))
   if trees.size < 2 then #[]
   else collectDupsAux covered .anonymous trees #[]
 
+/--
+Forces the lazily merged root node, i.e. the grouping of all modules' root-level children by key
+(the largest single `foldChildGroups` of the import, ~65k children for a Mathlib import), and returns
+the root's child count. Every import pays this on its first lookup; `finalizeImport` forces it on a
+task while the main thread assembles the environment (lean-perf L04).
+-/
+public def forceRoot (t : ImportedConsts α) : Nat :=
+  match t.tree with
+  | .lazy _ _ cs   => cs.get.size
+  | .merged _ _ cs => cs.size
+  | .mod _ tr      => tr.children.size
+
 def mergeLazy (resolve : Array (α × Nat) → Option (α × Nat)) (key : Name)
     (cands : Array (Nat × ConstTrie α)) : ImportedTree α :=
   if cands.size == 1 then
