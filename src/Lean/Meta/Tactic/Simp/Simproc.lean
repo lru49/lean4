@@ -228,7 +228,8 @@ extra arguments recorded for each of them only makes sense for `e`. The simplifi
 candidates afresh when it revisits the rewritten expression.
 -/
 def simprocCore (post : Bool) (s : SimprocTree) (erased : PHashSet Name) (e : Expr) : SimpM Step := do
-  let candidates ← withSimpIndexConfig <| s.getMatchWithExtra e
+  -- lean-perf (cr): no retrieval (key computation) for an empty simproc tree
+  let candidates ← if s.root.isEmpty then pure #[] else withSimpIndexConfig <| s.getMatchWithExtra e
   if candidates.isEmpty then
     let tag := if post then "post" else "pre"
     trace[Debug.Meta.Tactic.simp] "no {tag}-simprocs found for {e}"
@@ -248,7 +249,8 @@ def simprocCore (post : Bool) (s : SimprocTree) (erased : PHashSet Name) (e : Ex
 
 /-- Similar to `simprocCore`, but for `DSimproc`s. -/
 def dsimprocCore (post : Bool) (s : SimprocTree) (erased : PHashSet Name) (e : Expr) : SimpM DStep := do
-  let candidates ← withSimpIndexConfig <| s.getMatchWithExtra e
+  -- lean-perf (cr): no retrieval (key computation) for an empty simproc tree
+  let candidates ← if s.root.isEmpty then pure #[] else withSimpIndexConfig <| s.getMatchWithExtra e
   if candidates.isEmpty then
     let tag := if post then "post" else "pre"
     trace[Debug.Meta.Tactic.simp] "no {tag}-simprocs found for {e}"
