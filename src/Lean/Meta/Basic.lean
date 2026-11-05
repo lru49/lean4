@@ -706,8 +706,8 @@ structure Context where
   cacheInferType : Bool := true
 deriving Inhabited
 
-def Context.config (c : Context) : Config := c.keyedConfig.config
-def Context.configKey (c : Context) : UInt64 := c.keyedConfig.key
+@[inline] def Context.config (c : Context) : Config := c.keyedConfig.config
+@[inline] def Context.configKey (c : Context) : UInt64 := c.keyedConfig.key
 
 /--
 The `MetaM` monad is a core component of Lean's metaprogramming framework, facilitating the
