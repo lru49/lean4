@@ -742,10 +742,15 @@ optional<expr> type_checker::unfold_definition(expr const & e) {
 expr mk_bool_true();
 expr mk_bool_false();
 
-static inline bool is_nat_lit_ext(expr const & e) { return e == *g_nat_zero || is_nat_lit(e); }
+/* `e == c` for one of the global `Nat` constants above. Structural equality implies equal hashes, so a hash
+   mismatch (the common case: any other head) is decided inline, without the out-of-line comparison. */
+static inline bool is_nat_const(expr const & e, expr const & c) {
+    return hash(e) == hash(c) && e == c;
+}
+static inline bool is_nat_lit_ext(expr const & e) { return is_nat_const(e, *g_nat_zero) || is_nat_lit(e); }
 static inline nat get_nat_val(expr const & e) {
     lean_assert(is_nat_lit_ext(e));
-    if (e == *g_nat_zero) return nat((unsigned)0);
+    if (is_nat_const(e, *g_nat_zero)) return nat((unsigned)0);
     return lit_value(e).get_nat();
 }
 
@@ -811,7 +816,7 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
     unsigned nargs = get_app_num_args(e);
     if (nargs == 1) {
         expr const & f = app_fn(e);
-        if (f == *g_nat_succ) {
+        if (is_nat_const(f, *g_nat_succ)) {
             expr arg = whnf(app_arg(e));
             if (!is_nat_lit_ext(arg)) return none_expr();
             nat v = get_nat_val(arg);
@@ -822,6 +827,14 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
     } else if (nargs == 2) {
         expr const & f = app_fn(app_fn(e));
         if (!is_constant(f)) return none_expr();
+        /* Hash prefilter: `f == c` implies `hash(f) == hash(c)`, so a head whose hash matches none of the binary
+           `Nat` operations below cannot be one of them (no out-of-line comparison per operation). */
+        unsigned h = hash(f);
+        if (h != hash(*g_nat_add) && h != hash(*g_nat_sub) && h != hash(*g_nat_mul) && h != hash(*g_nat_pow) &&
+            h != hash(*g_nat_gcd) && h != hash(*g_nat_mod) && h != hash(*g_nat_div) && h != hash(*g_nat_beq) &&
+            h != hash(*g_nat_ble) && h != hash(*g_nat_land) && h != hash(*g_nat_lor) && h != hash(*g_nat_xor) &&
+            h != hash(*g_nat_shiftLeft) && h != hash(*g_nat_shiftRight))
+            return none_expr();
         if (f == *g_nat_add) return reduce_bin_nat_op(nat_add, e, /* check_size */ true);
         if (f == *g_nat_sub) return reduce_bin_nat_op(nat_sub, e, /* check_size */ true);
         if (f == *g_nat_mul) return reduce_bin_nat_op(nat_mul, e, /* check_size */ true);
@@ -1179,7 +1192,7 @@ auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n) -> reductio
 }
 
 inline bool is_nat_zero(expr const & t) {
-    return t == *g_nat_zero || (is_nat_lit(t) && lit_value(t).is_zero());
+    return is_nat_const(t, *g_nat_zero) || (is_nat_lit(t) && lit_value(t).is_zero());
 }
 
 inline optional<expr> is_nat_succ(expr const & t) {
@@ -1190,7 +1203,7 @@ inline optional<expr> is_nat_succ(expr const & t) {
         }
     }
 
-    if (get_app_fn(t) == *g_nat_succ && get_app_num_args(t) == 1) {
+    if (is_nat_const(get_app_fn(t), *g_nat_succ) && get_app_num_args(t) == 1) {
         return some_expr(app_arg(t));
     }
     return none_expr();
