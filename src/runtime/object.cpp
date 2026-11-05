@@ -384,10 +384,10 @@ static object * lean_del_core_other(object * o, uint8 tag, object * todo) {
         object ** end = it + lean_array_size(o);
         if (end - it > (ptrdiff_t)ARRAY_DEL_DISTANCE) {
             for (object ** pf = it; pf != it + ARRAY_DEL_DISTANCE; ++pf)
-                if (!lean_is_scalar(*pf)) __builtin_prefetch(*pf, 1, 3);
+                if (!lean_is_scalar(*pf)) __builtin_prefetch(*pf, 0, 3);
             for (object ** stop = end - ARRAY_DEL_DISTANCE; it != stop; ++it) {
                 object * f = it[ARRAY_DEL_DISTANCE];
-                if (!lean_is_scalar(f)) __builtin_prefetch(f, 1, 3);
+                if (!lean_is_scalar(f)) __builtin_prefetch(f, 0, 3);
                 dec(*it, todo);
             }
         }
