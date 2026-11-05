@@ -2505,7 +2505,23 @@ private def getCachedResult (keyInfo : DefEqCacheKeyInfo) : MetaM LBool := do
   | some val => return val.toLBool
   | none => return .undef
 
-private def cacheResult (keyInfo : DefEqCacheKeyInfo) (result : Bool) : MetaM Unit := do
+/--
+`true` if the two metavariable contexts share their (pointer-equal) assignment tables. Then an expression
+fully instantiated with respect to `a` is also fully instantiated with respect to `b`: `instantiateMVars`
+reads only these tables.
+-/
+private unsafe def sameAssignmentsImpl (a b : MetavarContext) : Bool :=
+  ptrEq a.eAssignment b.eAssignment && ptrEq a.lAssignment b.lAssignment && ptrEq a.dAssignment b.dAssignment
+
+@[implemented_by sameAssignmentsImpl]
+private def sameAssignments (_ _ : MetavarContext) : Bool := false
+
+/--
+Store `result` for `keyInfo`. For a transient key, `keyMCtx?` is the metavariable context in which the
+sides of the key were instantiated (see `isExprDefEqAuxImpl`).
+-/
+private def cacheResult (keyInfo : DefEqCacheKeyInfo) (result : Bool) (keyMCtx? : Option MetavarContext) :
+    MetaM Unit := do
   let key := keyInfo.key
   match keyInfo.kind with
   | .permanent => modifyDefEqPermCache fun c => c.insert key result
@@ -2514,8 +2530,12 @@ private def cacheResult (keyInfo : DefEqCacheKeyInfo) (result : Bool) : MetaM Un
     We must ensure that all assigned metavariables in the key are replaced by their current assignments.
     Otherwise, the key is invalid after the assignment is "backtracked".
     See issue #1870 for an example.
+    If no assignment happened since the key was built (for example, a failed check whose state was restored),
+    the key is still fully instantiated: re-instantiating it would rebuild an equal key.
     -/
-    let key ← mkDefEqCacheKey (← instantiateMVars key.lhs) (← instantiateMVars key.rhs)
+    let mctx ← getMCtx
+    let key ← if keyMCtx?.any (sameAssignments · mctx) then pure key
+      else mkDefEqCacheKey (← instantiateMVars key.lhs) (← instantiateMVars key.rhs)
     modifyDefEqTransientCache fun c => c.insert key result
 
 private def whnfCoreAtDefEq (e : Expr) : MetaM Expr := do
@@ -2596,10 +2616,12 @@ partial def isExprDefEqAuxImpl (t : Expr) (s : Expr) : MetaM Bool := withIncRecD
       trace[Meta.isDefEq.cache] "cache hit 'false' for {t} =?= {s}"
       return false
     | .undef =>
+      -- only transient keys need the context (held only for them: it keeps the old tables alive)
+      let keyMCtx? ← if k.kind matches .transient then some <$> getMCtx else pure none
       let result ← isExprDefEqExpensive t s
       if numPostponed == (← getNumPostponed) then
         trace[Meta.isDefEq.cache] "cache {result} for {t} =?= {s}"
-        cacheResult k result
+        cacheResult k result keyMCtx?
       return result
 
 builtin_initialize
