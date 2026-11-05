@@ -527,10 +527,16 @@ struct deferred_owner_slot {
 struct deferred_batch {
     lean_object *                        m_todo;
     std::shared_ptr<deferred_owner_slot> m_owner;
+    // references to drop (`lean_dec_refs_deferred`): pointer array (nullptr/scalars skipped) and the block to free after
+    lean_object **                       m_refs = nullptr;
+    size_t                               m_nrefs = 0;
+    void                              (* m_free_fn)(void *) = nullptr;
+    void *                               m_block = nullptr;
 };
 
 static size_t                         g_defer_min = SIZE_MAX;  // SIZE_MAX = disabled
 static size_t                         g_defer_queue_max = 64;
+static size_t                         g_defer_min_refs = SIZE_MAX;  // `lean_dec_refs_deferred` below this runs inline
 static bool                           g_defer_stats = false;
 static std::mutex *                   g_defer_mutex = nullptr;
 static std::condition_variable *      g_defer_cv = nullptr;
@@ -670,11 +676,21 @@ static void defer_worker_main() {
         object * todo = b.m_todo;
         uint64_t n = 0, owned_st = 0;
         bool stopped = false;
-        while (todo != nullptr) {
+        size_t next_ref = 0;
+        while (true) {
+            if (todo == nullptr) {
+                // refs batch: drop the next reference (each one is handled like a field of a dying object)
+                while (todo == nullptr && next_ref < b.m_nrefs) {
+                    lean_object * r = b.m_refs[next_ref++];
+                    if (r != nullptr) defer_dec(r, todo, tally, owned_st);
+                }
+                if (todo == nullptr) break;
+            }
             object * o = pop_back(todo);
             todo = defer_del_core(o, todo, tally, owned_st);
             if ((++n & 4095) == 0 && g_defer_stop.load(std::memory_order_relaxed)) { stopped = true; break; }
         }
+        if (!stopped && b.m_free_fn != nullptr) b.m_free_fn(b.m_block);
         if (!stopped) defer_return_to_owner(b.m_owner, tally);
         else tally.for_each_and_clear([](lean_object *, size_t) {});
         b.m_owner.reset();
@@ -747,27 +763,50 @@ extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {
     lean_deferred_free_drain();
 }
 
-/* Called by `lean_dec_ref_cold` after `g_defer_min` objects of one cascade. Returns false when the caller must
-   continue inline with `todo` unchanged; on true, `todo` holds what the caller must still free itself (the
-   owner-only objects of the worklist, usually none). */
-__attribute__((noinline)) static bool defer_handoff(object * & todo) {
+/* Common part of the two entry points: the caller holds `g_defer_mutex`; false = refused. */
+static bool defer_prepare(std::unique_lock<std::mutex> & lock) {
     if (g_defer_draining) return false;
     lean_deferred_free_drain();
     if (g_defer_slot == nullptr) {
         g_defer_slot = new std::shared_ptr<deferred_owner_slot>(std::make_shared<deferred_owner_slot>());
         register_thread_finalizer(defer_slot_finalizer, g_defer_slot);
     }
-    std::unique_lock<std::mutex> lock(*g_defer_mutex);
+    lock.lock();
     if (g_defer_stop.load(std::memory_order_relaxed) || g_defer_queue->size() >= g_defer_queue_max) {
         g_defer_n_refused.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     if (!g_defer_started) {
         g_defer_started = true;
-        // a plain std::thread, detached: it never touches the task manager, and is stopped by `defer_atexit`
         std::thread(defer_worker_main).detach();
         std::atexit(defer_atexit);
     }
+    return true;
+}
+
+/* Drop one reference to each of `objs[0..n)` (nullptr and scalars are skipped) on the release thread, then call
+   `free_fn(block)` there (both may be null). The caller gives up those references (it must not use the objects through
+   them again) and keeps ownership of nothing else; `objs` must stay valid until `free_fn` runs (it normally lives in
+   `block`). Returns false, having done nothing, when the caller must release them itself (deferral disabled, `n` below
+   `LEAN_DEFER_FREE_MIN_REFS`, queue full). Same soundness argument as for cascades (see above): each reference is
+   treated like a field of a dying object. Used for large C++ containers of Lean objects (kernel caches). */
+extern "C" LEAN_EXPORT bool lean_dec_refs_deferred(lean_object ** objs, size_t n, void (*free_fn)(void *), void * block) {
+    if (n < g_defer_min_refs) return false;
+    std::unique_lock<std::mutex> lock(*g_defer_mutex, std::defer_lock);
+    if (!defer_prepare(lock)) return false;
+    deferred_batch b{nullptr, *g_defer_slot};
+    b.m_refs = objs; b.m_nrefs = n; b.m_free_fn = free_fn; b.m_block = block;
+    g_defer_queue->push_back(std::move(b));
+    g_defer_cv->notify_one();
+    return true;
+}
+
+/* Called by `lean_dec_ref_cold` after `g_defer_min` objects of one cascade. Returns false when the caller must
+   continue inline with `todo` unchanged; on true, `todo` holds what the caller must still free itself (the
+   owner-only objects of the worklist, usually none). */
+__attribute__((noinline)) static bool defer_handoff(object * & todo) {
+    std::unique_lock<std::mutex> lock(*g_defer_mutex, std::defer_lock);
+    if (!defer_prepare(lock)) return false;
     // split the worklist: owner-only objects stay with the caller
     object * give = nullptr; object * keep = nullptr;
     while (todo != nullptr) {
@@ -791,12 +830,15 @@ static void initialize_deferred_free() {
     if (on && strcmp(on, "0") == 0) return;
     g_defer_min = 16384;
     if (char const * s = std::getenv("LEAN_DEFER_FREE_MIN")) { long v = atol(s); if (v > 0) g_defer_min = (size_t)v; }
+    g_defer_min_refs = 8192;
+    if (char const * s = std::getenv("LEAN_DEFER_FREE_MIN_REFS")) { long v = atol(s); if (v > 0) g_defer_min_refs = (size_t)v; }
     if (char const * s = std::getenv("LEAN_DEFER_FREE_QUEUE")) { long v = atol(s); if (v > 0) g_defer_queue_max = (size_t)v; }
     if (char const * s = std::getenv("LEAN_DEFER_FREE_STATS")) g_defer_stats = strcmp(s, "0") != 0;
 }
 #else
 extern "C" LEAN_EXPORT void lean_deferred_free_drain() {}
 extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {}
+extern "C" LEAN_EXPORT bool lean_dec_refs_deferred(lean_object **, size_t, void (*)(void *), void *) { return false; }
 static void initialize_deferred_free() {}
 #endif
 
