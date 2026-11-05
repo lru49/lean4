@@ -685,7 +685,11 @@ struct mark_persistent_work {
 struct mark_persistent_pool {
     mutex m;
     std::vector<mark_persistent_work> items;
-    unsigned active{0};
+    /* lean-perf: `items.size()` mirrored for lock-free polling (written under `m`), and `active` atomic
+       (incremented under `m` together with the pop, decremented without it), so that idle walkers and
+       the periodic donation check no longer take `m` when there is nothing to do. */
+    std::atomic<size_t> n_items{0};
+    std::atomic<unsigned> active{0};
     unsigned num_threads{1};
     std::atomic<size_t> claimed{0};
     std::atomic<size_t> donations{0};
@@ -699,6 +703,7 @@ static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** beg
         w.end = std::min(begin + MARK_PERSISTENT_CHUNK, end);
         pool->items.push_back(std::move(w));
     }
+    pool->n_items.store(pool->items.size(), std::memory_order_release);
 }
 
 /* Every `MARK_PERSISTENT_DONATE_EVERY` pops a walker offers the older half of its stack to the pool
@@ -708,6 +713,7 @@ static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** beg
 #define MARK_PERSISTENT_DONATE_EVERY 256
 static void mark_persistent_pool_donate(mark_persistent_pool * pool, std::vector<object*> & todo) {
     if (todo.size() < 2) return;
+    if (pool->n_items.load(std::memory_order_relaxed) >= pool->num_threads) return;  // lean-perf: no lock when full
     unique_lock<mutex> lock(pool->m);
     if (pool->items.size() >= pool->num_threads) return;
     size_t half = todo.size() / 2;
@@ -715,6 +721,7 @@ static void mark_persistent_pool_donate(mark_persistent_pool * pool, std::vector
     w.owned.assign(todo.begin(), todo.begin() + half);
     pool->items.push_back(std::move(w));
     todo.erase(todo.begin(), todo.begin() + half);
+    pool->n_items.store(pool->items.size(), std::memory_order_release);
     pool->donations.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -828,29 +835,41 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
     size_t const end = frontier.size();
     auto worker = [&]() {
         std::vector<object*> todo;
+        unsigned idle_polls = 0;
         while (true) {
+            /* lean-perf: poll the item count without the lock while the pool is empty but other walkers
+               are still active (they may donate); take the lock only to pop or to confirm termination. */
+            if (pool.n_items.load(std::memory_order_acquire) == 0 && pool.active.load(std::memory_order_acquire) != 0) {
+                if (++idle_polls < 64) {
+#if defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                    __asm__ __volatile__("yield" ::: "memory");
+#endif
+                } else {
+                    this_thread::yield();
+                }
+                continue;
+            }
             {
                 unique_lock<mutex> lock(pool.m);
                 if (!pool.items.empty()) {
                     mark_persistent_work w = std::move(pool.items.back());
                     pool.items.pop_back();
-                    pool.active++;
+                    pool.n_items.store(pool.items.size(), std::memory_order_release);
+                    pool.active.fetch_add(1);
                     lock.unlock();
+                    idle_polls = 0;
                     if (w.begin) todo.assign(w.begin, w.end); else todo.swap(w.owned);
-                } else if (pool.active == 0) {
+                } else if (pool.active.load() == 0) {
                     break;
                 } else {
-                    lock.unlock();
-                    this_thread::yield();
                     continue;
                 }
             }
             mark_persistent_core<true>(todo, &pool);
             todo.clear();
-            {
-                unique_lock<mutex> lock(pool.m);
-                pool.active--;
-            }
+            pool.active.fetch_sub(1);
         }
     };
     std::vector<std::unique_ptr<lthread>> threads;
