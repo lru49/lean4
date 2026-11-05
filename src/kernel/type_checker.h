@@ -24,7 +24,7 @@ class type_checker {
 public:
     class state {
         typedef expr_flat_map<expr> infer_cache;
-        typedef lean::unordered_set<expr_pair, expr_pair_hash, expr_pair_eq> expr_pair_set;
+        typedef expr_pair_flat_set expr_pair_set;
         environment               m_env;
         name_generator            m_ngen;
         infer_cache               m_infer_type[2];

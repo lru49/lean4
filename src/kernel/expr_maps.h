@@ -114,4 +114,82 @@ public:
         }
     }
 };
+
+/** \brief Set of expression pairs keyed by structural equality of both components (as
+    `std::unordered_set<expr_pair, expr_pair_hash, expr_pair_eq>`), as an open-addressing table of 16-byte `{a, b}` entries
+    (linear probing, power-of-two capacity, load factor <= 2/3) like `expr_flat_map`: no node is allocated per element and the
+    structural hashes are read from the key objects. Used for the kernel's positive and negative `is_def_eq` caches, where a
+    node allocation made each insertion cost ~1000 cycles (DL cache profile, docs/profiles/cache-profile-20261105.md).
+    Owns one reference to each stored component. */
+class expr_pair_flat_set {
+    struct entry { lean_object * m_a; lean_object * m_b; };  // m_a == nullptr: empty
+    entry *  m_tab  = nullptr;
+    size_t   m_mask = 0;
+    size_t   m_size = 0;
+    static constexpr size_t INITIAL_CAP = 8;
+    static expr const & as_expr(lean_object * const & o) { return *reinterpret_cast<expr const *>(&o); }
+    static size_t slot(unsigned h, size_t mask) {
+        uint64_t x = (uint64_t)h * 0x9E3779B97F4A7C15ull;
+        return (size_t)(x >> 32) & mask;
+    }
+    static unsigned pair_hash(expr const & a, expr const & b) { return hash(hash(a), hash(b)); }  // = expr_pair_hash
+    static bool comp_eq(lean_object * o, expr const & k) { return o == k.raw() || std::equal_to<expr>()(k, as_expr(o)); }
+    void grow() {
+        size_t new_cap  = m_tab ? (m_mask + 1) * 2 : INITIAL_CAP;
+        entry * new_tab = static_cast<entry *>(alloc_zeroed_block(new_cap, sizeof(entry)));
+        if (new_tab == nullptr) lean_internal_panic_out_of_memory();
+        size_t new_mask = new_cap - 1;
+        if (m_tab) {
+            for (size_t i = 0; i <= m_mask; i++) {
+                entry const & e = m_tab[i];
+                if (e.m_a == nullptr) continue;
+                size_t j = slot(pair_hash(as_expr(e.m_a), as_expr(e.m_b)), new_mask);
+                while (new_tab[j].m_a != nullptr) j = (j + 1) & new_mask;
+                new_tab[j] = e;
+            }
+            free_block(m_tab);
+        }
+        m_tab = new_tab; m_mask = new_mask;
+    }
+public:
+    expr_pair_flat_set() {}
+    expr_pair_flat_set(expr_pair_flat_set const &) = delete;
+    expr_pair_flat_set & operator=(expr_pair_flat_set const &) = delete;
+    ~expr_pair_flat_set() { clear(); }
+    size_t size() const { return m_size; }
+    void clear() {
+        if (m_tab == nullptr) return;
+        for (size_t i = 0; i <= m_mask; i++) {
+            if (m_tab[i].m_a != nullptr) { lean_dec(m_tab[i].m_a); lean_dec(m_tab[i].m_b); }
+        }
+        free_block(m_tab);
+        m_tab = nullptr; m_mask = 0; m_size = 0;
+    }
+    bool contains(expr const & a, expr const & b) const {
+        if (m_tab == nullptr) return false;
+        size_t i = slot(pair_hash(a, b), m_mask);
+        while (true) {
+            entry const & e = m_tab[i];
+            if (e.m_a == nullptr) return false;
+            if (comp_eq(e.m_a, a) && comp_eq(e.m_b, b)) return true;
+            i = (i + 1) & m_mask;
+        }
+    }
+    /** \brief Add `(a, b)` unless a structurally equal pair is present. */
+    void insert(expr const & a, expr const & b) {
+        if (m_tab == nullptr || (m_size + 1) * 3 > (m_mask + 1) * 2) grow();
+        size_t i = slot(pair_hash(a, b), m_mask);
+        while (true) {
+            entry & e = m_tab[i];
+            if (e.m_a == nullptr) {
+                lean_inc(a.raw()); lean_inc(b.raw());
+                e.m_a = a.raw(); e.m_b = b.raw();
+                m_size++;
+                return;
+            }
+            if (comp_eq(e.m_a, a) && comp_eq(e.m_b, b)) return;
+            i = (i + 1) & m_mask;
+        }
+    }
+};
 };
