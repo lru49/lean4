@@ -384,13 +384,15 @@ def ScopedEnvExtension.modifyState (ext : ScopedEnvExtension α β σ) (env : En
       { s with stateStack := { top with state := f top.state, scopeChanged } :: stack }
     | _ => s
 
+-- One `modifyEnv` for all scoped extensions (the per-extension writes are pure; `MetaM`/`CoreM` drop their
+-- caches on every `modifyEnv`, so one write leaves them in the same state as N writes did).
 def pushScope [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] : m Unit := do
-  for ext in (← scopedEnvExtensionsRef.get) do
-    modifyEnv ext.pushScope
+  let exts ← scopedEnvExtensionsRef.get
+  modifyEnv fun env => exts.foldl (fun env ext => ext.pushScope env) env
 
 def popScope [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] : m Unit := do
-  for ext in (← scopedEnvExtensionsRef.get) do
-    modifyEnv ext.popScope
+  let exts ← scopedEnvExtensionsRef.get
+  modifyEnv fun env => exts.foldl (fun env ext => ext.popScope env) env
 
 /-- Used to implement `end_local_scope` command, that disables delimiting local entries of ScopedEnvExtension
 across `depth` scope levels.
@@ -400,8 +402,8 @@ def setDelimitsLocal [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] (de
     modifyEnv (ext.setDelimitsLocal · depth)
 
 def activateScoped [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] (namespaceName : Name) : m Unit := do
-  for ext in (← scopedEnvExtensionsRef.get) do
-    modifyEnv (ext.activateScoped · namespaceName)
+  let exts ← scopedEnvExtensionsRef.get
+  modifyEnv fun env => exts.foldl (fun env ext => ext.activateScoped env namespaceName) env
 
 abbrev SimpleScopedEnvExtension (α : Type) (σ : Type) := ScopedEnvExtension α α σ
 
