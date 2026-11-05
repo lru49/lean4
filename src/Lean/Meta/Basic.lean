@@ -470,6 +470,8 @@ private structure PersistentSynthInstanceCache where
   /-- Earlier tiers, most recent first; see `Environment.reviveSynthCache`. -/
   parked  : List ParkedSynthInstanceCache := []
 
+private instance : Inhabited PersistentSynthInstanceCache := ⟨{ gen := 0, entries := {} }⟩
+
 /--
 Persistent tier of the type class resolution cache, which survives the current command. It holds
 only context-free entries (see `Lean.Meta.SynthInstance`), and as it is part of the environment, it
@@ -502,7 +504,7 @@ def _root_.Lean.Environment.isSynthCacheStale (env : Environment) : Bool :=
 /-- The stored tier, if any. -/
 private def getPersistentSynthCache? (env : Environment) : Option PersistentSynthInstanceCache :=
   -- safety: only `setSynthCacheWith` stores a value
-  env.synthCacheRaw?.map fun v => unsafe unsafeCast v
+  env.synthCacheRaw?.map fun (v : NonScalar) => unsafe unsafeCast v
 
 private def setPersistentSynthCache (env : Environment) (c : PersistentSynthInstanceCache) :
     Environment :=
@@ -523,11 +525,13 @@ def _root_.Lean.Environment.setSynthCacheWith (env : Environment) (c : SynthInst
     else
       let parked := if old.witnesses.isEmpty || old.entries.isEmpty then old.parked else
         { entries := old.entries, extGens := old.extGens, witnesses := old.witnesses } :: old.parked
+      let gens := env.base.private.extGens
       setPersistentSynthCache env { gen := env.trackedGen, entries := c,
-        extGens := env.base.private.extGens, witnesses, parked := parked.take maxParkedSynthCaches }
+        extGens := gens, witnesses := witnesses, parked := parked.take maxParkedSynthCaches }
   | none =>
+    let gens := env.base.private.extGens
     setPersistentSynthCache env { gen := env.trackedGen, entries := c,
-      extGens := env.base.private.extGens, witnesses }
+      extGens := gens, witnesses := witnesses }
 
 /-- Replaces the persistent tier of the type class resolution cache; see `Environment.synthCache`. -/
 def _root_.Lean.Environment.setSynthCache (env : Environment) (c : SynthInstanceCache) :
@@ -568,8 +572,8 @@ def _root_.Lean.Environment.reviveSynthCache (env : Environment)
     if p.extGens[idx]? == some g then (idx, cur[idx]!) else (idx, g)
   let entries := p.entries.foldl (init := p.entries) fun m key es =>
     m.insert key (es.map fun e => { e with deps.extGens := translate e.deps.extGens })
-  setPersistentSynthCache env { gen := env.trackedGen, entries, extGens := cur, witnesses,
-    parked := (candidates.eraseIdx i).take maxParkedSynthCaches }
+  setPersistentSynthCache env { gen := env.trackedGen, entries := entries, extGens := cur,
+    witnesses := witnesses, parked := (candidates.eraseIdx i).take maxParkedSynthCaches }
 
 /--
 The free-variable normalization of a local instance context (see `Lean.Meta.SynthNorm`): every free
