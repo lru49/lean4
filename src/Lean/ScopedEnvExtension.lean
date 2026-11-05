@@ -394,6 +394,27 @@ def popScope [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] : m Unit :=
   let exts ← scopedEnvExtensionsRef.get
   modifyEnv fun env => exts.foldl (fun env ext => ext.popScope env) env
 
+/--
+Whether `new`, the environment after a `popScope`, has exactly the scoped-extension states in effect that
+`old`, the environment before the matching `pushScope`, had (for every scoped extension the state in
+effect, the head of its state stack, is the same object), and nothing else that `Meta`-level results
+depend on changed (`Environment.cachesValidExcept`). Then the `Core`/`Meta` caches of `old` are valid
+again under `new`.
+-/
+unsafe def scopeRestoredUnsafe (old new : Environment) : BaseIO Bool := do
+  let exts ← scopedEnvExtensionsRef.get
+  let idxs := exts.map (·.ext.toEnvExtension.idx)
+  if !old.cachesValidExcept new (idxs.contains ·) then return false
+  return exts.all fun ext =>
+    match (ext.ext.getState (asyncMode := .local) old).stateStack,
+        (ext.ext.getState (asyncMode := .local) new).stateStack with
+    | so :: _, sn :: _ => ptrEq so sn
+    | [], [] => true
+    | _, _ => false
+
+@[implemented_by scopeRestoredUnsafe, inherit_doc scopeRestoredUnsafe]
+opaque scopeRestored (old new : Environment) : BaseIO Bool
+
 /-- Used to implement `end_local_scope` command, that disables delimiting local entries of ScopedEnvExtension
 across `depth` scope levels.
 -/
