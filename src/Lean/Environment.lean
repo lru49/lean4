@@ -751,9 +751,12 @@ still valid under `new`: the constant map is the very same object and no constan
 `MetaM` keep their caches across `modifyEnv` exactly when this holds and drop them otherwise, as they
 used to do unconditionally.
 -/
-def cachesSurvive (old new : Environment) : Bool :=
+unsafe def cachesSurviveUnsafe (old new : Environment) : Bool :=
   ptrEq old.base.private.constants new.base.private.constants &&
     old.constGen == new.constGen && old.cacheGen == new.cacheGen
+
+@[implemented_by cachesSurviveUnsafe, inherit_doc cachesSurviveUnsafe]
+opaque cachesSurvive (old new : Environment) : Bool
 
 def header (env : Environment) : EnvironmentHeader :=
   -- can be assumed to be in sync with `env.checked`; see `setMainModule`, the only modifier of the header
