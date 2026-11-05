@@ -95,6 +95,19 @@ public:
             i = (i + 1) & m_mask;
         }
     }
+    /** \brief False iff `find(k)` returns nullptr for every `k` with `hash(k) == h` that is not itself a key object,
+        without comparing anything structurally (`key_eq` = pointer test + `is_equal`, which exits on a hash
+        mismatch before counting a heartbeat). Lets a caller skip building a fresh term only to look it up. */
+    bool may_contain_hash(unsigned h) const {
+        if (m_tab == nullptr) return false;
+        size_t i = slot(h, m_mask);
+        while (true) {
+            entry const & e = m_tab[i];
+            if (e.m_key == nullptr) return false;
+            if (key_hash(e) == h) return true;
+            i = (i + 1) & m_mask;
+        }
+    }
     /** \brief Store `v` for `k` unless a structurally equal key is present. */
     void insert(expr const & k, T const & v) {
         // Load factor 2/3: about two probes per hit with linear probing.
