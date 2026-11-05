@@ -679,6 +679,11 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
                     DD_INC(DD_BETA_FUSE); DD_ADD(DD_BETA_FUSE_SAVED, get_app_num_args(body) + num_args - m);
                 }
             }
+            {
+                expr const & hb = get_app_fn(binding_body(f));
+                if (is_constant(hb)) { auto ci = env().find(const_name(hb)); if (ci && ci->is_recursor()) DD_INC(DD_BX_REC); else DD_INC(DD_BX_CONST); }
+                else DD_INC(DD_BX_OTHER);
+            }
             r = whnf_core_impl(mk_rev_app(instantiate(binding_body(f), m, args.data() + (num_args - m)), num_args - m, args.data()),
                                cheap_rec, cheap_proj, false);
         } else if (f == f0) {
