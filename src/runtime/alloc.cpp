@@ -5,9 +5,6 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include <cstdlib>
-#ifdef LEAN_MIMALLOC
-#include <mimalloc.h>
-#endif
 #include <lean/lean.h>
 #include "runtime/thread.h"
 #include "runtime/debug.h"
@@ -26,6 +23,7 @@ namespace lean {
 
 void initialize_alloc() {
 #ifdef LEAN_MIMALLOC
+#include <mimalloc.h>
     // the main thread does not go through `lean_initialize_thread`; see `runtime/alloc_tls.h`
     lean_mi_theap_cache_init();
     /* Lean's allocation pattern is churn: large terms and caches are built, freed and rebuilt within one process
