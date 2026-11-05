@@ -1330,7 +1330,7 @@ def Module.recBuildIRArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) :=
     let upToDate ← buildUnlessUpToDate? (oldTrace := presetup.srcMTime) mod.irFile depTrace mod.irTraceFile do
       createParentDirs mod.irSetupFile
       let irSetup ← mkModuleSetup mod presetup
-      IO.FS.writeFile mod.irSetupFile (toJson irSetup).pretty
+      IO.FS.writeFile mod.irSetupFile (toJson irSetup).compress
       mod.clearIROutputArtifacts
       mod.clearIROutputHashes
       compileLeanIR mod.irSetupFile mod.irFile mod.cFile (← getLeanPath) (← getLeanir)
