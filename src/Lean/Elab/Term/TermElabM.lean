@@ -1590,10 +1590,17 @@ def addTermInfo (stx : Syntax) (e : Expr) (expectedType? : Option Expr := none)
   if (← read).inPattern && !force then
     return mkPatternWithRef e stx
   else
-    discard <| withInfoContext'
-      (pure ())
-      (fun _ => mkTermInfo elaborator stx e expectedType? lctx? isBinder isDisplayableTerm)
-      (mkPartialTermInfo elaborator stx expectedType? lctx?)
+    -- A leaf: this is `withInfoContext' (pure ()) (fun _ => mkTermInfo ..) ..` without resetting and
+    -- restoring the pending trees around a computation that cannot fail. With no pending trees
+    -- `mkTermInfo` never finds a nested hole, so a tactic or postponed hole becomes a `hole` leaf.
+    if (← getInfoState).enabled then
+      let tree ← if let some mvarId ← isTacticOrPostponedHole? e then
+        pure <| InfoTree.hole mvarId
+      else
+        let e := removeSaveInfoAnnotation e
+        pure <| InfoTree.node (children := {}) <| Info.ofTermInfo
+          { elaborator, lctx := lctx?.getD (← getLCtx), expr := e, stx, expectedType?, isBinder, isDisplayableTerm }
+      pushInfoTree tree
     return e
 
 def addTermInfo' (stx : Syntax) (e : Expr) (expectedType? : Option Expr := none)
