@@ -612,14 +612,13 @@ static constexpr uintptr_t DEFER_GRACE = 1;
 static inline void defer_dec(lean_object * o, defer_stack & stack, defer_tally & tally, uint64_t & owned_st) {
     if (lean_is_scalar(o))
         return;
-    if (LEAN_UNLIKELY(defer_owner_only(o))) {
-        // Task / Promise / External, single-threaded OR thread-shared: the release thread never touches their count, so it
-        // never runs their deletion (task manager, foreign finalizers). The owner applies the decrement. v2: v1 deactivated
-        // thread-shared tasks here, which raced with `lean_finalize_task_manager` at process end (deadlock / use-after-free).
+    int rc = defer_load_rc(o);
+    if (LEAN_UNLIKELY(rc > 0 && defer_owner_only(o))) {
+        // single-threaded Task / Promise / External: deletion runs foreign code on behalf of the owner: return the decrement.
+        // (Thread-shared ones take the acq_rel path below and are deleted by `defer_release` under the runtime-alive lock.)
         tally.add(o);
         return;
     }
-    int rc = defer_load_rc(o);
     if (rc == 1) {
         stack.push_back((uintptr_t)o | DEFER_GRACE);
     } else if (rc > 1) {
@@ -675,9 +674,32 @@ static void defer_visit(object * o, defer_stack & stack, defer_tally & tally, ui
 }
 
 /* Free the memory of a visited object (children already dropped). */
+/* Thread-shared Task / Promise / External objects whose last reference the release thread dropped are deleted here
+   promptly (delaying them can deadlock a program that waits for a socket close or a task cancellation, and their owner
+   thread may be blocked), but only while the runtime is alive: `lean_finalize_task_manager`, the task manager's scoped
+   destructor and `defer_atexit` take `g_defer_rt_mutex` exclusively and clear `g_defer_rt_alive` before tearing anything
+   down, so a deletion either completes before teardown starts or is skipped (the object is leaked at process end). v2:
+   v1 deleted them unconditionally and raced with `lean_finalize_task_manager` (lake deadlocked in exit on aarch64; the
+   same race is a use-after-free). */
+static std::shared_mutex * g_defer_rt_mutex = nullptr;
+static bool g_defer_rt_alive = true;
 static void defer_release(object * o) {
-    lean_assert(!defer_owner_only(o));  // never reach the release thread (handoff filter + `defer_dec`)
+    uint8 tag = lean_ptr_tag(o);
+    if (LEAN_UNLIKELY(tag == LeanTask || tag == LeanPromise || tag == LeanExternal)) {
+        std::shared_lock<std::shared_mutex> lock(*g_defer_rt_mutex);
+        if (g_defer_rt_alive) {
+            object * junk = nullptr;
+            junk = lean_del_core_other(o, tag, junk);  // pushes nothing for these kinds
+            lean_assert(junk == nullptr);
+        }
+        return;
+    }
     lean_free_object(o);
+}
+extern "C" LEAN_EXPORT void lean_deferred_free_runtime_dying() {
+    if (g_defer_rt_mutex == nullptr) return;
+    std::unique_lock<std::shared_mutex> lock(*g_defer_rt_mutex);
+    g_defer_rt_alive = false;
 }
 
 #if defined(__linux__)
@@ -708,8 +730,10 @@ static void defer_return_to_owner(std::shared_ptr<deferred_owner_slot> const & o
     owner->m_has_pending.store(true, std::memory_order_release);
 }
 
+static thread_local bool g_defer_is_release_thread = false;
 static void defer_worker_main() {
     lean_initialize_thread();
+    g_defer_is_release_thread = true;  // its own cascades (task/promise contents) stay inline
     defer_tally tally;
     defer_stack stack;
     std::vector<object *> grace;
@@ -772,8 +796,10 @@ static void defer_atexit() {
                 (unsigned long long)g_defer_n_batches.load(), (unsigned long long)g_defer_n_freed.load(),
                 (unsigned long long)g_defer_n_owned_st.load(), (unsigned long long)g_defer_n_returned.load(),
                 (unsigned long long)g_defer_n_refused.load(), (unsigned long long)g_defer_n_drained.load(), g_defer_min);
-    // Stop the release thread at its next check (every 4096 objects). It only touches the allocator and object memory
-    // (never the task manager or foreign finalizers), so a bounded wait suffices; never block exit on it.
+    // No more Task/Promise/External deletions on the release thread from here on (waits for one in progress).
+    lean_deferred_free_runtime_dying();
+    // Stop the release thread at its next check (every 4096 objects); it now only touches object memory and the
+    // allocator, so a bounded wait suffices; never block exit on it.
     std::unique_lock<std::mutex> lock(*g_defer_mutex);
     g_defer_stop.store(true, std::memory_order_relaxed);
     g_defer_cv->notify_all();
@@ -827,7 +853,7 @@ extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {
 
 /* Common part of the two entry points: the caller holds `g_defer_mutex`; false = refused. */
 static bool defer_prepare(std::unique_lock<std::mutex> & lock) {
-    if (g_defer_draining) return false;
+    if (g_defer_draining || g_defer_is_release_thread) return false;
     lean_deferred_free_drain();
     if (g_defer_slot == nullptr) {
         g_defer_slot = new std::shared_ptr<deferred_owner_slot>(std::make_shared<deferred_owner_slot>());
@@ -890,6 +916,7 @@ __attribute__((noinline)) static bool defer_handoff(object * & todo) {
 
 static void initialize_deferred_free() {
     g_defer_mutex = new std::mutex();
+    g_defer_rt_mutex = new std::shared_mutex();
     g_defer_cv = new std::condition_variable();
     g_defer_idle_cv = new std::condition_variable();
     g_defer_queue = new std::deque<deferred_batch>();
@@ -905,6 +932,7 @@ static void initialize_deferred_free() {
 #else
 extern "C" LEAN_EXPORT void lean_deferred_free_drain() {}
 extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {}
+extern "C" LEAN_EXPORT void lean_deferred_free_runtime_dying() {}
 extern "C" LEAN_EXPORT bool lean_dec_refs_deferred(lean_object **, size_t, void (*)(void *), void *) { return false; }
 static void initialize_deferred_free() {}
 #endif
@@ -1891,6 +1919,7 @@ extern "C" LEAN_EXPORT void lean_init_task_manager() {
 }
 
 extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
+    lean_deferred_free_runtime_dying();  // lean-perf (CJ): no task deletions on the release thread from here on
     if (g_task_manager) {
         delete g_task_manager;
         g_task_manager = nullptr;
@@ -1908,6 +1937,7 @@ scoped_task_manager::scoped_task_manager(unsigned num_workers) {
 }
 
 scoped_task_manager::~scoped_task_manager() {
+    lean_deferred_free_runtime_dying();  // lean-perf (CJ): see lean_finalize_task_manager
     if (g_task_manager) {
         delete g_task_manager;
         g_task_manager = nullptr;
