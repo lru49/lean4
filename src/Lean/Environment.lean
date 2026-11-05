@@ -2347,90 +2347,6 @@ private def setImportedEntries (states : Array EnvExtensionState) (mods : Array 
           { s with importedEntries := s.importedEntries.set! modIdx entries }
   return states
 
-/-!
-lean-perf (L01d): `setImportedEntries` on tasks. Pass 1 (module ranges) resolves every `(extName, entries)`
-pair of every module to its extension index once; pass 2 (extension ranges) builds the `importedEntries`
-array of each extension in the range, visiting the pairs in the sequential order (repeated names in one
-module resolve identically). The arrays are the same values as the sequential loop's.
--/
-private def setImportedEntriesPar (states : Array EnvExtensionState) (mods : Array ModuleData)
-    (startingAt : Nat) (numThreads : Nat) : IO (Array EnvExtensionState) := do
-  let extDescrs ← persistentEnvExtensionsRef.get
-  let numExts := extDescrs.size - startingAt
-  if numExts == 0 then return states
-  let extNameIdx ← mkExtNameMap startingAt
-  let n := max 1 numThreads
-  let modChunk := (mods.size + n - 1) / n
-  let idxTasks ← (Array.range n).mapM fun k => BaseIO.asTask (prio := .default) do
-    let lo := k * modChunk
-    let hi := min mods.size ((k + 1) * modChunk)
-    let mut out : Array (Array Nat) := Array.emptyWithCapacity (hi - lo)
-    for m in [lo:hi] do
-      out := out.push <| mods[m]!.entries.map fun (extName, _) =>
-        match extNameIdx[extName]? with
-        | some e => e - startingAt
-        | none => numExts
-    return out
-  -- the main thread waits for pass 1 (a task waiting for a task would cost a pool worker)
-  let idxs := idxTasks.map (·.get)
-  let extChunk := (numExts + n - 1) / n
-  let entTasks ← (Array.range n).mapM fun k => BaseIO.asTask (prio := .default) do
-    let elo := k * extChunk
-    let ehi := min numExts ((k + 1) * extChunk)
-    let mut arrs : Array (Array (Array EnvExtensionEntry)) := Array.emptyWithCapacity (ehi - elo)
-    for _ in [elo:ehi] do
-      arrs := arrs.push (Array.replicate mods.size #[])
-    for kIdx in [:n] do
-      let idxs := idxs[kIdx]!
-      for t in [:idxs.size] do
-        let m := kIdx * modChunk + t
-        let entries := mods[m]!.entries
-        let idx := idxs[t]!
-        for p in [:idx.size] do
-          let e := idx[p]!
-          if elo ≤ e && e < ehi then
-            arrs := arrs.modify (e - elo) (·.set! m entries[p]!.2)
-    return arrs
-  let mut states := states
-  for k in [:n] do
-    let arrs := entTasks[k]!.get
-    for t in [:arrs.size] do
-      let e := startingAt + k * extChunk + t
-      states := unsafe extDescrs[e]!.toEnvExtension.modifyStateImpl states fun s =>
-        { s with importedEntries := arrs[t]! }
-  return states
-
-/-- lean-perf (L01d): `setImportedEntries`, on tasks when the import has several threads
-(`LEAN_IMPORT_PAR_SETENTRIES=0` keeps the sequential loop; `LEAN_IMPORT_CHECK=1` compares the two). -/
-private def setImportedEntriesAuto (states : Array EnvExtensionState) (mods : Array ModuleData)
-    (startingAt : Nat := 0) : IO (Array EnvExtensionState) := do
-  let n ← ParallelImport.numThreads
-  if n > 1 && mods.size ≥ 256 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_SETENTRIES") then
-    let par ← setImportedEntriesPar states mods startingAt n
-    if (← ParallelImport.checkEnabled) then
-      let seq ← setImportedEntries states mods startingAt
-      let extDescrs ← persistentEnvExtensionsRef.get
-      let mut bad := 0
-      let mut cells := 0
-      for e in [startingAt:extDescrs.size] do
-        -- `states` is indexed by `EnvExtension.idx` (all extensions), not by the persistent-extension index
-        let idx := extDescrs[e]!.toEnvExtension.idx
-        let a : PersistentEnvExtensionState EnvExtensionEntry EnvExtensionState := unsafe unsafeCast par[idx]!
-        let b : PersistentEnvExtensionState EnvExtensionEntry EnvExtensionState := unsafe unsafeCast seq[idx]!
-        if a.importedEntries.size != b.importedEntries.size then
-          bad := bad + 1
-        else
-          for m in [:a.importedEntries.size] do
-            let x := a.importedEntries[m]!
-            let y := b.importedEntries[m]!
-            cells := cells + 1
-            unless (x.isEmpty && y.isEmpty) || unsafe ptrEq x y do
-              bad := bad + 1
-      IO.eprintln s!"[check-setentries] extensions {extDescrs.size - startingAt}, modules {mods.size}, cells {cells}: {if bad == 0 then "identical" else s!"{bad} DIFFER"}"
-    return par
-  else
-    setImportedEntries states mods startingAt
-
 /--
 Variant of `setImportedEntries` for `irBaseExts` that leaves `importedEntries` empty for extensions
 without entries in `mods`, which `getModuleIREntries` accounts for.
@@ -2543,6 +2459,90 @@ def tick (what : String) : IO Unit := do
     IO.eprintln s!"[timeline] {← sinceStart (← IO.monoNanosNow)} {what}"
 
 end ParallelImport
+
+/-!
+lean-perf (L01d): `setImportedEntries` on tasks. Pass 1 (module ranges) resolves every `(extName, entries)`
+pair of every module to its extension index once; pass 2 (extension ranges) builds the `importedEntries`
+array of each extension in the range, visiting the pairs in the sequential order (repeated names in one
+module resolve identically). The arrays are the same values as the sequential loop's.
+-/
+private def setImportedEntriesPar (states : Array EnvExtensionState) (mods : Array ModuleData)
+    (startingAt : Nat) (numThreads : Nat) : IO (Array EnvExtensionState) := do
+  let extDescrs ← persistentEnvExtensionsRef.get
+  let numExts := extDescrs.size - startingAt
+  if numExts == 0 then return states
+  let extNameIdx ← mkExtNameMap startingAt
+  let n := max 1 numThreads
+  let modChunk := (mods.size + n - 1) / n
+  let idxTasks ← (Array.range n).mapM fun k => BaseIO.asTask (prio := .default) do
+    let lo := k * modChunk
+    let hi := min mods.size ((k + 1) * modChunk)
+    let mut out : Array (Array Nat) := Array.emptyWithCapacity (hi - lo)
+    for m in [lo:hi] do
+      out := out.push <| mods[m]!.entries.map fun (extName, _) =>
+        match extNameIdx[extName]? with
+        | some e => e - startingAt
+        | none => numExts
+    return out
+  -- the main thread waits for pass 1 (a task waiting for a task would cost a pool worker)
+  let idxs := idxTasks.map (·.get)
+  let extChunk := (numExts + n - 1) / n
+  let entTasks ← (Array.range n).mapM fun k => BaseIO.asTask (prio := .default) do
+    let elo := k * extChunk
+    let ehi := min numExts ((k + 1) * extChunk)
+    let mut arrs : Array (Array (Array EnvExtensionEntry)) := Array.emptyWithCapacity (ehi - elo)
+    for _ in [elo:ehi] do
+      arrs := arrs.push (Array.replicate mods.size #[])
+    for kIdx in [:n] do
+      let idxs := idxs[kIdx]!
+      for t in [:idxs.size] do
+        let m := kIdx * modChunk + t
+        let entries := mods[m]!.entries
+        let idx := idxs[t]!
+        for p in [:idx.size] do
+          let e := idx[p]!
+          if elo ≤ e && e < ehi then
+            arrs := arrs.modify (e - elo) (·.set! m entries[p]!.2)
+    return arrs
+  let mut states := states
+  for k in [:n] do
+    let arrs := entTasks[k]!.get
+    for t in [:arrs.size] do
+      let e := startingAt + k * extChunk + t
+      states := unsafe extDescrs[e]!.toEnvExtension.modifyStateImpl states fun s =>
+        { s with importedEntries := arrs[t]! }
+  return states
+
+/-- lean-perf (L01d): `setImportedEntries`, on tasks when the import has several threads
+(`LEAN_IMPORT_PAR_SETENTRIES=0` keeps the sequential loop; `LEAN_IMPORT_CHECK=1` compares the two). -/
+private def setImportedEntriesAuto (states : Array EnvExtensionState) (mods : Array ModuleData)
+    (startingAt : Nat := 0) : IO (Array EnvExtensionState) := do
+  let n ← ParallelImport.numThreads
+  if n > 1 && mods.size ≥ 256 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_SETENTRIES") then
+    let par ← setImportedEntriesPar states mods startingAt n
+    if (← ParallelImport.checkEnabled) then
+      let seq ← setImportedEntries states mods startingAt
+      let extDescrs ← persistentEnvExtensionsRef.get
+      let mut bad := 0
+      let mut cells := 0
+      for e in [startingAt:extDescrs.size] do
+        -- `states` is indexed by `EnvExtension.idx` (all extensions), not by the persistent-extension index
+        let idx := extDescrs[e]!.toEnvExtension.idx
+        let a : PersistentEnvExtensionState EnvExtensionEntry EnvExtensionState := unsafe unsafeCast par[idx]!
+        let b : PersistentEnvExtensionState EnvExtensionEntry EnvExtensionState := unsafe unsafeCast seq[idx]!
+        if a.importedEntries.size != b.importedEntries.size then
+          bad := bad + 1
+        else
+          for m in [:a.importedEntries.size] do
+            let x := a.importedEntries[m]!
+            let y := b.importedEntries[m]!
+            cells := cells + 1
+            unless (x.isEmpty && y.isEmpty) || unsafe ptrEq x y do
+              bad := bad + 1
+      IO.eprintln s!"[check-setentries] extensions {extDescrs.size - startingAt}, modules {mods.size}, cells {cells}: {if bad == 0 then "identical" else s!"{bad} DIFFER"}"
+    return par
+  else
+    setImportedEntries states mods startingAt
 
 private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
