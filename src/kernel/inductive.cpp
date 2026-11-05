@@ -1351,6 +1351,16 @@ bool is_whnf_constructor_app(environment const & env, expr const & e) {
     return is_constructor(env, const_name(fn));
 }
 
+bool inductive_is_never_prop(environment const & env, name const & I) {
+    optional<constant_info> info = env.find(I);
+    if (!info || !info->is_inductive())
+        return false;
+    expr const * t = &info->get_type();
+    while (is_pi(*t))
+        t = &binding_body(*t);
+    return is_sort(*t) && is_not_zero(sort_level(*t));
+}
+
 expr nat_lit_to_constructor(expr const & e) {
     lean_assert(is_nat_lit(e));
     nat const & v = lit_value(e).get_nat();

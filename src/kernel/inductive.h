@@ -54,6 +54,9 @@ expr nat_lit_to_constructor(expr const & e);
    term unchanged (`whnf_core` finds no beta/iota/projection redex at a constructor head, constructors have no value to
    unfold, and `reduce_nat` only rewrites `Nat.succ _` among constructor applications). */
 bool is_whnf_constructor_app(environment const & env, expr const & e);
+/* True iff the type of the inductive `I` is `Π ..., Sort u` with `u` never zero (`Nat : Type`, `List.{u} : Type u -> Type u`,
+   `PProd : Sort (max 1 u v) ...`): no term of type `I ...` is a proof, whatever the universe and parameters. */
+bool inductive_is_never_prop(environment const & env, name const & I);
 expr string_lit_to_constructor(expr const & e);
 
 /* Auxiliary method for \c to_cnstr_when_structure, convert `e` into `mk e.1 ... e.n` */
@@ -115,7 +118,10 @@ inline optional<expr> inductive_reduce_rec(environment const & env, expr const &
     /* `whnf` is the identity on a constructor application (other than `Nat.succ _`), so neither the proof-irrelevance
        test (an `infer_type` of a term that is usually fresh: a reduct of the previous step) nor the `whnf` call can
        change `major` then. */
-    if (!is_whnf_constructor_app(env, major) && !is_prop(infer_type(major)))
+    /* The proof-irrelevance test needs no `infer_type` (of a major that is usually a fresh reduct) when the major's
+       inductive lives in a universe that is never `Prop`: the (well-typed) major's type is `I ...`, never a proposition. */
+    if (!is_whnf_constructor_app(env, major) &&
+        (inductive_is_never_prop(env, rec_val.get_major_induct()) || !is_prop(infer_type(major))))
         major = whnf(major);
     if (is_nat_lit(major))
         major = nat_lit_to_constructor(major);
