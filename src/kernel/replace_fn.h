@@ -6,6 +6,7 @@ Author: Leonardo de Moura
 */
 #pragma once
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <tuple>
 #include "runtime/interrupt.h"
@@ -24,10 +25,13 @@ class replace_cache {
         unsigned      m_offset;
         lean_object * m_val; // owned
     };
-    static constexpr size_t initial_capacity = 16;
-    // Most traversals cache only a few subterms, so the first slots need no allocation.
-    slot   m_initial[initial_capacity] = {};
-    slot * m_slots = m_initial;
+    /* lean-perf (step d, re-done on this class): 64 inline slots instead of 16, zeroed only on the first
+       insertion (most traversals never insert, so they must not pay for clearing 1.5 KB), and a 4x first
+       growth step (`grow` was 1.3-1.8 % of cycles on kernel-heavy modules with small inline tables and 2x
+       steps: a traversal that leaves the inline table usually has many shared subterms). */
+    static constexpr size_t initial_capacity = 64;
+    slot   m_initial[initial_capacity];
+    slot * m_slots = nullptr; // `m_initial` after the first insertion
     size_t m_mask  = initial_capacity - 1;
     size_t m_size  = 0;
 
@@ -45,7 +49,7 @@ class replace_cache {
     void grow() {
         slot * old = m_slots;
         size_t old_cap = m_mask + 1;
-        size_t cap = 2 * old_cap;
+        size_t cap = (old == m_initial ? 4 : 2) * old_cap; // lean-perf (step d): 4x when leaving the inline table
         slot * slots = static_cast<slot *>(std::calloc(cap, sizeof(slot)));
         if (!slots)
             throw std::bad_alloc();
@@ -61,6 +65,8 @@ public:
     replace_cache() {}
     replace_cache(replace_cache const &) = delete;
     ~replace_cache() {
+        if (!m_slots)
+            return;
         for (size_t i = 0; i <= m_mask; i++)
             if (m_slots[i].m_key)
                 lean_dec(m_slots[i].m_val);
@@ -69,6 +75,8 @@ public:
     }
     /* The cached result for `k` at `offset`, or `nullptr`; borrowed. */
     lean_object * find(lean_object * k, unsigned offset = 0) const {
+        if (!m_slots)
+            return nullptr;
         size_t i = hash_of(k, offset) & m_mask;
         while (lean_object * key = m_slots[i].m_key) {
             if (key == k && m_slots[i].m_offset == offset)
@@ -78,6 +86,10 @@ public:
         return nullptr;
     }
     void insert(lean_object * k, unsigned offset, object_ref const & v) {
+        if (!m_slots) {
+            std::memset(m_initial, 0, sizeof(m_initial));
+            m_slots = m_initial;
+        }
         if (2 * (m_size + 1) > m_mask + 1)
             grow();
         size_t i = hash_of(k, offset) & m_mask;
