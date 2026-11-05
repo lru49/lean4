@@ -112,6 +112,12 @@ void throw_stack_space_exception(char const * component_name) {
     throw stack_space_exception(component_name);
 }
 
+size_t get_stack_threshold() {
+    if (!g_stack_info_init)
+        save_stack_info(false);
+    return g_stack_threshold;
+}
+
 void check_stack(char const * component_name) {
     if (!g_stack_info_init)
         save_stack_info(false);
