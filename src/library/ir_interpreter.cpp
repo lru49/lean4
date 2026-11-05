@@ -1190,6 +1190,26 @@ private:
         return false;
     }
 
+    /** \brief Pop the frame of a native call. No arguments were pushed for the call and native code normally leaves
+        both stacks as it found them (re-entries into the interpreter through closure stubs pop their own frames), so
+        the two `resize` calls of `pop_frame` (out of line) would not change anything; skip them when the sizes show
+        that. Any other state takes the general path, so the result is always that of `pop_frame`. */
+    inline void pop_native_frame(value r, type t) {
+        frame const & f = get_frame();
+        if (LEAN_LIKELY(m_arg_stack.size() == f.m_arg_bp && m_jp_stack.size() == f.m_jp_bp)) {
+            m_call_stack.pop_back();
+            DEBUG_CODE({
+                lean_trace(*g_interpreter_call,
+                           tout() << std::string(m_call_stack.size(), ' ')
+                                  << "=> ";
+                           print_value(tout(), r, t);
+                           tout() << "\n";);
+            });
+        } else {
+            pop_frame(r, t);
+        }
+    }
+
     /** \brief Return cached lookup result for given unmangled function name in the current binary. */
     const symbol_cache_entry& lookup_symbol(name const & fn) {
         if (symbol_cache_entry * e = m_symbol_cache.find(fn)) {
@@ -1308,10 +1328,12 @@ private:
         type t = decl_type(e.m_decl);
         if (e.m_native.m_addr) {
             object ** args2 = static_cast<object **>(LEAN_ALLOCA(args.size() * sizeof(object *))); // NOLINT
+            array_ref<param> const & params = decl_params(e.m_decl);
+            bool const boxed = e.m_native.m_boxed;
             for (size_t i = 0; i < args.size(); i++) {
-                type t = param_type(decl_params(e.m_decl)[i]);
+                type t = param_type(params[i]);
                 args2[i] = box_t(eval_arg(args[i]), t);
-                if (e.m_native.m_boxed && param_borrow(decl_params(e.m_decl)[i])) {
+                if (boxed && param_borrow(params[i])) {
                     // NOTE: If we chose the boxed version where the IR chose the unboxed one, we need to manually increment
                     // originally borrowed parameters because the wrapper will decrement these after the call.
                     // Basically the wrapper is more homogeneous (removing both unboxed and borrowed parameters) than we
@@ -1332,6 +1354,8 @@ private:
             } else {
                 r = o;
             }
+            pop_native_frame(r, t);
+            return r;
         } else {
             if (decl_tag(e.m_decl) == decl_kind::Extern) {
                 string_ref mangled = get_symbol_stem(m_env, fn);
