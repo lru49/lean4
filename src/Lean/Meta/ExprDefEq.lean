@@ -341,6 +341,18 @@ least `.implicit`, so both `[instance_reducible]` and `[implicit_reducible]` unf
       withConfig (fun cfg => { cfg with beta := true, iota := true, zeta := true, zetaHave := true, zetaDelta := true, proj := .yesWithDelta }) x
 
 /--
+Unify the argument pair `a₁ =?= a₂` with `k` (a call of `Meta.isExprDefEqAux a₁ a₂`, possibly under a configuration
+change), unless the two arguments are structurally equal: then `isExprDefEqAux` would return `true` from
+`isDefEqQuick` without any other effect, and we skip the entry overhead (recursion-depth and system checks,
+let-consumption, configuration changes). In first-order unification `f a₁ ... aₙ =?= f b₁ ... bₙ` most implicit
+(type and instance) arguments are typically identical.
+When any trace option is set we always run `k`, so trace (and `trace.profiler`) output is unchanged.
+-/
+@[inline] private def isDefEqArg (a₁ a₂ : Expr) (k : MetaM Bool) : MetaM Bool := do
+  -- unrestricted: only decides whether trace nodes are produced
+  if a₁ == a₂ && !(← getOptionsUnrestricted).hasTrace then pure true else k
+
+/--
   First pass for `isDefEqArgs`. We unify explicit arguments, *and* easy cases
   Here, we say a case is easy if it is of the form
 
@@ -393,17 +405,17 @@ private def isDefEqArgsFirstPass
           -- `a₂` have the same type, so they're defeq in any case.
           -- See comment at `isAbstractedUnassignedMVar`.
           continue
-      unless (← Meta.isExprDefEqAux a₁ a₂) do
+      unless (← isDefEqArg a₁ a₂ <| Meta.isExprDefEqAux a₁ a₂) do
         return .failed
     else if (← isEtaUnassignedMVar a₁ <||> isEtaUnassignedMVar a₂) then
       -- Easy cases are still argument unifications at an implicit position, so they get the same
       -- transparency bump as the second pass.
       -- See `tests/elab/isDefEqArgsFirstPassBump.lean` for an example of when this is relevant.
       if respectTransparency && (info.binderInfo.isInstImplicit || implicitBump) then
-        unless (← withImplicitConfig <| Meta.isExprDefEqAux a₁ a₂) do
+        unless (← isDefEqArg a₁ a₂ <| withImplicitConfig <| Meta.isExprDefEqAux a₁ a₂) do
           return .failed
       else
-        unless (← Meta.isExprDefEqAux a₁ a₂) do
+        unless (← isDefEqArg a₁ a₂ <| Meta.isExprDefEqAux a₁ a₂) do
           return .failed
     else
       if info.isProp then
@@ -435,7 +447,7 @@ private partial def isDefEqArgs (f : Expr) (args₁ args₂ : Array Expr) : Meta
   let .ok postponedImplicit postponedHO ← isDefEqArgsFirstPass finfo.paramInfo args₁ args₂ | pure false
   -- finfo.paramInfo.size may be smaller than args₁.size
   for i in finfo.paramInfo.size...args₁.size do
-    unless (← Meta.isExprDefEqAux args₁[i]! args₂[i]!) do
+    unless (← isDefEqArg args₁[i]! args₂[i]! <| Meta.isExprDefEqAux args₁[i]! args₂[i]!) do
       return false
   let flags ← getOptionFlags
   let respectTransparency := flags.respectTransparency
@@ -466,22 +478,22 @@ private partial def isDefEqArgs (f : Expr) (args₁ args₂ : Array Expr) : Meta
       -- Bump to `.implicit` so that `[instance_reducible]` and `[implicit_reducible]` definitions
       -- both unfold. For instance-implicit arguments, this is especially necessary for diamond
       -- resolution.
-      unless (← withImplicitConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
+      unless (← isDefEqArg a₁ a₂ <| withImplicitConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
     else if respectTransparency then
-      unless (← Meta.isExprDefEqAux a₁ a₂) do return false
+      unless (← isDefEqArg a₁ a₂ <| Meta.isExprDefEqAux a₁ a₂) do return false
     else
       -- Old behavior
-      unless (← withInferTypeConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
+      unless (← isDefEqArg a₁ a₂ <| withInferTypeConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
   for i in postponedHO do
     let a₁   := args₁[i]!
     let a₂   := args₂[i]!
     if respectTransparency && (finfo.paramInfo[i]!.isInstance || implicitBump) then
-      unless (← withImplicitConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
+      unless (← isDefEqArg a₁ a₂ <| withImplicitConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
     -- Old behavior
     else if !respectTransparency && finfo.paramInfo[i]!.isInstance then
-      unless (← withInferTypeConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
+      unless (← isDefEqArg a₁ a₂ <| withInferTypeConfig <| Meta.isExprDefEqAux a₁ a₂) do return false
     else
-      unless (← Meta.isExprDefEqAux a₁ a₂) do return false
+      unless (← isDefEqArg a₁ a₂ <| Meta.isExprDefEqAux a₁ a₂) do return false
   return true
 
 /--
