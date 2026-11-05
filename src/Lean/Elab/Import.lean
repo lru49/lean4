@@ -138,6 +138,22 @@ where
       go parent messages
     | .num parent _, messages => go parent messages
 
+/--
+The part of `processHeaderCore` after importing: sets up `env`, the imported environment of
+`imports`, for `mainModule` and adds the header diagnostics. lean-perf (chain batching): also used
+with an environment imported by a chain server (`Lean.importModulesExtend`).
+-/
+def processHeaderCoreWith (env : Environment)
+    (startPos : String.Pos.Raw) (imports : Array Import)
+    (opts : Options) (messages : MessageLog) (inputCtx : Parser.InputContext)
+    (mainModule := Name.anonymous) (package? : Option PkgId := none)
+    (headerStx? : Option HeaderSyntax := none)
+    (origHeaderStx? : Option HeaderSyntax := none) : Environment × MessageLog :=
+  let env := env.setMainModule mainModule |>.setModulePackage package?
+  let messages := checkDeprecatedImports env imports opts inputCtx startPos messages headerStx? origHeaderStx?
+  let messages := checkModuleNamePortability mainModule inputCtx startPos messages
+  (env, messages)
+
 def processHeaderCore
     (startPos : String.Pos.Raw) (imports : Array Import) (isModule : Bool)
     (opts : Options) (messages : MessageLog) (inputCtx : Parser.InputContext)
@@ -163,10 +179,8 @@ def processHeaderCore
     let env ← mkEmptyEnvironment
     let pos := inputCtx.fileMap.toPosition startPos
     pure (env, messages.add { fileName := inputCtx.fileName, data := toString e, pos := pos })
-  let env := env.setMainModule mainModule |>.setModulePackage package?
-  let messages := checkDeprecatedImports env imports opts inputCtx startPos messages headerStx? origHeaderStx?
-  let messages := checkModuleNamePortability mainModule inputCtx startPos messages
-  return (env, messages)
+  return processHeaderCoreWith env startPos imports opts messages inputCtx mainModule package?
+    headerStx? origHeaderStx?
 
 /--
 Elaborates the given header syntax into an environment.
