@@ -1479,12 +1479,20 @@ static inline void lean_set_task_header(lean_object * o) {
     o->m_cs_sz    = 0;
 }
 
+/* Initializes the atomic fields of a task object no other thread can see yet. A plain `=` on an
+   `_Atomic` field is a sequentially consistent store, i.e. an `xchg` (a full barrier) on x86, twice
+   per spawned or pure task; relaxed stores suffice because the object is published later through the
+   task manager's mutex or an ordinary ownership transfer, which orders these writes. */
+static inline void init_task_fields(lean_task_object * o, lean_object * v, lean_task_imp * imp) {
+    std::atomic_store_explicit(&o->m_value, v, std::memory_order_relaxed);
+    std::atomic_store_explicit(&o->m_imp, imp, std::memory_order_relaxed);
+}
+
 static lean_task_object * alloc_task(obj_arg c, unsigned prio, bool keep_alive) {
     lean_mark_mt(c);
     lean_task_object * o = (lean_task_object*)lean_alloc_small_object(sizeof(lean_task_object));
     lean_set_task_header((lean_object*)o);
-    o->m_value = nullptr;
-    o->m_imp   = alloc_task_imp(c, prio, keep_alive);
+    init_task_fields(o, nullptr, alloc_task_imp(c, prio, keep_alive));
     if (keep_alive)
         lean_inc_ref((lean_object*)o);
     return o;
@@ -1493,8 +1501,7 @@ static lean_task_object * alloc_task(obj_arg c, unsigned prio, bool keep_alive) 
 static lean_task_object * alloc_task(obj_arg v) {
     lean_task_object * o = (lean_task_object*)lean_alloc_small_object(sizeof(lean_task_object));
     lean_set_st_header((lean_object*)o, LeanTask, 0);
-    o->m_value = v;
-    o->m_imp   = nullptr;
+    init_task_fields(o, v, nullptr);
     return o;
 }
 
@@ -1633,8 +1640,7 @@ obj_res lean_promise_new() {
     object * closure = nullptr;
     lean_task_object * t = (lean_task_object*)lean_alloc_small_object(sizeof(lean_task_object));
     lean_set_task_header((lean_object*)t);
-    t->m_value = nullptr;
-    t->m_imp   = alloc_task_imp(closure, prio, keep_alive);
+    init_task_fields(t, nullptr, alloc_task_imp(closure, prio, keep_alive));
 
     lean_promise_object * o = (lean_promise_object *)lean_alloc_small_object(sizeof(lean_promise_object));
     lean_set_st_header((lean_object *)o, LeanPromise, 0);
