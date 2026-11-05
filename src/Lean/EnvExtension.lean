@@ -44,12 +44,11 @@ def SimplePersistentEnvExtension.replayOfFilter (p : σ → α → Bool)
     let newEntries := newEntries.filter (p s)
     (newEntries, newEntries.foldl (init := s) addEntryFn)
 
-def registerSimplePersistentEnvExtension {α σ : Type} [Inhabited σ] (descr : SimplePersistentEnvExtensionDescr α σ) : IO (SimplePersistentEnvExtension α σ) :=
-  registerPersistentEnvExtension {
+def registerSimplePersistentEnvExtension {α σ : Type} [Inhabited σ] (descr : SimplePersistentEnvExtensionDescr α σ) : IO (SimplePersistentEnvExtension α σ) := do
+  let ext ← registerPersistentEnvExtension {
     name            := descr.name,
     mkInitial       := pure ([], descr.addImportedFn #[]),
     addImportedFn   := fun as => pure ([], descr.addImportedFn as),
-    parallelImport  := true, -- lean-perf: `descr.addImportedFn` is pure by type
     addEntryFn      := fun s e => match s with
       | (entries, s) => (e::entries, descr.addEntryFn s e),
     exportEntriesFnEx env s := match descr.exportEntriesFnEx? with
@@ -63,6 +62,9 @@ def registerSimplePersistentEnvExtension {α σ : Type} [Inhabited σ] (descr : 
       let (newEntries, s) := replay newEntries newState.2 s
       (newEntries ++ entries, s)
   }
+  -- lean-perf: `descr.addImportedFn` is pure by type, so the state may be computed on a task at import
+  registerParallelImportExt descr.name
+  return ext
 
 namespace SimplePersistentEnvExtension
 
@@ -263,13 +265,12 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
         let exported := all.filter fun (n, _) =>
           (env.setExporting true).contains (skipRealize := false) n
         { exported, server := exported, «private» := all }) :
-    IO (MapDeclarationExtension α) :=
-  .mk <$> registerPersistentEnvExtension {
+    IO (MapDeclarationExtension α) := do
+  let ext ← registerPersistentEnvExtension {
     name            := name,
     logWrites       := logWrites,
     mkInitial       := pure {}
     addImportedFn   := fun _ => pure {}
-    parallelImport  := true -- lean-perf
     addEntryFn      := fun s (n, v) => s.insert n v
     exportEntriesFnEx env s := exportEntriesFn env s
     asyncMode
@@ -279,6 +280,8 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
           s.insert c a
         else s
   }
+  registerParallelImportExt name -- lean-perf: `addImportedFn` is pure (the imported map is empty)
+  return .mk ext
 
 namespace MapDeclarationExtension
 

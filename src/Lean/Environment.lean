@@ -1987,8 +1987,6 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   -/
   exportEntriesFn : Environment → σ → OLeanEntries (Array α)
   statsFn         : σ → Format
-  /-- See `PersistentEnvExtensionDescrCore.parallelImport`. -/
-  parallelImport  : Bool := false
 
 instance {α σ} [Inhabited σ] : Inhabited (PersistentEnvExtensionState α σ) :=
   ⟨{importedEntries := #[], state := default }⟩
@@ -2085,14 +2083,6 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   trackGen          : Bool := false
   /-- See `EnvExtension.logWrites`. -/
   logWrites         : Bool := false
-  /--
-  lean-perf: `addImportedFn` is a pure function of its entries (it does not read the environment or
-  any other extension's state and has no side effects), so `finalizeImport` may run it on another
-  thread, concurrently with the other such extensions. Set by the registration helpers whose
-  descriptor types enforce this (`registerSimplePersistentEnvExtension`,
-  `registerSimpleScopedEnvExtension`, `mkMapDeclarationExtension`, `mkTagDeclarationExtension`).
-  -/
-  parallelImport    : Bool := false
 
 attribute [inherit_doc PersistentEnvExtension.exportEntriesFn]
   PersistentEnvExtensionDescrCore.exportEntriesFnEx
@@ -2134,14 +2124,33 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     addImportedFn   := descr.addImportedFn,
     addEntryFn      := descr.addEntryFn,
     exportEntriesFn := descr.exportEntriesFnEx,
-    statsFn         := descr.statsFn,
-    parallelImport  := descr.parallelImport
+    statsFn         := descr.statsFn
   }
   persistentEnvExtensionsRef.modify fun pExts => pExts.push (unsafeCast pExt)
   return pExt
 
 @[implemented_by registerPersistentEnvExtensionUnsafe]
 opaque registerPersistentEnvExtension {α β σ : Type} [Inhabited σ] (descr : PersistentEnvExtensionDescr α β σ) : IO (PersistentEnvExtension α β σ)
+
+/-!
+lean-perf: opt-in registry for the parallel import of persistent environment extensions. An extension
+whose `addImportedFn` is a pure function of its imported entries (it reads neither the environment nor
+any other extension's state and has no side effects) may be finalized on a worker thread by
+`finalizeImport`, concurrently with the other such extensions. The registration helpers whose
+descriptor types enforce this purity (`registerSimplePersistentEnvExtension`,
+`registerSimpleScopedEnvExtension`, `mkMapDeclarationExtension`) register the extension's name here
+right after registering the extension. A registry keyed by name instead of a descriptor field keeps
+`PersistentEnvExtension`, `PersistentEnvExtensionDescrCore` and `ScopedEnvExtension.Descr` at
+upstream's layout, so every module that constructs such a descriptor compiles to the same code as on
+upstream (with the field, 44 Mathlib meta-code modules compiled differently; lean-perf R14).
+-/
+builtin_initialize parallelImportExtsRef : IO.Ref NameSet ← IO.mkRef {}
+
+/-- lean-perf: marks the persistent environment extension `extName` as safe for the parallel import
+(see `parallelImportExtsRef`); called by the registration helpers whose descriptor types make
+`addImportedFn` pure. -/
+def registerParallelImportExt (extName : Name) : IO Unit :=
+  parallelImportExtsRef.modify (·.insert extName)
 
 /--
 Fills the `ModuleData` prefix tree fields from the corresponding arrays. Done by the module writers
@@ -2452,7 +2461,7 @@ private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let extGens ← EnvExtension.ensureGensArraySize env.base.private.extGens
   return env.modifyCheckedAsync ({ · with extensions := exts, extGens })
 
-/-- lean-perf: the pending `addImportedFn` task of a `parallelImport` extension (state, start, end). -/
+/-- lean-perf: the pending `addImportedFn` task of a parallel-import extension (state, start, end). -/
 private abbrev ExtTask := Task (Except IO.Error (EnvExtensionState × Nat × Nat))
 
 private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options)
@@ -2460,17 +2469,18 @@ private partial def finalizePersistentExtensions (env : Environment) (mods : Arr
   let tasks ← if par then spawnTasks env 0 #[] else pure #[]
   loop 0 env tasks
 where
-  /-- lean-perf: spawns the `addImportedFn` of every `parallelImport` extension with index `≥ start` on
-  the current environment: such a function is pure in its imported entries (see
-  `PersistentEnvExtensionDescrCore.parallelImport`), so it does not observe which other extension
-  states are already finalized. Called at the start and after `setImportedEntries` has supplied the
-  entries of extensions registered by `runInitAttrs`. -/
+  /-- lean-perf: spawns the `addImportedFn` of every extension with index `≥ start` that is registered
+  in `parallelImportExtsRef` on the current environment: such a function is pure in its imported
+  entries, so it does not observe which other extension states are already finalized. Called at the
+  start and after `setImportedEntries` has supplied the entries of extensions registered by
+  `runInitAttrs` (which register their names at the same time). -/
   spawnTasks (env : Environment) (start : Nat) (tasks : Array (Option ExtTask)) : IO (Array (Option ExtTask)) := do
     let pExtDescrs ← persistentEnvExtensionsRef.get
+    let parExts ← parallelImportExtsRef.get
     let mut tasks := tasks
     for i in [start:pExtDescrs.size] do
       let d := pExtDescrs[i]!
-      if d.parallelImport then
+      if parExts.contains d.name then
         let s := d.toEnvExtension.getState (asyncMode := .sync) env
         let t ← IO.asTask (prio := .default) (do
           let ta ← IO.monoNanosNow
@@ -2489,7 +2499,7 @@ where
     if h : i < pExtDescrs.size then
       let extDescr := pExtDescrs[i]
       if let some (some t) := tasks[i]? then
-        -- lean-perf: state computed on a task; a `parallelImport` extension registers no extensions
+        -- lean-perf: state computed on a task; a parallel-import extension registers no extensions
         -- or attributes, so the growth check below is not needed here.
         let tw0 ← IO.monoNanosNow
         let (newState, ta, tb) ← IO.ofExcept t.get
