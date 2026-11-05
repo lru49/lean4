@@ -42,8 +42,15 @@ extern "C" LEAN_EXPORT LEAN_ATTR_MALLOC lean_object * lean_alloc_small_object_co
     lean_assert(sz > 0 && sz % LEAN_OBJECT_SIZE_DELTA == 0 && sz <= MI_SMALL_SIZE_MAX);
     /* Feeding the cached theap into mimalloc saves the load of mimalloc's own thread-local: the
        heartbeat update and the theap read share one TLS address computation. */
-    void * mem = mi_theap_malloc_small(tls->mi_theap_default, sz);
+    mi_page_t * page = NULL;
+    void * mem = mi_theap_malloc_small_zero(tls->mi_theap_default, sz, false, &page);
     if (LEAN_UNLIKELY(mem == NULL)) lean_internal_panic_out_of_memory();
+    /* The pop above had to load the block's free-list link, which is usually a cache miss (the block
+       was freed long ago); it is the hottest instruction of this function. Prefetching the block that
+       is now at the head of the page's free list lets the next allocation of this size class find its
+       link (and the line Lean is about to write the object header into) in cache. A prefetch never
+       faults, so a NULL or stale head is harmless. */
+    if (LEAN_LIKELY(page != NULL)) __builtin_prefetch(page->free, 1, 3);
     lean_object * o = (lean_object *)mem;
     /* `m_cs_sz` must be the exact (aligned) requested size, not mimalloc's potentially larger
        block size: `lean_small_object_size` and `leangz` rely on it. */
