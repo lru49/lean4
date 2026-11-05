@@ -518,6 +518,10 @@ instance : Elab.MonadInfoTree CoreM where
   modifyCache fun ⟨c₁, c₂⟩ => ⟨c₁, f c₂⟩
 
 def instantiateTypeLevelParams (c : ConstantVal) (us : List Level) : CoreM Expr := do
+  -- `instantiateLevelParams _ _ []` is the identity, so a constant used without universe arguments
+  -- needs neither the cache lookup nor an insertion (the cached value would be `c.type` itself)
+  if us.isEmpty then
+    return c.type
   if let some (us', r) := (← get).cache.instLevelType.find? c.name then
     if us == us' then
       return r
@@ -526,6 +530,9 @@ def instantiateTypeLevelParams (c : ConstantVal) (us : List Level) : CoreM Expr 
   return r
 
 def instantiateValueLevelParams (c : ConstantInfo) (us : List Level) (allowOpaque := false) : CoreM Expr := do
+  -- as in `instantiateTypeLevelParams`: without universe arguments the result is the value itself
+  if us.isEmpty && c.hasValue (allowOpaque := allowOpaque) then
+    return c.value! (allowOpaque := allowOpaque)
   if let some (us', r) := (← get).cache.instLevelValue.find? c.name then
     if us == us' then
       return r
