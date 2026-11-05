@@ -89,8 +89,19 @@ void type_checker::state::retarget(environment const & env) {
    that built it); both from the environment (LEAN_KERNEL_CACHE_POOL=0 disables the pool,
    LEAN_KERNEL_CACHE_POOL_MAX_ENTRIES=<n> sets the bound). Evicted states are destroyed outside the lock. */
 namespace {
+/* Pool key: what a state's entries are a function of. Every cache of a state memoises a function of the constants the
+   checker can see (`environment::find/get`, i.e. the `constants` field of `Kernel.Environment`), of the `quotInit` flag
+   (`is_quot_initialized`) and of the state's own fvars; no kernel reduction reads any other field (extensions,
+   diagnostics, extra constant names, header). The elaborator rebuilds the `Kernel.Environment` object for every
+   declaration (extension states change between declarations: doc strings, ranges, attributes, the async-constant
+   bookkeeping), so keying on the environment object itself made most declarations miss the pool (DL cache profile:
+   18-35 % pool hits, the same with 64 slots) and lose 87-95 % of their unfold/recursor-rule entries and 35-70 % of their
+   `whnf` entries. The key is the `constants` object (pointer identity, a reference is held so the address cannot be
+   reused) plus `quotInit`: two environments with the same constants object see exactly the same constants. */
+static lean_object * env_constants_obj(environment const & env) { return lean_ctor_get(env.raw(), 0); }
 struct pool_entry {
-    object_ref                            m_env;
+    object_ref                            m_env;     // the `constants` object of the environment
+    bool                                  m_quot;
     std::shared_ptr<type_checker::state>  m_state;
 };
 class kernel_state_pool {
@@ -100,8 +111,10 @@ public:
     std::shared_ptr<type_checker::state> take(environment const & env) {
         std::shared_ptr<type_checker::state> r;
         std::lock_guard<std::mutex> lock(m_mutex);
+        lean_object * c = env_constants_obj(env);
+        bool q = env.is_quot_initialized();
         for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
-            if (it->m_env.raw() == env.raw()) {
+            if (it->m_env.raw() == c && it->m_quot == q) {
                 r = it->m_state;
                 break;
             }
@@ -118,9 +131,11 @@ public:
         std::vector<pool_entry> evicted;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_entries.push_back(pool_entry{object_ref(e1), st});
-            if (e2.raw() != e1.raw())
-                m_entries.push_back(pool_entry{object_ref(e2), st});
+            lean_object * c1 = env_constants_obj(e1), * c2 = env_constants_obj(e2);
+            bool q1 = e1.is_quot_initialized(), q2 = e2.is_quot_initialized();
+            m_entries.push_back(pool_entry{object_ref(c1, true), q1, st});
+            if (c2 != c1 || q2 != q1)
+                m_entries.push_back(pool_entry{object_ref(c2, true), q2, st});
             while (m_entries.size() > slots) {
                 evicted.push_back(std::move(m_entries.front()));
                 m_entries.pop_front();
