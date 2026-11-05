@@ -6,7 +6,6 @@ module
 
 prelude
 public import Lean.Data.Json
-public import Lean.Data.NameMap
 import Lean.Environment
 import Lean.Util.FoldConsts
 import Std.Data.HashMap
@@ -51,8 +50,8 @@ structure Cmd where
   line : Nat
   endLine : Nat := 0
   names : Array Name := #[]
-  needs : NameSet := {}
-  after : Std.HashSet Nat := {}
+  needs : Array Name := #[]
+  after : Array Nat := #[]
 
 def jsonNat (j : Json) : Nat := (j.getNat?).toOption.getD 0
 
@@ -69,7 +68,7 @@ public def compute (mod : Name) (olean ilean : FilePath) (deps : Array (Name × 
     if m == mod then continue
     for n in (← constNamesOf f) do owner := owner.insert n m
   let (md, _region) ← readModuleData olean
-  let own : NameSet := md.constNames.foldl (·.insert ·) {}
+  let own : Std.HashSet Name := md.constNames.foldl (·.insert ·) {}
   -- declaration ranges and syntactic references from the ilean
   let il ← match Json.parse (← IO.FS.readFile ilean) with
     | .ok j => pure j | .error e => throw <| IO.userError s!"{ilean}: {e}"
@@ -101,18 +100,17 @@ public def compute (mod : Name) (olean ilean : FilePath) (deps : Array (Name × 
   for ci in md.constants do
     let some l := lineOfConst.get? ci.name | continue
     let mut c := cmds.getD l { line := l }
-    for u in ci.getUsedConstantsAsSet do
+    for u in ci.getUsedConstantsAsSet.toList do
       if own.contains u then
         if let some l' := lineOfConst.get? u then
-          if l' != l then c := { c with after := c.after.insert l' }
+          if l' != l && !c.after.contains l' then c := { c with after := c.after.push l' }
       else if let some m := owner.get? u then
-        c := { c with needs := c.needs.insert m }
+        unless c.needs.contains m do c := { c with needs := c.needs.push m }
     cmds := cmds.insert l c
   -- syntactic references (ilean), which also cover unnamed commands such as `example`s
   if let .ok refs := (il.getObjValD "references").getArr? then
-    let mut i := 0
-    while i + 1 < refs.size do
-      let key := refs[i]!; let v := refs[i+1]!; i := i + 2
+    for i in [0:refs.size / 2] do
+      let key := refs[2*i]!; let v := refs[2*i+1]!
       let .ok k := key.getArr? | continue
       unless k.size == 3 && jsonNat k[0]! == 0 do continue
       let some dm := (k[1]!.getStr?).toOption.map (·.toName) | continue
@@ -125,30 +123,32 @@ public def compute (mod : Name) (olean ilean : FilePath) (deps : Array (Name × 
         let mut c := cmds.getD l { line := l, endLine := ln }
         if dm == mod then
           if let some l' := lineOfConst.get? cn then
-            if l' != l then c := { c with after := c.after.insert l' }
-        else if deps.any (·.1 == dm) then
-          c := { c with needs := c.needs.insert dm }
+            if l' != l && !c.after.contains l' then c := { c with after := c.after.push l' }
+        else if deps.any (·.1 == dm) && !c.needs.contains dm then
+          c := { c with needs := c.needs.push dm }
         cmds := cmds.insert l c
-  -- transitive closure of `needs` through `after`
+  -- transitive closure of `needs` through `after` (a few passes reach the fixpoint: references point backwards)
   let keys := cmds.toArray.map (·.1) |>.qsort (· < ·)
-  let mut closed : Std.HashMap Nat NameSet := {}
-  for _ in [0:keys.size] do   -- fixpoint (commands reference earlier ones; one pass usually suffices)
+  let mut closed : Std.HashMap Nat (Array Name) := {}
+  for l in keys do closed := closed.insert l (cmds.getD l { line := l }).needs
+  for _ in [0:8] do
     let mut changed := false
     for l in keys do
-      let c := cmds[l]!
-      let mut s := (closed.getD l c.needs)
-      for a in c.after do s := (closed.getD a ((cmds.get? a).map (·.needs) |>.getD {})).foldl (·.insert ·) s
-      if s.toList.length != (closed.getD l {}).toList.length then changed := true
-      closed := closed.insert l s
+      let c := cmds.getD l { line := l }
+      let mut acc := closed.getD l #[]
+      for a in c.after do
+        for m in closed.getD a #[] do
+          unless acc.contains m do acc := acc.push m; changed := true
+      closed := closed.insert l acc
     if !changed then break
+  let strs (ns : Array Name) : Json := toJson ((ns.map toString).qsort (· < ·))
   let out := keys.map fun l =>
-    let c := cmds[l]!
-    Json.mkObj [("line", l), ("end", c.endLine), ("names", toJson (c.names.map toString)),
-      ("needs", toJson ((closed.getD l {}).toList.map toString |>.toArray.qsort (· < ·))),
-      ("direct", toJson (c.needs.toList.map toString |>.toArray.qsort (· < ·))),
-      ("after", toJson (c.after.toArray.qsort (· < ·)))]
+    let c := cmds.getD l { line := l }
+    Json.mkObj [("line", toJson l), ("end", toJson c.endLine), ("names", toJson (c.names.map toString)),
+      ("needs", strs (closed.getD l #[])), ("direct", strs c.needs),
+      ("after", toJson (c.after.qsort (· < ·)))]
   let t1 ← IO.monoMsNow
-  return Json.mkObj [("version", 1), ("module", mod.toString), ("src", srcHash), ("envSensitive", true),
-    ("analysisMs", t1 - t0), ("commands", Json.arr out)]
+  return Json.mkObj [("version", toJson (1 : Nat)), ("module", toJson mod.toString), ("src", toJson srcHash),
+    ("envSensitive", toJson true), ("analysisMs", toJson (t1 - t0)), ("commands", Json.arr out)]
 
 end Lake.DeclDeps
