@@ -102,7 +102,12 @@ private def quickCmpImpl (n₁ n₂ : Name) : Ordering :=
     Ordering.eq
   else
     match compare n₁.hash n₂.hash with
-    | Ordering.eq => quickCmpAux n₁ n₂
+    | Ordering.eq =>
+      /- Equal hashes almost always mean equal names that are distinct objects (e.g. the same constant
+         name loaded from two different `.olean` files). `n₁ == n₂` (`lean_name_eq`) decides that case in
+         one C loop that stops at the first shared prefix; `quickCmpAux` returns `.eq` exactly when the
+         names are equal, so the result is unchanged. -/
+      if n₁ == n₂ then Ordering.eq else quickCmpAux n₁ n₂
     | ord => ord
 
 @[implemented_by quickCmpImpl]

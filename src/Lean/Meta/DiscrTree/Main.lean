@@ -432,8 +432,37 @@ private def getStarResult (d : DiscrTree α) : Array α :=
   | none => result
   | some c => result ++ c.nodeValues
 
+/--
+Three-way comparison consistent with `Key.lt`: `.lt` iff `k₁ < k₂`, `.gt` iff `k₂ < k₁`, `.eq` otherwise.
+The name-keyed cases compare the names once (`Key.lt` called twice per binary-search probe compared
+equal names up to four times).
+-/
+private def keyCmp (k₁ k₂ : Key) : Ordering :=
+  match k₁, k₂ with
+  | .const n₁ a₁, .const n₂ a₂ =>
+    match Name.quickCmp n₁ n₂ with
+    | .eq => compare a₁ a₂
+    | o => o
+  | .fvar n₁ a₁, .fvar n₂ a₂ =>
+    match Name.quickCmp n₁.name n₂.name with
+    | .eq => compare a₁ a₂
+    | o => o
+  | k₁, k₂ => if k₁ < k₂ then .lt else if k₂ < k₁ then .gt else .eq
+
+/-- Binary search on `cs[lo:hi]` (sorted by `Key.lt`, keys unique) with one comparison per probe. -/
+private partial def findKeyAux (cs : Array (Key × Trie α)) (k : Key) (lo hi : Nat) : Option (Key × Trie α) :=
+  if lo < hi then
+    let m := (lo + hi) / 2
+    let a := cs[m]!
+    match keyCmp a.1 k with
+    | .lt => findKeyAux cs k (m + 1) hi
+    | .gt => findKeyAux cs k lo m
+    | .eq => some a
+  else
+    none
+
 private abbrev findKey (cs : Array (Key × Trie α)) (k : Key) : Option (Key × Trie α) :=
-  cs.binSearch (k, default) (fun a b => a.1 < b.1)
+  findKeyAux cs k 0 cs.size
 
 private partial def getMatchLoop (todo : Array Expr) (c : Trie α) (result : Array α) : MetaM (Array α) := do
   match c with

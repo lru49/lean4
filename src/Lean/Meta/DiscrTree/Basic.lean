@@ -39,8 +39,18 @@ instance : ToExpr Key where
 
 def Key.lt : Key → Key → Bool
   | .lit v₁,        .lit v₂        => v₁ < v₂
-  | .fvar n₁ a₁,    .fvar n₂ a₂    => Name.quickLt n₁.name n₂.name || (n₁ == n₂ && a₁ < a₂)
-  | .const n₁ a₁,   .const n₂ a₂   => Name.quickLt n₁ n₂ || (n₁ == n₂ && a₁ < a₂)
+  -- One `Name.quickCmp` instead of `quickLt` followed by `==` (both walk equal names in full).
+  -- `quickCmp n₁ n₂ = .eq` iff `n₁ == n₂`, so this is `quickLt n₁ n₂ || (n₁ == n₂ && a₁ < a₂)`.
+  | .fvar n₁ a₁,    .fvar n₂ a₂    =>
+    match Name.quickCmp n₁.name n₂.name with
+    | .lt => true
+    | .eq => a₁ < a₂
+    | .gt => false
+  | .const n₁ a₁,   .const n₂ a₂   =>
+    match Name.quickCmp n₁ n₂ with
+    | .lt => true
+    | .eq => a₁ < a₂
+    | .gt => false
   | .proj s₁ i₁ a₁, .proj s₂ i₂ a₂ => Name.quickLt s₁ s₂ || (s₁ == s₂ && i₁ < i₂) || (s₁ == s₂ && i₁ == i₂ && a₁ < a₂)
   | k₁,             k₂             => k₁.ctorIdx < k₂.ctorIdx
 
