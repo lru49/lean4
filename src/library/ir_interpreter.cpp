@@ -30,6 +30,7 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <string>
 #include <vector>
 #include <shared_mutex>
+#include <memory>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #include <psapi.h>
@@ -365,6 +366,12 @@ void * lookup_symbol_in_cur_exe(char const * sym) {
 class interpreter;
 LEAN_THREAD_PTR(interpreter, g_interpreter);
 
+/* The interpreter instance a thread keeps between top-level evaluations against the same environment and
+   options (see `with_interpreter`). It owns references to both so that pointer equality identifies them.
+   Thread-local, never freed at thread exit (the runtime may already be finalized by then). */
+struct cached_interpreter;
+LEAN_THREAD_PTR(cached_interpreter, g_cached_interpreter);
+
 struct native_symbol_cache_entry {
     // symbol address; `nullptr` if function does not have native code
     void * m_addr;
@@ -447,19 +454,7 @@ class interpreter {
 
 public:
     template<class T>
-    static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f) {
-        if (g_interpreter && is_eqp(g_interpreter->m_env, env) && is_eqp(g_interpreter->m_opts, opts)) {
-            return f(*g_interpreter);
-        } else {
-            // We changed threads or the closure was stored and called in a different context.
-            time_task t("interpretation", opts, fn);
-            scope_trace_env scope_trace(env, opts);
-            // the caches contain data from the Environment, so we cannot reuse them when changing it
-            interpreter interp(env, opts);
-            flet<interpreter *> fl(g_interpreter, &interp);
-            return f(interp);
-        }
-    }
+    static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f);
 
 private:
     value eval_arg(arg const & a) {
@@ -1178,6 +1173,68 @@ public:
         }
     }
 };
+
+struct cached_interpreter {
+    elab_environment m_env;
+    options m_opts;
+    std::unique_ptr<interpreter> m_interp;
+    cached_interpreter(elab_environment const & env, options const & opts) : m_env(env), m_opts(opts) {
+        m_interp.reset(new interpreter(m_env, m_opts));
+    }
+};
+
+/* Top-level evaluations (`evalConst`, `[init]` declarations, interpreted closures called from compiled code)
+   used to construct a fresh interpreter each, with empty symbol and constant caches, so every evaluation
+   looked its callees up again in the environment (`findEnvDecl`) and in the global native-symbol cache.
+   Import-time extension initialization alone makes ~13,000 such evaluations against the same environment
+   object, and interpreted parsers/elaborators are called with the import-time environment captured in their
+   closures throughout a file. The thread now keeps its last interpreter and reuses it while the environment
+   and options are the SAME objects (pointer equality; the cache holds references to both, so the objects
+   cannot be freed and their addresses cannot be reused while cached). The caches contain data derived from
+   the environment only, so reuse against the same environment object is exactly as valid as reuse within one
+   evaluation. On any exception the instance is dropped (its stacks may be left inconsistent). */
+template<class T>
+inline T interpreter::with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f) {
+    if (g_interpreter && is_eqp(g_interpreter->m_env, env) && is_eqp(g_interpreter->m_opts, opts)) {
+        return f(*g_interpreter);
+    } else if (g_interpreter) {
+        // A nested evaluation against a different environment while an interpreter is running on this
+        // thread (e.g. `evalConst` on the current environment from an interpreted tactic whose closure
+        // holds the import-time one): a temporary instance, as before. The cached instance may be the
+        // running one, so it is left alone.
+        time_task t("interpretation", opts, fn);
+        scope_trace_env scope_trace(env, opts);
+        interpreter interp(env, opts);
+        flet<interpreter *> fl(g_interpreter, &interp);
+        return f(interp);
+    } else {
+        // Outermost evaluation on this thread: reuse the cached instance if it was built for these very
+        // environment and options objects, otherwise replace it (no interpreter is running on this
+        // thread, so the old instance is not in use).
+        time_task t("interpretation", opts, fn);
+        scope_trace_env scope_trace(env, opts);
+        cached_interpreter * c = g_cached_interpreter;
+        if (!c || !is_eqp(c->m_env, env) || !is_eqp(c->m_opts, opts)) {
+            // the caches contain data from the Environment, so we cannot reuse them when changing it
+            g_cached_interpreter = nullptr;
+            delete c;
+            c = new cached_interpreter(env, opts);
+            g_cached_interpreter = c;
+        }
+        flet<interpreter *> fl(g_interpreter, c->m_interp.get());
+        try {
+            return f(*c->m_interp);
+        } catch (...) {
+            // the instance's stacks may be inconsistent after an exception: drop it (`fl` restores
+            // `g_interpreter` to null when this scope unwinds)
+            if (g_cached_interpreter == c) {
+                g_cached_interpreter = nullptr;
+            }
+            delete c;
+            throw;
+        }
+    }
+}
 
 extern "C" object * lean_decl_get_sorry_dep(object * env, object * n);
 
