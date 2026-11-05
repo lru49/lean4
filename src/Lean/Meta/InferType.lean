@@ -73,6 +73,18 @@ where
     if offset >= e.looseBVarRange then
       -- `e` doesn't have free variables
       return e
+    else if let .bvar vidx := e then
+      -- A variable replaced by an argument that needs no lifting is answered without the cache:
+      -- the result is that argument itself (the same object the cache would return), so caching it
+      -- would only cost a hash-map insertion per occurrence.
+      if vidx < offset + (stop - start) then
+        let arg := args[stop - (vidx - offset) - 1]!
+        if offset == 0 || !arg.hasLooseBVars then
+          return arg
+        else
+          checkCache ({ val := e : ExprStructEq }, offset) fun _ => return visitBVar vidx offset
+      else
+        checkCache ({ val := e : ExprStructEq }, offset) fun _ => return visitBVar vidx offset
     else checkCache ({ val := e : ExprStructEq }, offset) fun _ => do
       match e with
       | .forallE _ d b _ => return e.updateForallE! (← visit d offset) (← visit b (offset+1))
