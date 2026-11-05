@@ -487,7 +487,7 @@ static inline void del_prefetch_children(object * o) {
     }
     for (; it != end; ++it) {
         object * c = *it;
-        if (!lean_is_scalar(c)) __builtin_prefetch(c, 1, 3);
+        if (!lean_is_scalar(c)) __builtin_prefetch(c, 0, 3);
     }
 }
 
