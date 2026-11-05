@@ -1196,6 +1196,7 @@ def Module.buildLean
   mod.clearOutputHashes
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
     (← getLeanPath) (← getLean)
+    (← getBuildContext).chainPool?
   mod.computeArtifacts setup.isModule presetup.postponeCompile
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
