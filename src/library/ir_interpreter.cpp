@@ -463,6 +463,291 @@ static unsigned imported_decl_generation(elab_environment const & env) {
     return gen;
 }
 
+/* Pre-decoded IR (release builds; debug builds keep the node-walking loop and its traces).
+
+   `eval_body` walks the IR objects themselves: every step loads the next `fn_body` node's header for its tag, unboxes
+   variable indices stored as `Nat` objects and follows a continuation pointer, so most of its cost is dependent memory
+   loads. The body of a persistent declaration (imported from an .olean, or created at initialization) is decoded once
+   into a flat array of small instructions; `eval_decoded` executes it with the semantics of `eval_body`, node by node:
+   - one instruction per `fn_body` node except `JDecl`, which has no effect besides recording its body: join point
+     indices are unique per declaration (the C backend emits them as labels), so every `Jmp` is resolved statically to
+     the lexically enclosing join point's body (a duplicate or unknown index, a non-small index, or nesting deeper than
+     `k_max_depth` makes the decoder give up, and that declaration keeps using `eval_body`);
+   - expressions other than `Proj` are evaluated by `eval_expr` on the original IR node; the self tail call is detected
+     at decode time with the same conditions `eval_body` checks at run time (the frame's function is the declaration
+     being executed);
+   - `Case` alternatives keep their order and first-match rule, `Jmp` assigns its parameters left to right.
+   Decoded code holds raw pointers into the declaration's own IR. It is cached process-wide per (generation of the
+   imported-declaration cache, declaration address) and never freed: a persistent declaration stays at its address for
+   as long as its import is alive, and a new import is a new generation (see the imported-declaration cache above). */
+#ifndef LEAN_DEBUG
+#define LEAN_IR_DECODE 1
+#else
+#define LEAN_IR_DECODE 0
+#endif
+#if LEAN_IR_DECODE
+
+enum class dop : uint8_t { Expr, Proj, TailSelf, Set, SetTag, USet, SSet, Inc, Dec, Del, Case, Ret, Jmp, Unreachable };
+static constexpr uint32_t k_dirrelevant = 0xffffffffu;
+
+struct dinsn {
+    dop      m_op   = dop::Unreachable;
+    type     m_type = type::Object;
+    uint32_t m_x    = 0;  // target / object / case variable slot; Ret: argument
+    uint32_t m_a    = 0;  // Proj, USet, SSet: source slot; Set: argument; SetTag: tag; Inc/Dec: count; Case, Jmp, TailSelf: first entry
+    uint32_t m_b    = 0;  // Proj, Set, USet: field index; SSet: byte offset; Case: #alts; Jmp, TailSelf: #arguments
+    uint32_t m_c    = 0;  // Jmp: first parameter slot entry
+    uint32_t m_next = 0;  // next instruction; Jmp: join point body
+    object * m_obj  = nullptr; // Expr: the IR expression
+};
+
+struct dalt {
+    bool     m_default;
+    size_t   m_tag;
+    uint32_t m_pc;
+};
+
+struct decoded_decl {
+    std::vector<dinsn>    m_code;
+    std::vector<uint32_t> m_args;  // slots (variable index - 1) or k_dirrelevant
+    std::vector<dalt>     m_alts;
+    uint32_t              m_entry = 0;
+};
+
+class ir_decoder {
+    struct jp_info { uint32_t m_body; uint32_t m_params; uint32_t m_num_params; };
+    static constexpr unsigned k_max_depth = 256;
+    decoded_decl & m_out;
+    name const &   m_self;
+    std::unordered_map<size_t, jp_info> m_jps; // join points in scope
+    unsigned       m_depth = 0;
+    bool           m_ok = true;
+
+    uint32_t small32(nat const & n) {
+        if (!n.is_small() || n.get_small_value() >= k_dirrelevant) { m_ok = false; return 0; }
+        return static_cast<uint32_t>(n.get_small_value());
+    }
+    uint32_t slot(var_id const & v) {
+        uint32_t i = small32(v);
+        if (i == 0) { m_ok = false; return 0; } // variables are 1-indexed
+        return i - 1;
+    }
+    uint32_t arg_slot(arg const & a) { return arg_is_irrelevant(a) ? k_dirrelevant : slot(arg_var_id(a)); }
+    uint32_t args(array_ref<arg> const & as) {
+        uint32_t start = static_cast<uint32_t>(m_out.m_args.size());
+        for (arg const & a : as) m_out.m_args.push_back(arg_slot(a));
+        return start;
+    }
+
+    // decode the sequence starting at `b0` (up to its terminal node); returns the pc of its first instruction
+    uint32_t seq(fn_body const & b0) {
+        if (++m_depth > k_max_depth) { m_ok = false; --m_depth; return 0; }
+        int64_t start = -1, prev = -1;
+        std::vector<size_t> scoped;
+        auto emit = [&](dinsn const & ins) -> uint32_t {
+            uint32_t idx = static_cast<uint32_t>(m_out.m_code.size());
+            m_out.m_code.push_back(ins);
+            if (prev >= 0) m_out.m_code[prev].m_next = idx;
+            if (start < 0) start = idx;
+            prev = idx;
+            return idx;
+        };
+        fn_body const * b = &b0;
+        bool done = false;
+        while (m_ok && !done) {
+            dinsn ins;
+            switch (fn_body_tag(*b)) {
+            case fn_body_kind::VDecl: {
+                expr const & e = fn_body_vdecl_expr(*b);
+                fn_body const & cont = fn_body_vdecl_cont(*b);
+                ins.m_type = fn_body_vdecl_type(*b);
+                ins.m_x = slot(fn_body_vdecl_var(*b));
+                if (expr_tag(e) == expr_kind::FAp &&
+                    fn_body_tag(cont) == fn_body_kind::Ret && !arg_is_irrelevant(fn_body_ret_arg(cont)) &&
+                    arg_var_id(fn_body_ret_arg(cont)) == fn_body_vdecl_var(*b) &&
+                    expr_fap_fun(e) == m_self) {
+                    ins.m_op = dop::TailSelf;
+                    ins.m_b = static_cast<uint32_t>(expr_fap_args(e).size());
+                    ins.m_a = args(expr_fap_args(e));
+                    emit(ins);
+                    done = true; // `eval_body` restarts the body here; the `Ret` is never reached
+                    break;
+                }
+                if (expr_tag(e) == expr_kind::Proj) {
+                    ins.m_op = dop::Proj;
+                    ins.m_a = slot(expr_proj_obj(e));
+                    ins.m_b = small32(expr_proj_idx(e));
+                } else {
+                    ins.m_op = dop::Expr;
+                    ins.m_obj = e.raw();
+                }
+                emit(ins);
+                b = &cont;
+                break;
+            }
+            case fn_body_kind::JDecl: {
+                if (!fn_body_jdecl_id(*b).is_small()) { m_ok = false; break; }
+                size_t j = fn_body_jdecl_id(*b).get_small_value();
+                if (m_jps.count(j)) { m_ok = false; break; }
+                jp_info info;
+                info.m_params = static_cast<uint32_t>(m_out.m_args.size());
+                info.m_num_params = static_cast<uint32_t>(fn_body_jdecl_params(*b).size());
+                for (param const & p : fn_body_jdecl_params(*b)) m_out.m_args.push_back(slot(param_var(p)));
+                info.m_body = seq(fn_body_jdecl_body(*b)); // its own jump targets are the enclosing ones
+                if (!m_ok) break;
+                m_jps.emplace(j, info);
+                scoped.push_back(j);
+                b = &fn_body_jdecl_cont(*b);
+                break;
+            }
+            case fn_body_kind::Set:
+                ins.m_op = dop::Set;
+                ins.m_x = slot(fn_body_set_var(*b));
+                ins.m_b = small32(fn_body_set_idx(*b));
+                ins.m_a = arg_slot(fn_body_set_arg(*b));
+                emit(ins); b = &fn_body_set_cont(*b);
+                break;
+            case fn_body_kind::SetTag:
+                ins.m_op = dop::SetTag;
+                ins.m_x = slot(fn_body_set_tag_var(*b));
+                ins.m_a = small32(fn_body_set_tag_cidx(*b));
+                emit(ins); b = &fn_body_set_tag_cont(*b);
+                break;
+            case fn_body_kind::USet:
+                ins.m_op = dop::USet;
+                ins.m_x = slot(fn_body_uset_target(*b));
+                ins.m_b = small32(fn_body_uset_idx(*b));
+                ins.m_a = slot(fn_body_uset_source(*b));
+                emit(ins); b = &fn_body_uset_cont(*b);
+                break;
+            case fn_body_kind::SSet: {
+                ins.m_op = dop::SSet;
+                ins.m_x = slot(fn_body_sset_target(*b));
+                if (!fn_body_sset_idx(*b).is_small() || !fn_body_sset_offset(*b).is_small()) { m_ok = false; break; }
+                size_t offset = fn_body_sset_idx(*b).get_small_value() * sizeof(void *) + fn_body_sset_offset(*b).get_small_value();
+                if (offset >= k_dirrelevant) { m_ok = false; break; }
+                ins.m_b = static_cast<uint32_t>(offset);
+                ins.m_a = slot(fn_body_sset_source(*b));
+                ins.m_type = fn_body_sset_type(*b);
+                emit(ins); b = &fn_body_sset_cont(*b);
+                break;
+            }
+            case fn_body_kind::Inc:
+                ins.m_op = dop::Inc;
+                ins.m_x = slot(fn_body_inc_var(*b));
+                ins.m_a = small32(fn_body_inc_val(*b));
+                emit(ins); b = &fn_body_inc_cont(*b);
+                break;
+            case fn_body_kind::Dec:
+                ins.m_op = dop::Dec;
+                ins.m_x = slot(fn_body_dec_var(*b));
+                ins.m_a = small32(fn_body_dec_val(*b));
+                emit(ins); b = &fn_body_dec_cont(*b);
+                break;
+            case fn_body_kind::Del:
+                ins.m_op = dop::Del;
+                ins.m_x = slot(fn_body_del_var(*b));
+                emit(ins); b = &fn_body_del_cont(*b);
+                break;
+            case fn_body_kind::Case: {
+                ins.m_op = dop::Case;
+                ins.m_x = slot(fn_body_case_var(*b));
+                ins.m_type = fn_body_case_var_type(*b);
+                uint32_t idx = emit(ins);
+                std::vector<dalt> alts;
+                for (alt_core const & a : fn_body_case_alts(*b)) {
+                    if (!m_ok) break;
+                    if (alt_core_tag(a) == alt_core_kind::Ctor) {
+                        nat const & t = ctor_info_tag(alt_core_ctor_info(a));
+                        if (!t.is_small()) { m_ok = false; break; }
+                        alts.push_back(dalt { false, t.get_small_value(), seq(alt_core_ctor_cont(a)) });
+                    } else {
+                        alts.push_back(dalt { true, 0, seq(alt_core_default_cont(a)) });
+                    }
+                }
+                m_out.m_code[idx].m_a = static_cast<uint32_t>(m_out.m_alts.size());
+                m_out.m_code[idx].m_b = static_cast<uint32_t>(alts.size());
+                m_out.m_alts.insert(m_out.m_alts.end(), alts.begin(), alts.end());
+                done = true;
+                break;
+            }
+            case fn_body_kind::Ret:
+                ins.m_op = dop::Ret;
+                ins.m_x = arg_slot(fn_body_ret_arg(*b));
+                emit(ins);
+                done = true;
+                break;
+            case fn_body_kind::Jmp: {
+                if (!fn_body_jmp_jp(*b).is_small()) { m_ok = false; break; }
+                auto it = m_jps.find(fn_body_jmp_jp(*b).get_small_value());
+                if (it == m_jps.end() || it->second.m_num_params != fn_body_jmp_args(*b).size()) { m_ok = false; break; }
+                ins.m_op = dop::Jmp;
+                ins.m_b = it->second.m_num_params;
+                ins.m_c = it->second.m_params;
+                ins.m_a = args(fn_body_jmp_args(*b));
+                ins.m_next = it->second.m_body;
+                emit(ins);
+                done = true;
+                break;
+            }
+            case fn_body_kind::Unreachable:
+                ins.m_op = dop::Unreachable;
+                emit(ins);
+                done = true;
+                break;
+            }
+        }
+        for (size_t j : scoped) m_jps.erase(j);
+        --m_depth;
+        if (start < 0) m_ok = false;
+        return start < 0 ? 0 : static_cast<uint32_t>(start);
+    }
+public:
+    ir_decoder(decoded_decl & out, name const & self) : m_out(out), m_self(self) {}
+    bool run(fn_body const & b) {
+        m_out.m_entry = seq(b);
+        return m_ok;
+    }
+};
+
+/* the decoded-code cache: (generation, declaration address) -> decoded code (nullptr: not decodable); never erased */
+struct decoded_key {
+    unsigned m_gen;
+    object * m_decl;
+    bool operator==(decoded_key const & o) const { return m_gen == o.m_gen && m_decl == o.m_decl; }
+};
+struct decoded_key_hash {
+    size_t operator()(decoded_key const & k) const noexcept {
+        uint64 h = reinterpret_cast<uintptr_t>(k.m_decl) * 0x9E3779B97F4A7C15ull;
+        return static_cast<size_t>((h >> 17) ^ k.m_gen);
+    }
+};
+struct decoded_cache_shard {
+    std::shared_mutex m_mutex;
+    std::unordered_map<decoded_key, decoded_decl const *, decoded_key_hash> m_map;
+};
+static constexpr size_t g_decoded_cache_num_shards = 64;
+static decoded_cache_shard * g_decoded_cache = nullptr;
+
+/** \brief Decoded code of the persistent declaration `d` in generation `gen`, decoding it on first use. */
+static decoded_decl const * get_decoded_decl(unsigned gen, decl const & d) {
+    decoded_key key { gen, d.raw() };
+    decoded_cache_shard & shard = g_decoded_cache[(reinterpret_cast<uintptr_t>(d.raw()) >> 4) % g_decoded_cache_num_shards];
+    {
+        std::shared_lock<std::shared_mutex> lock(shard.m_mutex);
+        auto it = shard.m_map.find(key);
+        if (it != shard.m_map.end()) return it->second;
+    }
+    decoded_decl * dd = new decoded_decl();
+    ir_decoder dec(*dd, decl_fun_id(d));
+    if (!dec.run(decl_fun_body(d))) { delete dd; dd = nullptr; }
+    std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
+    auto r = shard.m_map.emplace(key, dd);
+    if (!r.second) { delete dd; return r.first->second; } // another thread decoded it first: same result
+    return dd;
+}
+#endif
+
 class interpreter {
     // stack of IR variable slots
     std::vector<value> m_arg_stack;
@@ -497,6 +782,10 @@ class interpreter {
     name_hash_map<symbol_cache_entry> m_symbol_cache;
     // generation of `m_env` in the imported-declaration cache; 0 until the first `get_decl`
     unsigned m_imported_gen = 0;
+#if LEAN_IR_DECODE
+    // decoded code of the persistent declarations this evaluation executed (nullptr: not decodable)
+    std::unordered_map<object *, decoded_decl const *> m_decoded;
+#endif
 
     /** \brief Get current stack frame */
     inline frame & get_frame() {
@@ -890,8 +1179,157 @@ private:
         fn_body const & b = decl_fun_body(d);
         m_arg_stack.resize(get_frame().m_arg_bp + decl_max_var(d).get_small_value());
         m_jp_stack.resize(get_frame().m_jp_bp + decl_max_jp(d).get_small_value());
+#if LEAN_IR_DECODE
+        if (decoded_decl const * dd = get_decoded(d))
+            return eval_decoded(*dd);
+#endif
         return eval_body(b);
     }
+
+#if LEAN_IR_DECODE
+    /** \brief Decoded code of `d` if it is a persistent declaration that could be decoded, else nullptr. */
+    decoded_decl const * get_decoded(decl const & d) {
+        object * o = d.raw();
+        if (!lean_is_persistent(o))
+            return nullptr;
+        auto it = m_decoded.find(o);
+        if (it != m_decoded.end())
+            return it->second;
+        if (m_imported_gen == 0)
+            m_imported_gen = imported_decl_generation(m_env);
+        decoded_decl const * r = get_decoded_decl(m_imported_gen, d);
+        m_decoded.emplace(o, r);
+        return r;
+    }
+
+    /** \brief `eval_body` on decoded code (see `decoded_decl`): same effects, node by node. */
+    value eval_decoded(decoded_decl const & dd) {
+        check_system();
+        size_t const bp = get_frame().m_arg_bp;
+        dinsn const * code = dd.m_code.data();
+        uint32_t const * dargs = dd.m_args.data();
+        uint32_t pc = dd.m_entry;
+        while (true) {
+            dinsn const & ins = code[pc];
+            switch (ins.m_op) {
+            case dop::Expr: {
+                value v = eval_expr(TO_REF(expr, ins.m_obj), ins.m_type);
+                // the stack may have been resized by `eval_expr`: index it afterwards
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Proj:
+                m_arg_stack[bp + ins.m_x] = value(cnstr_get(m_arg_stack[bp + ins.m_a].m_obj, ins.m_b));
+                pc = ins.m_next;
+                break;
+            case dop::TailSelf: {
+                // argument and parameter slots may overlap, so first copy arguments to end of stack
+                size_t old_size = m_arg_stack.size();
+                for (uint32_t i = 0; i < ins.m_b; i++) {
+                    m_arg_stack.push_back(eval_darg(bp, dargs[ins.m_a + i]));
+                }
+                for (uint32_t i = 0; i < ins.m_b; i++) {
+                    m_arg_stack[bp + i] = m_arg_stack[old_size + i];
+                }
+                m_arg_stack.resize(old_size);
+                pc = dd.m_entry;
+                check_system();
+                break;
+            }
+            case dop::Set: {
+                object * o = m_arg_stack[bp + ins.m_x].m_obj;
+                lean_assert(is_exclusive(o));
+                cnstr_set(o, ins.m_b, eval_darg(bp, ins.m_a).m_obj);
+                pc = ins.m_next;
+                break;
+            }
+            case dop::SetTag:
+                cnstr_set_tag(m_arg_stack[bp + ins.m_x].m_obj, ins.m_a);
+                pc = ins.m_next;
+                break;
+            case dop::USet:
+                cnstr_set_usize(m_arg_stack[bp + ins.m_x].m_obj, ins.m_b, m_arg_stack[bp + ins.m_a].m_num);
+                pc = ins.m_next;
+                break;
+            case dop::SSet: {
+                object * o = m_arg_stack[bp + ins.m_x].m_obj;
+                size_t offset = ins.m_b;
+                value v = m_arg_stack[bp + ins.m_a];
+                switch (ins.m_type) {
+                    case type::Float: cnstr_set_float(o, offset, v.m_float); break;
+                    case type::Float32: cnstr_set_float32(o, offset, v.m_float32); break;
+                    case type::UInt8: cnstr_set_uint8(o, offset, v.m_num); break;
+                    case type::UInt16: cnstr_set_uint16(o, offset, v.m_num); break;
+                    case type::UInt32: cnstr_set_uint32(o, offset, v.m_num); break;
+                    case type::UInt64: cnstr_set_uint64(o, offset, v.m_num); break;
+                    case type::USize:
+                    case type::Irrelevant:
+                    case type::Void:
+                    case type::Object:
+                    case type::Tagged:
+                    case type::TObject:
+                    case type::Struct:
+                    case type::Union:
+                        throw exception(sstream() << "invalid instruction");
+                }
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Inc:
+                inc(m_arg_stack[bp + ins.m_x].m_obj, ins.m_a);
+                pc = ins.m_next;
+                break;
+            case dop::Dec:
+                for (uint32_t i = 0; i < ins.m_a; i++) {
+                    dec(m_arg_stack[bp + ins.m_x].m_obj);
+                }
+                pc = ins.m_next;
+                break;
+            case dop::Del:
+                lean_del_object(m_arg_stack[bp + ins.m_x].m_obj);
+                pc = ins.m_next;
+                break;
+            case dop::Case: {
+                unsigned tag;
+                value v = m_arg_stack[bp + ins.m_x];
+                if (type_is_scalar(ins.m_type)) {
+                    tag = v.m_num;
+                } else {
+                    tag = lean_obj_tag(v.m_obj);
+                }
+                dalt const * alts = dd.m_alts.data() + ins.m_a;
+                uint32_t i = 0;
+                for (; i < ins.m_b; i++) {
+                    if (alts[i].m_default || tag == alts[i].m_tag) {
+                        pc = alts[i].m_pc;
+                        break;
+                    }
+                }
+                if (i == ins.m_b)
+                    throw exception("incomplete case");
+                break;
+            }
+            case dop::Ret:
+                return eval_darg(bp, ins.m_x);
+            case dop::Jmp:
+                for (uint32_t i = 0; i < ins.m_b; i++) {
+                    value v = eval_darg(bp, dargs[ins.m_a + i]);
+                    m_arg_stack[bp + dargs[ins.m_c + i]] = v;
+                }
+                pc = ins.m_next;
+                break;
+            case dop::Unreachable:
+                throw exception("unreachable code");
+            }
+        }
+    }
+
+    inline value eval_darg(size_t bp, uint32_t s) {
+        // an "irrelevant" argument is type- or proof-erased; we can use an arbitrary value for it
+        return s == k_dirrelevant ? value(box(0)) : m_arg_stack[bp + s];
+    }
+#endif
 
     // specify argument base pointer explicitly because we've usually already pushed some function arguments
     void push_frame(decl const & d, size_t arg_bp) {
@@ -1368,6 +1806,9 @@ void initialize_ir_interpreter() {
     ir::g_imported_decl_cache = new ir::imported_decl_cache_shard[ir::g_imported_decl_cache_num_shards];
     ir::g_imported_gen_mutex = new std::mutex();
     ir::g_imported_gens = new std::vector<std::pair<object *, bool>>();
+#if LEAN_IR_DECODE
+    ir::g_decoded_cache = new ir::decoded_cache_shard[ir::g_decoded_cache_num_shards];
+#endif
 }
 
 void finalize_ir_interpreter() {
