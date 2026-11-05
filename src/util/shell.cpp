@@ -262,6 +262,7 @@ unsigned get_shell_num_threads(object_ref const & shell_opts) {
 }
 
 extern "C" object * lean_enable_initializer_execution();
+extern "C" void lean_enable_exit_detach();
 
 namespace lean {
 extern void (*g_lean_report_task_get_blocked_time)(std::chrono::nanoseconds);
@@ -319,6 +320,8 @@ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
         return 1;
     }
     lean_enable_initializer_execution();
+    // the frontend exits through `IO.Process.exit`: release the address space in a detached helper (see io.cpp)
+    lean_enable_exit_detach();
 
     // Default the configured thread stack size from the environment as in `lean_run_main`;
     // `--tstack` below overrides it.
