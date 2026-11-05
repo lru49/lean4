@@ -497,6 +497,10 @@ private def AsyncConst.aconsts (c : AsyncConst) : Task AsyncConsts :=
   c.aconstsImpl.map (sync := true) fun dyn =>
     dyn.get? AsyncConsts |>.getD default
 
+/-- `c.aconsts.get` without allocating the intermediate mapped `Task`. -/
+private def AsyncConst.aconstsGet (c : AsyncConst) : AsyncConsts :=
+  c.aconstsImpl.get |>.get? AsyncConsts |>.getD default
+
 private def AsyncConsts.add (aconsts : AsyncConsts) (aconst : AsyncConst) : AsyncConsts :=
   let normalizedName := privateToUserName aconst.constInfo.name
   if let some aconst' := aconsts.normalizedTrie.find? normalizedName then
@@ -516,7 +520,7 @@ private def AsyncConsts.find? (aconsts : AsyncConsts) (declName : Name) : Option
 private def AsyncConsts.findPrefix? (aconsts : AsyncConsts) (declName : Name) : Option AsyncConst :=
   -- as macro scopes are a strict suffix, we do not have to remove them before calling
   -- `findLongestPrefix?`
-  aconsts.normalizedTrie.findLongestPrefix? (privateToUserName declName)
+  aconsts.normalizedTrie.findLongestPrefixName? (privateToUserName declName)
 
 /--
 Finds constants including from other environment branches by recursively looking up longest
@@ -529,7 +533,7 @@ private partial def AsyncConsts.findRec? (aconsts : AsyncConsts) (declName : Nam
   -- If privacy is the only difference between `declName` and `findPrefix?` result, we can assume
   -- `declName` does not exist according to the `add` invariant
   guard <| privateToUserName c.constInfo.name != privateToUserName declName
-  let aconsts ← c.aconsts.get
+  let aconsts := c.aconstsGet
   AsyncConsts.findRec? aconsts declName
 
 /-- Like `findRec?`; allocating tasks is (currently?) too costly to do always. -/
@@ -550,7 +554,7 @@ where go parent? aconsts := do
   -- If privacy is the only difference between `declName` and `findPrefix?` result, we can assume
   -- `declName` does not exist according to the `add` invariant
   guard <| privateToUserName c.constInfo.name != privateToUserName declName
-  go (some c) c.aconsts.get
+  go (some c) c.aconstsGet
 
 /-- Accessibility levels of declarations in `Lean.Environment`. -/
 inductive Environment.Visibility where
@@ -1382,7 +1386,7 @@ where
       seen := seen.insert c.constInfo.name
       acc := acc.push c.constInfo
       unless skipTheoremSubDecls && c.constInfo.kind == .thm do
-        (acc, seen) ← go c.aconsts.get acc seen
+        (acc, seen) ← go c.aconstsGet acc seen
     return (acc, seen)
 
 def setMainModule (env : Environment) (m : Name) : Environment := Id.run do
