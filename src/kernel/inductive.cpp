@@ -1344,6 +1344,13 @@ static expr * g_list_cons_char = nullptr;
 static expr * g_list_nil_char  = nullptr;
 static expr * g_char_of_nat    = nullptr;
 
+bool is_whnf_constructor_app(environment const & env, expr const & e) {
+    expr const & fn = get_app_fn(e);
+    if (!is_constant(fn) || const_name(fn) == const_name(*g_nat_succ))
+        return false;
+    return is_constructor(env, const_name(fn));
+}
+
 expr nat_lit_to_constructor(expr const & e) {
     lean_assert(is_nat_lit(e));
     nat const & v = lit_value(e).get_nat();
