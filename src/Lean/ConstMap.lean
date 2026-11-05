@@ -29,9 +29,20 @@ opaque findConstEntryCachedImpl (cache? : @& Option LookupCache)
     Option (ConstantInfo × Nat) :=
   findConstEntryCachedImpl t.cache? t n
 
+/-- `findConstEntryCachedImpl` without the module index; a hit returns the `Option` stored in the
+cache entry instead of allocating one. -/
+@[extern "lean_imported_consts_find_cached"]
+opaque findConstCachedImpl (cache? : @& Option LookupCache)
+    (t : @& ImportedConsts ConstantInfo) (n : @& Name) : Option ConstantInfo
+
 @[inherit_doc findConstEntryCached?, inline]
 public def findConstCached? (t : ImportedConsts ConstantInfo) (n : Name) : Option ConstantInfo :=
-  (t.findConstEntryCached? n).map (·.1)
+  -- The stage0 binary interprets this code while building stage1 but lacks the native
+  -- implementation of the new extern `findConstCachedImpl`, so it keeps the old projection.
+  if Internal.isStage0 () then
+    (t.findConstEntryCached? n).map (·.1)
+  else
+    findConstCachedImpl t.cache? t n
 
 /--
 The module index of `findConstEntryCached?` plus one, or zero if not found; returning a scalar avoids
