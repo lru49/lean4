@@ -57,5 +57,23 @@ must retain this update. Hits, absent hashes, and definite inequality do not cal
     onEvict { map := c.map.erase key }
     return none
 
+/--
+Like `find?`, but reports exhaustion to the caller instead of evicting the candidate: returns
+`(some v, false)` on a hit, `(none, true)` when the comparison exhausted its budget, and
+`(none, false)` otherwise. A caller that afterwards inserts a value for the same key replaces the
+candidate anyway (one candidate per full hash), so it can skip the separate eviction.
+-/
+@[inline] def findOrExhausted? {β : Type} [BudgetedBEq α] {m : Type → Type w} [Monad m] [MonadLiftT BaseIO m]
+    (c : BudgetedCache α β) (key : α) (budget : USize := 64) : m (Option β × Bool) := do
+  let some (stored, value) := c.map.findEntry? key | return (none, false)
+  match ← BudgetedBEq.beq key stored budget with
+  | .true => return (some value, false)
+  | .false => return (none, false)
+  | .undef => return (none, true)
+
+/-- Removes the candidate stored for the hash of `key`, if any. -/
+@[inline] def erase (c : BudgetedCache α β) (key : α) : BudgetedCache α β :=
+  { map := c.map.erase key }
+
 end BudgetedCache
 end Lean

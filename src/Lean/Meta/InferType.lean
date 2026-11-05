@@ -261,13 +261,18 @@ private def inferFVarType (fvarId : FVarId) : MetaM Expr := do
     inferType
   else
     let key ← mkExprConfigCacheKey e
-    match ← (← get).cache.inferType.find? key (fun c => modifyInferTypeCache fun _ => c) with
+    -- On budget exhaustion the stale candidate is not erased up front: the insertion below replaces
+    -- it (one candidate per hash), which saves one persistent-map update per exhausted lookup.
+    let (cached?, exhausted) ← (← get).cache.inferType.findOrExhausted? key
+    match cached? with
     | some type => return type
     | none =>
       Core.checkInterrupted
       let type ← inferType
-      unless type.hasMVar do
+      if !type.hasMVar then
         modifyInferTypeCache fun c => c.insert key type
+      else if exhausted then
+        modifyInferTypeCache fun c => c.erase key
       return type
 
 /--
