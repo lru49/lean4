@@ -972,6 +972,13 @@ static void free_task(lean_task_object * t) {
     lean_free_small_object((lean_object*)t);
 }
 
+/* lean-perf (self-continuation): true on a pool worker thread while the task manager propagates the
+   completion of a task that worker just ran (`resolve_core` -> `handle_finished` -> `enqueue_core`). The
+   worker goes back to the queue right afterwards, so the first task made ready by that completion does not
+   need to wake another (sleeping) worker: this one takes it (or another queued task) without a futex wake.
+   Typical case: `Task.map` / `bind` chains such as the kernel-check chain of a module. */
+LEAN_THREAD_VALUE(bool, g_worker_skip_one_notify, false);
+
 struct scoped_current_task_object : flet<lean_task_object *> {
     scoped_current_task_object(lean_task_object * t):flet(g_current_task_object, t) {}
 };
@@ -1025,6 +1032,8 @@ class task_manager {
         m_queues_size++;
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
             spawn_worker();
+        else if (g_worker_skip_one_notify)
+            g_worker_skip_one_notify = false;  // the current worker dequeues next (see declaration)
         else
             m_queue_cv.notify_one();
     }
@@ -1083,7 +1092,7 @@ class task_manager {
 
                 lean_task_object * t = dequeue();
                 m_idle_std_workers--;
-                run_task(lock, t);
+                run_task(lock, t, /* std_worker */ true);
                 m_idle_std_workers++;
                 reset_heartbeat();
             }
@@ -1103,7 +1112,10 @@ class task_manager {
         // `lthread` will be implicitly freed, which frees up its control resources but does not terminate the thread
     }
 
-    void run_task(unique_lock<mutex> & lock, lean_task_object * t) {
+    void run_task(unique_lock<mutex> & lock, lean_task_object * t, bool std_worker = false) {
+        // lean-perf: a `(sync := true)` dependent run inline from `handle_finished` must not consume the
+        // enclosing worker's skipped wake-up (e.g. for a task it spawns); restored on return
+        flet<bool> no_skip(g_worker_skip_one_notify, false);
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
         lean_assert(imp);
         if (imp->m_deleted) {
@@ -1136,7 +1148,13 @@ class task_manager {
             lock.lock();
         } else if (v != nullptr) {
             lean_assert(imp->m_closure == nullptr);
+            /* lean-perf: this worker may take the next task itself only if the worker throttle (see the
+               worker loop) will let it dequeue once it is idle again */
+            bool self = std_worker && !m_shutting_down &&
+                m_std_workers.size() - m_idle_std_workers - 1 < m_max_std_workers;
+            g_worker_skip_one_notify = self;
             resolve_core(lock, t, v);
+            g_worker_skip_one_notify = false;
         } else {
             // `bind` task has not finished yet, re-add as dependency of nested task
             // NOTE: closure MUST be extracted before unlocking the mutex as otherwise
