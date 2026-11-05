@@ -735,46 +735,6 @@ namespace Environment
 def trackedGen (env : Environment) : Nat :=
   env.base.private.trackedGen
 
-/--
-Indices (`EnvExtension.idx`) of the environment extensions whose writes never change the result of a
-`Meta`-level computation about existing declarations (`whnf`, `inferType`, `isDefEq`, type class
-resolution, instantiating constant types and values): bookkeeping that elaboration does not consult,
-such as doc strings and declaration ranges. Registered by `EnvExtension.markMetaCacheSafe`; read by
-`Environment.cachesSurvive`, which lets `CoreM`/`MetaM` keep their caches across a write to such an
-extension. A registry rather than a field of `EnvExtension`, so that the extension's layout is unchanged.
--/
-private builtin_initialize metaCacheSafeExtsRef : IO.Ref (Array Nat) ← IO.mkRef #[]
-
-/-- `cachesSurviveUnsafe` on the extension-state arrays: every slot whose state object changed belongs to a cache-safe extension. -/
-private unsafe def extensionsSurvive (oe ne : Array EnvExtensionState) (safe : Array Nat) (i : Nat) : Bool :=
-  if h : i < oe.size then
-    if h' : i < ne.size then
-      (ptrEq oe[i] ne[i] || safe.contains i) && extensionsSurvive oe ne safe (i + 1)
-    else
-      false
-  else
-    true
-
-/--
-Whether results cached under `old` that depend only on the constants, reducibility, instances and
-other declaration-keyed or reduction-relevant environment state (the `Core.Cache` of instantiated
-constant types and values, the `Meta.Cache` of `whnf`/`inferType`/`isDefEq`/type class results) are
-still valid under `new`: the constant map is the very same object, no constant was announced
-(`constGen`), and every extension state that changed belongs to an extension registered as
-cache-safe (`metaCacheSafeExtsRef`). `CoreM` and `MetaM` keep their caches across `modifyEnv` exactly
-when this holds and drop them otherwise, as they used to do unconditionally.
--/
-unsafe def cachesSurviveUnsafe (old new : Environment) : Bool :=
-  ptrEq old.base.private.constants new.base.private.constants &&
-    old.constGen == new.constGen &&
-    (let oe := old.base.private.extensions
-     let ne := new.base.private.extensions
-     ptrEq oe ne ||
-       (oe.size == ne.size &&
-         extensionsSurvive oe ne (unsafeBaseIO (metaCacheSafeExtsRef.get : BaseIO (Array Nat))) 0))
-
-@[implemented_by cachesSurviveUnsafe, inherit_doc cachesSurviveUnsafe]
-opaque cachesSurvive (old new : Environment) : Bool
 
 def header (env : Environment) : EnvironmentHeader :=
   -- can be assumed to be in sync with `env.checked`; see `setMainModule`, the only modifier of the header
@@ -1621,16 +1581,63 @@ namespace EnvExtension
 def isGenTracked (ext : EnvExtension σ) : Bool :=
   ext.genIdx?.isSome
 
-/--
-Registers `ext` as cache-safe (see `metaCacheSafeExtsRef`): its writes never change the result of a
-`Meta`-level computation about existing declarations, so `CoreM`/`MetaM` keep their caches across them
-(`Environment.cachesSurvive`). Call once, right after registering the extension.
--/
-def markMetaCacheSafe (ext : EnvExtension σ) : IO Unit :=
-  Environment.metaCacheSafeExtsRef.modify (·.push ext.idx)
 
 private builtin_initialize envExtensionsRef : IO.Ref (Array (EnvExtension EnvExtensionState)) ← IO.mkRef #[]
 private builtin_initialize numTrackedExtsRef : IO.Ref Nat ← IO.mkRef 0
+
+/--
+Names of the environment extensions whose writes never change the result of a `Meta`-level
+computation about existing declarations (`whnf`, `inferType`, `isDefEq`, type class resolution,
+instantiating constant types and values): bookkeeping that elaboration does not consult. Writes to
+them let `CoreM`/`MetaM` keep their caches (`Environment.cachesSurvive`); every other extension write
+drops them, as before. A fixed list compared against `EnvExtension.name` (after removing a private
+prefix), so that no declaration's layout or signature changes and no new initializer is needed.
+-/
+private def metaCacheSafeExtNames : List Name :=
+  [`Lean.docStringExt, `Lean.versoDocStringExt, `Lean.inheritDocStringExt, `Lean.declRangeExt]
+
+/--
+`Environment.cachesSurvive` on the extension-state arrays: every slot whose state object changed must
+belong to a cache-safe extension (`metaCacheSafeExtNames`; `exts` is the registry of all extensions,
+indexed like the state arrays).
+-/
+private unsafe def extensionsSurvive (oe ne : Array EnvExtensionState)
+    (exts : Array (EnvExtension EnvExtensionState)) (i : Nat) : Bool :=
+  if h : i < oe.size then
+    if h' : i < ne.size then
+      (ptrEq oe[i] ne[i] ||
+          (i < exts.size && metaCacheSafeExtNames.contains (privateToUserName exts[i]!.name))) &&
+        extensionsSurvive oe ne exts (i + 1)
+    else
+      false
+  else
+    true
+
+end EnvExtension
+
+/--
+Whether results cached under `old` that depend only on the constants, reducibility, instances and
+other declaration-keyed or reduction-relevant environment state (the `Core.Cache` of instantiated
+constant types and values, the `Meta.Cache` of `whnf`/`inferType`/`isDefEq`/type class results) are
+still valid under `new`: the constant map is the very same object, no constant was announced
+(`constGen`), and every extension state that changed belongs to one of the extensions elaboration
+never consults (`EnvExtension.metaCacheSafeExtNames`: doc strings, declaration ranges). `CoreM` and
+`MetaM` keep their caches across `modifyEnv` exactly when this holds and drop them otherwise, as
+they used to do unconditionally.
+-/
+unsafe def Environment.cachesSurviveUnsafe (old new : Environment) : Bool :=
+  ptrEq old.base.private.constants new.base.private.constants &&
+    old.constGen == new.constGen &&
+    (let oe := old.base.private.extensions
+     let ne := new.base.private.extensions
+     ptrEq oe ne ||
+       (oe.size == ne.size &&
+         EnvExtension.extensionsSurvive oe ne (unsafeBaseIO (EnvExtension.envExtensionsRef.get : BaseIO _)) 0))
+
+@[implemented_by Environment.cachesSurviveUnsafe, inherit_doc Environment.cachesSurviveUnsafe]
+opaque Environment.cachesSurvive (old new : Environment) : Bool
+
+namespace EnvExtension
 
 /-- Pads `gens` with initial generations for the generation-tracked extensions registered since. -/
 private def ensureGensArraySize (gens : Array Nat) : IO (Array Nat) := do
