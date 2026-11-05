@@ -329,13 +329,15 @@ private def withSavedPartialInfoContext [MonadFinally m]
   let treesSaved ← getResetInfoTrees
   Prod.fst <$> MonadFinally.tryFinally' x fun _ => do
     let st    ← getInfoState
-    let trees ← st.trees.mapM fun tree => do
-      let tree := tree.substitute st.assignment
-      match (← ctx?) with
-      | none =>
-        pure tree
-      | some ctx =>
-        pure <| InfoTree.context ctx tree
+    -- `ctx?` only reads the state, which does not change while the trees are mapped: evaluate it
+    -- once instead of once per tree (and not at all when there are no trees).
+    let trees ← if st.trees.isEmpty then pure st.trees else do
+      let ctx? ← ctx?
+      pure <| st.trees.map fun t =>
+        let tree := t.substitute st.assignment
+        match ctx? with
+        | none     => tree
+        | some ctx => InfoTree.context ctx tree
     modifyInfoTrees fun _ => treesSaved ++ trees
 
 /--
