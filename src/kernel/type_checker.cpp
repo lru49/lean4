@@ -69,7 +69,8 @@ void type_checker::state::retarget(environment const & env) {
        and the `unsafe`/`partial` safety checks of `infer_constant`. `m_failure` holds negative `is_def_eq` answers,
        which are incomplete and depend on `m_eager_reduce`; a stale failure could reject a declaration another checker
        would accept. Everything else is a function of the environment and of this state's own fvars. */
-    m_infer_type[0].clear();
+    /* `m_infer_type[0]` is no longer cleared here: `use_check_config` drops it when a check runs under a different
+       configuration than the one its entries were computed under. */
     m_failure.clear();
 }
 
@@ -485,12 +486,29 @@ expr type_checker::infer_type(expr const & e) {
     return infer_type_core(e, true);
 }
 
+/* Make the check-mode cache `m_infer_type[0]` consistent with the checker configuration of the check about to run: its
+   entries skip `check_level` against the universe parameter list (or no check at all) and the `unsafe`/`partial` safety
+   tests of `infer_constant` that were in effect when they were computed, so they may be reused only under the same list
+   (compared structurally, names are values) and the same safety. */
+void type_checker::use_check_config(names const * lps) {
+    state & st = *m_st;
+    bool has = lps != nullptr;
+    if (st.m_check_cfg_set && st.m_check_has_lparams == has && st.m_check_safety == m_definition_safety &&
+        (!has || st.m_check_lparams == *lps))
+        return;
+    st.m_infer_type[0].clear();
+    st.m_check_cfg_set = true; st.m_check_has_lparams = has; st.m_check_safety = m_definition_safety;
+    st.m_check_lparams = has ? *lps : names();
+}
+
 expr type_checker::check(expr const & e, names const & lps) {
+    use_check_config(&lps);
     flet<names const *> updt(m_lparams, &lps);
     return infer_type_core(e, false);
 }
 
 expr type_checker::check_ignore_undefined_universes(expr const & e) {
+    use_check_config(nullptr);
     flet<names const *> updt(m_lparams, nullptr);
     return infer_type_core(e, false);
 }
