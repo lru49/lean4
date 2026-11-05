@@ -128,6 +128,9 @@ protected unsafe def init {γ} (df : Def γ) (attrDeclName : Name := by exact de
     addEntry     := fun s e => s.insert e
     toOLeanEntry := (·.toOLeanEntry)
   }
+  -- lean-perf (L05): `ofOLeanEntry` only evaluates imported constants and `mkInitial` only reads the
+  -- builtin table, so the imported state may be computed on a task after `runInitAttrs`
+  registerParallelAfterInitExt attrDeclName
   unless df.builtinName.isAnonymous do
     registerBuiltinAttribute {
       ref   := attrDeclName
