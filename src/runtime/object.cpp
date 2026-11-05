@@ -2385,6 +2385,30 @@ static void check_string_linearity(b_obj_arg s) {
     }
 }
 
+// =======================================
+// Owned thread-shared objects with a single reference
+
+/* `o` is OWNED by the caller. A thread-shared (MT) object whose count shows exactly one reference is then referenced by
+   nobody else: every other holder (an object field, another thread, a task result, a `Ref`) would own a count of its own.
+   Such an object can become single-threaded (ST) again and be updated in place instead of being copied. Its children keep
+   their marks (an ST object may point to MT objects; the converse invariant is unaffected), and if it is later published
+   again (`IO.Ref.set`, a task result) `lean_mark_mt` re-marks this object only, stopping at its MT children.
+   The acquire load pairs with the acq_rel decrement by which other threads dropped their references, so their accesses
+   happen-before our in-place writes. Never called on borrowed objects (a borrowed MT reference with count 1 may be owned by
+   an object other threads can reach). Upstream removed MT exclusivity from `lean_is_exclusive` (9e9a036475) because an
+   in-place-updated MT object could point to unmarked ST objects; turning the object into an ST object avoids exactly that.
+   `LEAN_MT_UNIQUE_REUSE=0` disables the conversion (copy as upstream). */
+static bool g_mt_unique_reuse = [] { char const * e = getenv("LEAN_MT_UNIQUE_REUSE"); return !(e && e[0] == '0'); }();
+
+static inline bool mt_unique_to_st(object * o) {
+    if (!lean_is_mt(o) || !g_mt_unique_reuse)
+        return false;
+    if (std::atomic_load_explicit(lean_get_rc_mt_addr(o), std::memory_order_acquire) != -1)
+        return false;
+    lean_internal_set_rc(o, 1);
+    return true;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_copy_string(obj_arg s, size_t cap) {
     size_t sz  = lean_string_size(s);
     lean_assert(cap >= sz);
@@ -2397,6 +2421,10 @@ extern "C" LEAN_EXPORT obj_res lean_copy_string(obj_arg s, size_t cap) {
 
 __attribute__((noinline))
 extern "C" LEAN_EXPORT obj_res lean_copy_string_nonlinear(obj_arg s, size_t cap) {
+    if (mt_unique_to_st(s)) {
+        if (cap <= lean_string_capacity(s)) return s;
+        return lean_copy_string(s, cap);
+    }
     check_string_linearity(s);
     return lean_copy_string(s, cap);
 }
@@ -2865,6 +2893,10 @@ extern "C" LEAN_EXPORT obj_res lean_copy_sarray(obj_arg a, size_t cap) {
 
 __attribute__((noinline))
 extern "C" LEAN_EXPORT obj_res lean_copy_sarray_nonlinear(obj_arg a, size_t cap) {
+    if (mt_unique_to_st(a)) {
+        if (cap <= lean_sarray_capacity(a)) return a;
+        return lean_copy_sarray(a, cap);
+    }
     if (lean_sarray_is_marked_linear(a) && should_abort_on_nonlinearity()) {
         lean_internal_panic("scalar array marked by `markLinear` was used non-linearly");
     }
@@ -3032,6 +3064,10 @@ extern "C" LEAN_EXPORT obj_res lean_copy_expand_array(obj_arg a, bool expand) {
 
 __attribute__((noinline))
 extern "C" LEAN_EXPORT obj_res lean_copy_expand_array_nonlinear(obj_arg a, bool expand) {
+    if (mt_unique_to_st(a)) {
+        if (!expand) return a;
+        return lean_copy_expand_array(a, true); // exclusive now: moves the elements (memcpy), no inc/dec
+    }
     if (lean_array_is_marked_linear(a) && should_abort_on_nonlinearity()) {
         lean_internal_panic("array marked by `Array.markLinear` was used non-linearly");
     }
