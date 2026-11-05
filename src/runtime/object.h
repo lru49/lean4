@@ -9,6 +9,8 @@ Author: Leonardo de Moura
 #include <lean/lean.h>
 #include "runtime/mpz.h"
 
+/* lean-perf (CJ): see object.cpp (deferred release of large object graphs). */
+extern "C" LEAN_EXPORT void lean_deferred_free_barrier();
 namespace lean {
 
 typedef lean_object object;

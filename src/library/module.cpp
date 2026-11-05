@@ -621,6 +621,8 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 }
 
 extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object *) {
+    // lean-perf (CJ): objects released on the runtime's release thread may still point into this region
+    lean_deferred_free_barrier();
     char * buffer = region_buffer(region);
     size_t full_sz = region_size(region);
     bool is_mmap = lean_ctor_get_uint8(region, sizeof(void*) * 5) != 0;
