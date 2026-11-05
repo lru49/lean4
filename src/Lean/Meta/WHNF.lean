@@ -1067,11 +1067,11 @@ partial def whnfImp (e : Expr) : MetaM Expr :=
     if (← useWHNFCache e) then
       -- one key for the lookup and the insertion: the configuration does not change in between
       let key ← mkExprConfigCacheKey e
-      match (← get).cache.whnf.find? key with
+      match (← get).cache.whnf.get? key with
       | some e' => pure e'
       | none    =>
         let r ← whnfUncached e
-        modify fun s => { s with cache.whnf := s.cache.whnf.insert key r }
+        modifyWhnfCache fun c => c.insert key r
         return r
     else
       whnfUncached e

@@ -9,6 +9,7 @@ prelude
 public import Init.Control.Do
 public import Lean.Data.LOption
 public import Lean.Data.BudgetedCache
+public import Std.Data.HashMap.Basic
 public import Lean.Class
 public import Lean.ReducibilityAttrs
 public import Lean.Util.MonadBacktrack
@@ -542,7 +543,12 @@ instance : BudgetedBEq ExprConfigCacheKey where
 
 abbrev InferTypeCache  := BudgetedCache ExprConfigCacheKey Expr
 abbrev FunInfoCache    := PersistentHashMap InfoCacheKey FunInfo
-abbrev WhnfCache       := PersistentHashMap ExprConfigCacheKey Expr
+/--
+The `whnf` cache of one `MetaM` run is a mutable hash map updated in place, not a persistent one:
+`Meta.saveState` deliberately leaves it out of the saved copy (a rollback keeps the current `Meta.Cache`
+anyway, see `SavedState.restore`), so the live state holds the only reference and `insert` never copies.
+-/
+abbrev WhnfCache       := Std.HashMap ExprConfigCacheKey Expr
 abbrev IsUnitLikeCache := PersistentHashMap ExprConfigCacheKey Bool
 
 structure DefEqCacheKey where
@@ -771,8 +777,11 @@ instance : MonadEnv MetaM where
 instance : AddMessageContext MetaM where
   addMessageContext := addMessageContextFull
 
-protected def saveState : MetaM SavedState :=
-  return { core := (← Core.saveState), «meta» := (← get) }
+protected def saveState : MetaM SavedState := do
+  -- The `whnf` cache is a mutable hash map that `restore` never reads back (the current cache is kept);
+  -- leaving it out of the copy keeps the live map uniquely referenced, so inserts stay in place.
+  let s ← get
+  return { core := (← Core.saveState), «meta» := { s with cache.whnf := {} } }
 
 /--
 Drops the entries a rollback to an environment `env` invalidates: those stamped after changes it
@@ -868,6 +877,9 @@ def resetCache : MetaM Unit :=
 
 @[inline] def modifyInferTypeCache (f : InferTypeCache → InferTypeCache) : MetaM Unit :=
   modifyCache fun ⟨ic, c1, c2, c3, c4, c5, c6⟩ => ⟨f ic, c1, c2, c3, c4, c5, c6⟩
+
+@[inline] def modifyWhnfCache (f : WhnfCache → WhnfCache) : MetaM Unit :=
+  modifyCache fun ⟨c1, c2, c3, whnf, c4, c5, c6⟩ => ⟨c1, c2, c3, f whnf, c4, c5, c6⟩
 
 @[inline] def modifyDefEqTransientCache (f : DefEqCache → DefEqCache) : MetaM Unit :=
   modifyCache fun ⟨c1, c2, c3, c4, defeqTrans, c5, c6⟩ => ⟨c1, c2, c3, c4, f defeqTrans, c5, c6⟩
