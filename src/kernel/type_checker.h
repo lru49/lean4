@@ -44,6 +44,7 @@ public:
            keyed by `mk_app(rec_fn, rule_rhs)` (`rec_fn` = the recursor constant with its universe levels). A pure
            function of the rule object and the levels, as `m_unfold` is for definitions (see `instantiate_rec_rhs`). */
         expr_flat_map<expr>       m_rec_rhs;
+        expr_flat_map<expr>       m_wc1, m_wc2;  // DIAG
         friend type_checker;
     public:
         state(environment const & env);

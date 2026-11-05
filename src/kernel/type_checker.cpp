@@ -12,6 +12,8 @@ Author: Leonardo de Moura
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <cstdio>
 #include "runtime/interrupt.h"
 #include "runtime/sstream.h"
 #include "runtime/flet.h"
@@ -27,6 +29,21 @@ Author: Leonardo de Moura
 #include "kernel/inductive.h"
 
 namespace lean {
+// ---- DIAGNOSTIC (diag-cb-whnf, not for the branch): whnf_core cache use by key category ----
+// cat 0 = outer call (from whnf's first step / is_def_eq / infer / ...), 1 = fresh unfolded term from whnf's loop (iteration > 0),
+// 2 = reduct inside whnf_core (beta / proj / let / iota / re-app)
+static std::atomic<uint64_t> g_wc_lookup[3], g_wc_hit_by[3][3], g_wc_ins[3], g_w_lookup, g_w_hit, g_w_iter, g_rr_lookup, g_rr_hit;
+static thread_local int g_wc_cat = 0;
+static void print_wc_stats() {
+    if (!getenv("LEAN_KERNEL_WHNF_STATS")) return;
+    for (int c = 0; c < 3; c++)
+        fprintf(stderr, "WCSTAT cat%d lookups=%llu ins=%llu hits_on_key_cat0=%llu cat1=%llu cat2=%llu\n", c,
+            (unsigned long long)g_wc_lookup[c].load(), (unsigned long long)g_wc_ins[c].load(),
+            (unsigned long long)g_wc_hit_by[c][0].load(), (unsigned long long)g_wc_hit_by[c][1].load(), (unsigned long long)g_wc_hit_by[c][2].load());
+    fprintf(stderr, "WCSTAT whnf lookups=%llu hits=%llu loop_iters=%llu rec_rhs lookups=%llu hits=%llu\n",
+        (unsigned long long)g_w_lookup.load(), (unsigned long long)g_w_hit.load(), (unsigned long long)g_w_iter.load(),
+        (unsigned long long)g_rr_lookup.load(), (unsigned long long)g_rr_hit.load());
+}
 static name * g_kernel_fresh = nullptr;
 static expr * g_dont_care    = nullptr;
 static name * g_bool_true    = nullptr;
@@ -527,8 +544,9 @@ expr type_checker::instantiate_rec_rhs(expr const & rec_fn, expr const & rhs, na
     if (is_nil(ls) || !has_param_univ(rhs))
         return rhs;   // = instantiate_lparams(rhs, lps, ls): nothing to substitute
     expr key = mk_app(rec_fn, rhs);
+    g_rr_lookup++;
     if (lean_object * cached = m_st->m_rec_rhs.find(key))
-        return expr(cached, true);
+        { g_rr_hit++; return expr(cached, true); }
     expr r = instantiate_lparams(rhs, lps, ls);
     m_st->m_rec_rhs.insert(key, r);
     return r;
@@ -615,9 +633,13 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
         break;
     }
 
+    int my_cat = g_wc_cat; g_wc_cat = 2;   // every nested call below is a reduct unless reset
+    g_wc_lookup[my_cat]++;
     // check cache
-    if (lean_object * cached = m_st->m_whnf_core.find(e))
-        return expr(cached, true);
+    if (lean_object * cached = m_st->m_whnf_core.find(e)) { g_wc_hit_by[my_cat][0]++; g_wc_cat = my_cat; return expr(cached, true); }
+    if (lean_object * cached = m_st->m_wc1.find(e)) { g_wc_hit_by[my_cat][1]++; g_wc_cat = my_cat; return expr(cached, true); }
+    if (lean_object * cached = m_st->m_wc2.find(e)) { g_wc_hit_by[my_cat][2]++; g_wc_cat = my_cat; return expr(cached, true); }
+    struct restore_cat { int c; ~restore_cat() { g_wc_cat = c; } } _rc{my_cat};
 
     // do the actual work
     expr r;
@@ -638,7 +660,7 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     case expr_kind::App: {
         buffer<expr> args;
         expr f0 = get_app_rev_args(e, args);
-        expr f = whnf_core(f0, cheap_rec, cheap_proj);
+        g_wc_cat = 0; expr f = whnf_core(f0, cheap_rec, cheap_proj); g_wc_cat = 2;
         if (is_lambda(f)) {
             unsigned m = 1;
             unsigned num_args = args.size();
@@ -672,7 +694,10 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     }
 
     if (!cheap_rec && !cheap_proj) {
-        m_st->m_whnf_core.insert(e, r);
+        g_wc_ins[my_cat]++;
+        if (my_cat == 0) m_st->m_whnf_core.insert(e, r);
+        else if (my_cat == 1) m_st->m_wc1.insert(e, r);
+        else m_st->m_wc2.insert(e, r);
     }
     return r;
 }
@@ -847,13 +872,17 @@ expr type_checker::whnf(expr const & e) {
         break;
     }
 
+    g_w_lookup++;
     // check cache
     if (lean_object * cached = m_st->m_whnf.find(e))
-        return expr(cached, true);
+        { g_w_hit++; return expr(cached, true); }
 
     expr t = e;
+    bool first = true;
     while (true) {
+        int saved = g_wc_cat; g_wc_cat = first ? 0 : 1; first = false; g_w_iter++;
         expr t1 = whnf_core(t);
+        g_wc_cat = saved;
         if (auto v = reduce_nat(t1)) {
             m_st->m_whnf.insert(e, *v);
             return *v;
@@ -1431,6 +1460,7 @@ static size_t read_nat_size_env(char const * var, size_t default_value) {
 }
 
 void initialize_type_checker() {
+    atexit(print_wc_stats);
     init_kernel_state_pool_config();
     g_kernel_state_pool = new kernel_state_pool();
     g_nat_max_size = read_nat_size_env("LEAN_NAT_MAX_SIZE", LEAN_NAT_MAX_SIZE_DEFAULT);
