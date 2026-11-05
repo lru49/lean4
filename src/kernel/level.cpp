@@ -7,6 +7,7 @@ Author: Leonardo de Moura
 #include <utility>
 #include <algorithm>
 #include <vector>
+#include <initializer_list>
 #include <unordered_set>
 #include "runtime/debug.h"
 #include "runtime/interrupt.h"
@@ -33,11 +34,6 @@ level mk_succ(level const & l) { return level(lean_level_mk_succ(l.to_obj_arg())
 level mk_max_core(level const & l1, level const & l2) { return level(lean_level_mk_max(l1.to_obj_arg(), l2.to_obj_arg())); }
 level mk_imax_core(level const & l1, level const & l2) { return level(lean_level_mk_imax(l1.to_obj_arg(), l2.to_obj_arg())); }
 level mk_univ_param(name const & n) { return level(lean_level_mk_param(n.to_obj_arg())); }
-
-unsigned level::hash() const { return lean_level_hash(to_obj_arg()); }
-unsigned get_depth(level const & l) { return lean_level_depth(l.to_obj_arg()); }
-bool has_param(level const & l) { return lean_level_has_param(l.to_obj_arg()); }
-bool has_mvar(level const & l) { return lean_level_has_mvar(l.to_obj_arg()); }
 
 extern "C" LEAN_EXPORT uint64_t lean_level_mk_data (uint64_t h, object * depth, uint8_t hasMVar, uint8_t hasParam) {
     if (!is_scalar(depth))
@@ -116,9 +112,9 @@ level mk_imax(level const & l1, level const & l2) {
 }
 
 bool operator==(level const & l1, level const & l2) {
+    if (is_eqp(l1, l2))       return true;
     if (kind(l1) != kind(l2)) return false;
     if (hash(l1) != hash(l2)) return false;
-    if (is_eqp(l1, l2))       return true;
     switch (kind(l1)) {
     case level_kind::Zero:
         return true;
@@ -517,6 +513,14 @@ void initialize_level() {
     mark_persistent(g_level_zero->raw());
     g_level_one  = new level(mk_succ(*g_level_zero));
     mark_persistent(g_level_one->raw());
+    // `get_level_data` hard-codes the data of `Level.zero` and reads the computed field of the other
+    // constructors directly; check both against the Lean-side accessors once.
+    level two_field = mk_imax_core(*g_level_one, *g_level_zero);
+    for (level const * l : {g_level_zero, g_level_one, &two_field}) {
+        if (lean_level_hash(l->to_obj_arg()) != l->hash() || lean_level_depth(l->to_obj_arg()) != get_depth(*l) ||
+            lean_level_has_mvar(l->to_obj_arg()) != has_mvar(*l) || lean_level_has_param(l->to_obj_arg()) != has_param(*l))
+            lean_internal_panic("universe level data layout does not match `Level.data`");
+    }
 }
 
 void finalize_level() {
