@@ -877,6 +877,15 @@ static obj_res mark_mt_fn(obj_arg o) {
     return lean_box(0);
 }
 
+// lane CU diagnostic (not a candidate): counts of lean_mark_mt calls / objects marked, printed at exit with LEAN_MT_STATS=1
+static std::atomic<uint64_t> g_mt_calls{0}, g_mt_objs{0}, g_mt_big{0}, g_mt_tag[256];
+static void mt_stats_print() {
+    fprintf(stderr, "mt-stats: calls=%llu marked=%llu calls>=1000=%llu", (unsigned long long)g_mt_calls.load(), (unsigned long long)g_mt_objs.load(), (unsigned long long)g_mt_big.load());
+    for (int t = 0; t < 256; t++) if (g_mt_tag[t].load()) fprintf(stderr, " tag%d=%llu", t, (unsigned long long)g_mt_tag[t].load());
+    fprintf(stderr, "\n");
+}
+static bool g_mt_stats = [] { char const * e = std::getenv("LEAN_MT_STATS"); if (e && e[0] == '1') { atexit(mt_stats_print); return true; } return false; }();
+
 extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 #ifndef LEAN_MULTI_THREAD
     return;
@@ -884,6 +893,7 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
     if (lean_is_scalar(o) || !is_unshared(o)) return;
 
     buffer<object*> todo;
+    uint64_t n_marked = 0;
     todo.push_back(o);
     while (!todo.empty()) {
         object * o = todo.back();
@@ -895,6 +905,7 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
             int rc = lean_internal_get_rc(o);
             lean_internal_set_rc(o, rc < 0 || -rc <= LEAN_RC_STICKY_DROP ? LEAN_RC_STICKY : -rc);
             uint8_t tag = lean_ptr_tag(o);
+            n_marked++; if (g_mt_stats) g_mt_tag[tag > LeanMaxCtorTag ? tag : 0].fetch_add(1, std::memory_order_relaxed);
             if (tag <= LeanMaxCtorTag) {
                 object ** it  = lean_ctor_obj_cptr(o);
                 object ** end = it + lean_ctor_num_objs(o);
@@ -943,6 +954,7 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
             }
         }
     }
+    if (g_mt_stats) { g_mt_calls.fetch_add(1, std::memory_order_relaxed); g_mt_objs.fetch_add(n_marked, std::memory_order_relaxed); if (n_marked >= 1000) g_mt_big.fetch_add(1, std::memory_order_relaxed); }
 }
 
 // =======================================
