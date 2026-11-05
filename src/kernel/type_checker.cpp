@@ -1199,8 +1199,19 @@ inline optional<expr> is_nat_succ(expr const & t) {
 lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
     if (is_nat_zero(t) && is_nat_zero(s))
         return l_true;
-    optional<expr> pred_t = is_nat_succ(t);
-    optional<expr> pred_s = is_nat_succ(s);
+    /* `is_nat_succ` allocates a fresh literal `n-1` for a nonzero literal; most calls (one per lazy delta
+       step) have a side that is neither a literal nor `Nat.succ _`. Test the side that does not allocate first
+       so that no predecessor literal is built when the other side fails. */
+    optional<expr> pred_t, pred_s;
+    if (!is_nat_lit(t)) {
+        pred_t = is_nat_succ(t);
+        if (!pred_t) return l_undef;
+        pred_s = is_nat_succ(s);
+    } else {
+        pred_s = is_nat_succ(s);
+        if (!pred_s) return l_undef;
+        pred_t = is_nat_succ(t);
+    }
     if (pred_t && pred_s) {
         return to_lbool(is_def_eq_core(*pred_t, *pred_s));
     }
