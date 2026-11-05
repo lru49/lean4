@@ -1209,12 +1209,21 @@ inline optional<expr> is_nat_succ(expr const & t) {
     return none_expr();
 }
 
+/* `is_nat_succ(t)` is defined, without building the predecessor. */
+inline bool has_nat_pred(expr const & t) {
+    if (is_nat_lit(t) && !lit_value(t).is_zero())
+        return true;
+    return is_nat_const(get_app_fn(t), *g_nat_succ) && get_app_num_args(t) == 1;
+}
+
 lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
     if (is_nat_zero(t) && is_nat_zero(s))
         return l_true;
-    optional<expr> pred_t = is_nat_succ(t);
-    optional<expr> pred_s = is_nat_succ(s);
-    if (pred_t && pred_s) {
+    /* Build the predecessors (for a literal: a new literal `n - 1`) only when both sides have one; this test runs on
+       every lazy delta step, mostly with at most one side a successor. */
+    if (has_nat_pred(t) && has_nat_pred(s)) {
+        optional<expr> pred_t = is_nat_succ(t);
+        optional<expr> pred_s = is_nat_succ(s);
         return to_lbool(is_def_eq_core(*pred_t, *pred_s));
     }
     return l_undef;
