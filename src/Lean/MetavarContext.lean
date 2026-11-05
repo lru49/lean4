@@ -621,6 +621,9 @@ This operation is performed at `instantiateExprMVars`, `elimMVarDeps`, and `leve
 opaque instantiateLevelMVarsImp (mctx : MetavarContext) (l : Level) : MetavarContext × Level
 
 partial def instantiateLevelMVars [Monad m] [MonadMCtx m] (l : Level) : m Level := do
+  -- Without level metavariables the native pass returns `l` and the context unchanged; skip the
+  -- context round trip (and, in `MetaM`, the state update of `setMCtx`).
+  if !l.hasMVar then return l
   let (mctx, lNew) := instantiateLevelMVarsImp (← getMCtx) l
   setMCtx mctx
   return lNew
