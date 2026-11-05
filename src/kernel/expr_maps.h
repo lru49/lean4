@@ -43,7 +43,10 @@ class expr_flat_map {
     static bool key_eq(entry const & e, expr const & k) {
         // pointer equality first (the common hit: the same object is looked up again); `std::equal_to<expr>` = is_equal
         // itself compares the two objects' stored hashes before anything structural
-        return e.m_key == k.raw() || std::equal_to<expr>()(k, *reinterpret_cast<expr const *>(&e.m_key));
+        if (e.m_key == k.raw()) { DD_INC(DD_KEQ_PTR); return true; }
+        bool r = std::equal_to<expr>()(k, *reinterpret_cast<expr const *>(&e.m_key));
+        if (r) DD_INC(DD_KEQ_STRUCT); else DD_INC(DD_KEQ_MISS);
+        return r;
     }
     void grow() {
         size_t new_cap  = m_tab ? (m_mask + 1) * 2 : INITIAL_CAP;

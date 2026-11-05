@@ -1,3 +1,6 @@
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
 /*
 Copyright (c) 2013-2014 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
@@ -149,7 +152,20 @@ extern "C" object * lean_expr_mk_const(obj_arg n, obj_arg ls);
 expr mk_const(name const & n, levels const & ls) { return expr(lean_expr_mk_const(n.to_obj_arg(), ls.to_obj_arg())); }
 
 extern "C" object * lean_expr_mk_app(obj_arg f, obj_arg a);
-expr mk_app(expr const & f, expr const & a) { return expr(lean_expr_mk_app(f.to_obj_arg(), a.to_obj_arg())); }
+unsigned long long g_dd_cnt[DD_N];
+thread_local int g_dd_in_wc = 0;
+static const char * g_dd_names[DD_N] = {"wc_app_work","lookup_fresh","hit_fresh","lookup_all","hit_all","beta","beta_rest_nodes",
+  "beta_fusable","beta_fuse_saved_nodes","iota","iota_spine_nodes","iota_rhs_fusable","natlit_ctor","mkapp_in_wc","mkapp_all",
+  "upd_new_in_wc","upd_new_all","reapply_nodes","let","keq_ptr","keq_struct","keq_miss","iota_then_beta_head_lambda","whnf_calls"};
+void dd_dump() {
+    if (!getenv("LEAN_DD_STATS")) return;
+    char fn[256]; snprintf(fn, sizeof(fn), "%s.%d", getenv("LEAN_DD_STATS"), (int)getpid());
+    FILE * f = fopen(fn, "w"); if (!f) return;
+    for (int i = 0; i < DD_N; i++) fprintf(f, "%s %llu\n", g_dd_names[i], g_dd_cnt[i]);
+    fclose(f);
+}
+static struct dd_atexit { dd_atexit() { atexit(dd_dump); } } g_dd_atexit;
+expr mk_app(expr const & f, expr const & a) { DD_INC(DD_MKAPP_ALL); if (g_dd_in_wc) DD_INC(DD_MKAPP_WC); return expr(lean_expr_mk_app(f.to_obj_arg(), a.to_obj_arg())); }
 
 extern "C" object * lean_expr_mk_sort(obj_arg l);
 expr mk_sort(level const & l) { return expr(lean_expr_mk_sort(l.to_obj_arg())); }
@@ -274,8 +290,10 @@ expr update_proj(expr const & e, expr const & t) {
 }
 
 expr update_app(expr const & e, expr const & new_fn, expr const & new_arg) {
-    if (!is_eqp(app_fn(e), new_fn) || !is_eqp(app_arg(e), new_arg))
+    if (!is_eqp(app_fn(e), new_fn) || !is_eqp(app_arg(e), new_arg)) {
+        DD_INC(DD_UPD_ALL); if (g_dd_in_wc) DD_INC(DD_UPD_WC);
         return mk_app(new_fn, new_arg);
+    }
     else
         return e;
 }

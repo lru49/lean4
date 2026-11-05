@@ -1346,6 +1346,7 @@ static expr * g_char_of_nat    = nullptr;
 
 expr nat_lit_to_constructor(expr const & e) {
     lean_assert(is_nat_lit(e));
+    DD_INC(DD_NATLIT);
     nat const & v = lit_value(e).get_nat();
     if (v == 0u)
         return *g_nat_zero;

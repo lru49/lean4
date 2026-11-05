@@ -627,9 +627,13 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
         break;
     }
 
+    struct dd_g { dd_g() { g_dd_in_wc++; } ~dd_g() { g_dd_in_wc--; } } dd_guard;
     // check cache
-    if (lean_object * cached = m_st->m_whnf_core.find(e))
+    DD_INC(DD_LK_ALL); if (!cache_result) DD_INC(DD_LK_FRESH);
+    if (lean_object * cached = m_st->m_whnf_core.find(e)) {
+        DD_INC(DD_HIT_ALL); if (!cache_result) DD_INC(DD_HIT_FRESH);
         return expr(cached, true);
+    }
 
     // do the actual work
     expr r;
@@ -659,10 +663,25 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
                 m++;
             }
             lean_assert(m <= num_args);
+            DD_INC(DD_BETA); DD_ADD(DD_BETA_REST, num_args - m);
+            {
+                expr const & body = binding_body(f);
+                expr const & h = get_app_fn(body);
+                if (is_bvar(h) && bvar_idx(h) < nat(m) && is_lambda(args[num_args - m + bvar_idx(h).get_small_value()])) {
+                    DD_INC(DD_BETA_FUSE); DD_ADD(DD_BETA_FUSE_SAVED, get_app_num_args(body) + num_args - m);
+                }
+            }
             r = whnf_core_impl(mk_rev_app(instantiate(binding_body(f), m, args.data() + (num_args - m)), num_args - m, args.data()),
                                cheap_rec, cheap_proj, false);
         } else if (f == f0) {
             if (auto r = reduce_recursor(e, cheap_rec, cheap_proj)) {
+                if (is_app(*r)) {
+                    DD_INC(DD_IOTA); unsigned na = get_app_num_args(*r); DD_ADD(DD_IOTA_NODES, na);
+                    expr b = get_app_fn(*r); unsigned k = 0;
+                    while (is_lambda(b) && k < na) { b = binding_body(b); k++; }
+                    if (k > 0) DD_INC(DD_IOTA_FUSE);
+                    if (k == na && is_bvar(get_app_fn(b))) DD_INC(DD_IOTA_FUSE_BETA2);
+                }
                 if (m_diag) {
                     auto f = get_app_fn(e);
                     if (is_constant(f))
@@ -674,11 +693,13 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
                 return e;
             }
         } else {
+            DD_ADD(DD_REAPPLY_NODES, args.size());
             r = whnf_core_impl(mk_rev_app(f, args.size(), args.data()), cheap_rec, cheap_proj, false);
         }
         break;
     }
     case expr_kind::Let:
+        DD_INC(DD_LET);
         r = whnf_core_impl(instantiate(let_body(e), let_value(e)), cheap_rec, cheap_proj, false);
         break;
     }
@@ -859,6 +880,7 @@ expr type_checker::whnf(expr const & e) {
         break;
     }
 
+    DD_INC(DD_WHNF_CALLS);
     // check cache
     if (lean_object * cached = m_st->m_whnf.find(e))
         return expr(cached, true);
