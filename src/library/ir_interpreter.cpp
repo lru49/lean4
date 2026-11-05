@@ -374,22 +374,8 @@ struct native_symbol_cache_entry {
 
 // Caches native symbol lookup successes _and_ failures; we assume no native code is loaded or
 // unloaded after the interpreter is first invoked, so this can be a global cache.
-//
-// The cache is sharded by name hash so that threads evaluating concurrently (asynchronous
-// elaboration, interpreted environment-extension states at import time) rarely meet on one lock,
-// and a miss resolves the symbol (name mangling, `dlsym`) outside every lock: only the insertion of
-// the result is serialized. Resolution is deterministic, so when two threads resolve the same
-// name the first insertion wins and the other result is identical.
-struct native_symbol_cache_shard {
-    std::shared_mutex m_mutex;
-    name_hash_map<native_symbol_cache_entry> m_map;
-};
-static constexpr size_t g_native_symbol_cache_num_shards = 64;
-native_symbol_cache_shard * g_native_symbol_cache;
-
-static inline native_symbol_cache_shard & native_symbol_cache_shard_for(name const & fn) {
-    return g_native_symbol_cache[fn.hash() % g_native_symbol_cache_num_shards];
-}
+name_hash_map<native_symbol_cache_entry> * g_native_symbol_cache;
+std::shared_mutex * g_native_symbol_cache_mutex;
 
 class interpreter {
     // stack of IR variable slots
@@ -852,19 +838,20 @@ private:
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
-        symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
-        native_symbol_cache_shard & shard = native_symbol_cache_shard_for(fn);
-        {
-            std::shared_lock<std::shared_mutex> lock(shard.m_mutex);
-            auto ne = shard.m_map.find(fn);
-            if (ne != shard.m_map.end()) {
-                e_new.m_native = ne->second;
-                lock.unlock();
-                return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
-            }
+        std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
+        auto ne = g_native_symbol_cache->find(fn);
+        if (ne != g_native_symbol_cache->end()) {
+            symbol_cache_entry e_new { get_decl(fn), ne->second };
+            return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
         }
-        // not cached yet: resolve without holding any lock (`dlsym` and the name mangling below are
-        // the expensive part), then publish
+        lock.unlock();
+        std::unique_lock<std::shared_mutex> unique_lock(*g_native_symbol_cache_mutex);
+        ne = g_native_symbol_cache->find(fn);
+        if (ne != g_native_symbol_cache->end()) {
+            symbol_cache_entry e_new { get_decl(fn), ne->second };
+            return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
+        }
+        symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
         if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
             string_ref mangled = get_symbol_stem(m_env, fn);
             string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
@@ -883,14 +870,7 @@ private:
                 }
             }
         }
-        {
-            std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
-            auto r = shard.m_map.insert({ fn, e_new.m_native });
-            if (!r.second) {
-                // another thread resolved the same name meanwhile; the results are identical
-                e_new.m_native = r.first->second;
-            }
-        }
+        g_native_symbol_cache->insert({ fn, e_new.m_native });
         return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
     }
 
@@ -1248,11 +1228,13 @@ void initialize_ir_interpreter() {
         mark_persistent(ir::g_interpreter_step->raw());
         register_trace_class(*ir::g_interpreter_step);
     });
-    ir::g_native_symbol_cache = new ir::native_symbol_cache_shard[ir::g_native_symbol_cache_num_shards];
+    ir::g_native_symbol_cache = new name_hash_map<ir::native_symbol_cache_entry>();
+    ir::g_native_symbol_cache_mutex = new std::shared_mutex();
 }
 
 void finalize_ir_interpreter() {
-    delete[] ir::g_native_symbol_cache;
+    delete ir::g_native_symbol_cache_mutex;
+    delete ir::g_native_symbol_cache;
     DEBUG_CODE({
         delete ir::g_interpreter_call;
         delete ir::g_interpreter_step;
