@@ -332,6 +332,28 @@ static inline lean_object * pop_back(lean_object * & todo) {
     return r;
 }
 
+/* Drops one reference to a thread-shared object (count < 0, not sticky); true if it was the last.
+   A count of exactly -1 means the caller holds the only reference: no other thread can reach the
+   object to increment it concurrently (every other path to it would itself be a counted
+   reference), so the acquire load, which synchronizes with the release decrements of every
+   previous owner, is enough and the locked read-modify-write is skipped. This is the uniqueness
+   test of `std::shared_ptr::use_count() == 1` / Rust's `Arc::get_mut`. LEAN_MT_LAST_LOAD=0 restores
+   the unconditional `fetch_add`. */
+static bool g_mt_last_load = [] {
+    char const * s = std::getenv("LEAN_MT_LAST_LOAD");
+    return !(s && s[0] == '0');
+}();
+
+static inline bool mt_release_last(lean_object * o) {
+    if (LEAN_LIKELY(g_mt_last_load) &&
+        std::atomic_load_explicit(lean_get_rc_mt_addr(o), std::memory_order_acquire) == -1) {
+        // the count the `fetch_add` would have left (a deactivated task keeps RC == 0, lean.h)
+        std::atomic_store_explicit(lean_get_rc_mt_addr(o), 0, std::memory_order_relaxed);
+        return true;
+    }
+    return std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) == -1;
+}
+
 static inline void dec(lean_object * o, lean_object* & todo) {
     if (lean_is_scalar(o))
         return;
@@ -341,7 +363,7 @@ static inline void dec(lean_object * o, lean_object* & todo) {
         push_back(todo, o);
     } else if (lean_is_never_freed(o)) {
         return;
-    } else if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) == -1) {
+    } else if (mt_release_last(o)) {
         push_back(todo, o);
     }
 }
@@ -459,7 +481,7 @@ extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
     if (lean_internal_get_rc(o) != 1) {
         if (LEAN_UNLIKELY(lean_is_never_freed(o)))
             return;
-        if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) != -1)
+        if (!mt_release_last(o))
             return;
     }
     object * todo = nullptr;
