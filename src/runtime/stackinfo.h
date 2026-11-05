@@ -14,6 +14,7 @@ namespace lean {
 inline void check_stack(char const * ) { }
 inline size_t get_stack_size(bool ) { return 8192*1024; }
 inline void save_stack_info(bool = true) {}
+inline size_t get_stack_threshold() { return 0; }
 #else
 LEAN_EXPORT size_t get_stack_size(bool main);
 LEAN_EXPORT void save_stack_info(bool main = true);
@@ -24,6 +25,9 @@ LEAN_EXPORT void save_stack_info(bool main = true);
    user which module is the potential offender.
 */
 LEAN_EXPORT void check_stack(char const * component_name);
+/** \brief The current thread's stack threshold: `check_stack` throws iff its frame address is below it.
+    Initializes the thread's stack information like `check_stack` does; constant for the thread afterwards. */
+LEAN_EXPORT size_t get_stack_threshold();
 #endif
 
 }
