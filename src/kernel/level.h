@@ -46,7 +46,7 @@ public:
     level_kind kind() const {
       return lean_is_scalar(raw()) ? level_kind::Zero : static_cast<level_kind>(lean_ptr_tag(raw()));
     }
-    unsigned hash() const;
+    inline unsigned hash() const;
 
     level & operator=(level const & other) { object_ref::operator=(other); return *this; }
     level & operator=(level && other) noexcept { object_ref::operator=(std::move(other)); return *this; }
@@ -71,6 +71,20 @@ public:
     friend inline name const & mvar_id(level const & l)  { lean_assert(l.is_mvar()); return static_cast<name const &>(cnstr_get_ref(l, 0)); }
     friend inline name const & level_id(level const & l) { lean_assert(l.is_param() || l.is_mvar()); return static_cast<name const &>(cnstr_get_ref(l, 0)); }
 };
+
+/* `Level.data` (src/Lean/Level.lean) is a computed field: it is stored as the scalar field after the object
+   fields of every constructor except `zero`, which is a boxed scalar whose data is the constant
+   `Level.mkData 2221` (hash 2221, depth 0, no metavariables, no parameters; checked in `initialize_level`).
+   Layout: hash = bits 0-31, hasMVar = bit 32, hasParam = bit 33, depth = bits 40-63.
+   Reading it here avoids a call to the exported Lean accessors, each of which also took and released a
+   reference to the level (an atomic increment/decrement for levels shared between threads). */
+constexpr uint64_t g_level_zero_data = 2221;
+inline uint64_t get_level_data(level const & l) {
+    object * o = l.raw();
+    if (lean_is_scalar(o)) return g_level_zero_data;
+    return lean_ctor_get_uint64(o, lean_ctor_num_objs(o)*sizeof(object*));
+}
+inline unsigned level::hash() const { return static_cast<unsigned>(get_level_data(*this)); }
 
 typedef list_ref<level> levels;
 typedef pair<level, level> level_pair;
@@ -109,7 +123,7 @@ inline bool is_max(level const & l)    { return l.is_max(); }
 inline bool is_imax(level const & l)   { return l.is_imax(); }
 bool is_one(level const & l);
 
-unsigned get_depth(level const & l);
+inline unsigned get_depth(level const & l) { return static_cast<unsigned>(get_level_data(l) >> 40); }
 
 /** \brief Return true iff \c l is an explicit level.
     We say a level l is explicit iff
@@ -117,9 +131,9 @@ unsigned get_depth(level const & l);
     2) l = succ(l') and l' is explicit */
 bool is_explicit(level const & l);
 /** \brief Return true iff \c l contains placeholder (aka meta parameters). */
-bool has_mvar(level const & l);
+inline bool has_mvar(level const & l) { return ((get_level_data(l) >> 32) & 1) == 1; }
 /** \brief Return true iff \c l contains parameters */
-bool has_param(level const & l);
+inline bool has_param(level const & l) { return ((get_level_data(l) >> 33) & 1) == 1; }
 
 /** \brief Return a new level expression based on <tt>l == succ(arg)</tt>, where \c arg is replaced with
     \c new_arg.
