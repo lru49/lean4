@@ -603,8 +603,15 @@ static obj_res mark_persistent_fn(obj_arg o) {
 struct mark_persistent_pool;
 static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** begin, object ** end);
 /* Arrays with more children than this are split into `MARK_PERSISTENT_CHUNK`-sized ranges shared with
-   the other workers (the environment's constant map is a single array of ~2M buckets). */
-#define MARK_PERSISTENT_SPLIT 4096
+   the other workers (the environment's constant map is a single array of ~2M buckets). Smaller arrays
+   are walked by the walker that meets them, and their entries reach the other walkers through
+   donation of the older half of its stack. The threshold was 4096: an imported environment has many
+   arrays of a few thousand entries (e.g. every extension's per-module entry array, one slot per
+   imported module), and splitting all of them produced ~11 k pool items in the first
+   `markPersistent` of a Mathlib import at `-j 4`; taking an item locks the pool mutex twice, and the
+   four walkers spent ~6 of their ~18 ms per walk outside the marking itself. With 65536 the same walk
+   takes ~1 k items, and both import walks are ~30 % shorter. */
+#define MARK_PERSISTENT_SPLIT 65536
 #define MARK_PERSISTENT_CHUNK 256
 
 template<bool Par>
