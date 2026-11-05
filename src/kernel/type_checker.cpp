@@ -1063,40 +1063,40 @@ lbool type_checker::is_def_eq_proof_irrel(expr const & t, expr const & s) {
 
 bool type_checker::failed_before(expr const & t, expr const & s) const {
     if (hash(t) < hash(s)) {
-        return m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end();
+        return m_st->m_failure.contains(t, s);
     } else if (hash(t) > hash(s)) {
-        return m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+        return m_st->m_failure.contains(s, t);
     } else {
         return
-            m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end() ||
-            m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+            m_st->m_failure.contains(t, s) ||
+            m_st->m_failure.contains(s, t);
     }
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
     if (hash(t) <= hash(s))
-        m_st->m_failure.insert(mk_pair(t, s));
+        m_st->m_failure.insert(t, s);
     else
-        m_st->m_failure.insert(mk_pair(s, t));
+        m_st->m_failure.insert(s, t);
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
     if (hash(t) < hash(s)) {
-        return m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end();
+        return m_st->m_success.contains(t, s);
     } else if (hash(t) > hash(s)) {
-        return m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+        return m_st->m_success.contains(s, t);
     } else {
         return
-            m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end() ||
-            m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+            m_st->m_success.contains(t, s) ||
+            m_st->m_success.contains(s, t);
     }
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
     if (hash(t) <= hash(s))
-        m_st->m_success.insert(mk_pair(t, s));
+        m_st->m_success.insert(t, s);
     else
-        m_st->m_success.insert(mk_pair(s, t));
+        m_st->m_success.insert(s, t);
 }
 
 /**
