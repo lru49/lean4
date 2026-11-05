@@ -229,6 +229,54 @@ unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (Scope
 opaque registerScopedEnvExtension (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ)
 
 /--
+lean-perf (chain batching): per scoped environment extension (by name), its state before
+`Descr.finalizeImport` and its scoped entries as computed by the last import that used
+`ScopedEnvExtension.mkImportStateFn` with this store.
+-/
+abbrev ImportFoldStore :=
+  IO.Ref (NameMap (EnvExtensionState × ScopedEnvExtension.ScopedEntries EnvExtensionEntry))
+
+unsafe def ScopedEnvExtension.mkImportStateFnUnsafe (store : ImportFoldStore) (numKept : Nat) :
+    IO ImportStateFn :=
+  return fun d es => do
+    let exts ← scopedEnvExtensionsRef.get
+    let some ext := exts.find? (·.ext.name == d.name) | return none
+    let descr := ext.descr
+    let es : Array (Array (ScopedEnvExtension.Entry EnvExtensionEntry)) := unsafeCast es
+    let stored ← store.get
+    let prev? := if numKept > 0 then stored.find? d.name else none
+    let (start, s₀, sc₀) ← match prev? with
+      | some (s, sc) => pure (numKept, s, sc)
+      | none => pure (0, ← descr.mkInitial, ({} : ScopedEnvExtension.ScopedEntries EnvExtensionEntry))
+    -- `addImportedFn descr` (its sequential fold, which its parallel variant must equal), started
+    -- from the state of the first `start` modules
+    let mut s := s₀
+    let mut sc := sc₀
+    for a in es.extract start es.size do
+      for e in a do
+        match e with
+        | .global a =>
+          let b ← descr.ofOLeanEntry s a
+          s := descr.addEntry s b
+        | .scoped ns a =>
+          let b ← descr.ofOLeanEntry s a
+          sc := sc.insert ns b
+    store.modify (·.insert d.name (s, sc))
+    let st : ScopedEnvExtension.StateStack EnvExtensionEntry EnvExtensionEntry EnvExtensionState :=
+      { stateStack := [{ state := descr.finalizeImport s }], scopedEntries := sc }
+    return some (unsafeCast st)
+
+/--
+lean-perf (chain batching): an `ImportStateFn` for `Lean.importModulesExtend` that computes the
+imported state of every scoped environment extension as `ScopedEnvExtension.addImportedFn` does,
+but, when the first `numKept` modules are those of the last import that used `store`, by continuing
+that import's fold (kept in `store`, before `Descr.finalizeImport`) with the entries of the new
+modules only. Every call updates `store`.
+-/
+@[implemented_by ScopedEnvExtension.mkImportStateFnUnsafe]
+opaque ScopedEnvExtension.mkImportStateFn (store : ImportFoldStore) (numKept : Nat) : IO ImportStateFn
+
+/--
 Applies a scope-stack operation `f`. `changed` must be set exactly when `f` changes the state in
 effect (see `State.scopeChanged`), with `changedDecls` the declarations of the entries it adds or
 removes. For extensions with `Descr.tracksScopes` this is recorded like a content change: the

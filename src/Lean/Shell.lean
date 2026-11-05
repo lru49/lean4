@@ -455,8 +455,13 @@ where
     eprint s!"error: argument value for '-{opt}' is too large\n"
     throw 1
 
-@[export lean_shell_main]
-def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
+/--
+The `lean` command line driver. With `heldEnv? := some env` (lean-perf chain batching: a child of
+`lean --chain-server`), `env` is the imported environment of the file's header (see
+`Elab.runFrontendCore`), and the exit code is returned instead of exiting the process.
+-/
+def shellMainCore (args : List String) (opts : ShellOptions) (heldEnv? : Option Environment) :
+    IO UInt32 := do
   let opts := { opts with leanOpts := opts.leanOpts.mergeBy (fun _ _ v => v) (Internal.getOptionOverrides ()) }
   if opts.printPrefix then
     IO.println (← getBuildDir)
@@ -540,12 +545,13 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
           throw e
     else
       pure `_stdin
-  let env? ← Elab.runFrontend contents opts.leanOpts fileName mainModuleName
+  let env? ← Elab.runFrontendCore contents opts.leanOpts fileName mainModuleName
     opts.trustLevel opts.oleanFileName? opts.ileanFileName? opts.jsonOutput opts.errorOnKinds
     #[] opts.printStats setup?
     (incrSaveFileName? := opts.incrSaveFileName?)
     (incrLoadFileName? := opts.incrLoadFileName?)
     (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
+    (heldEnv? := heldEnv?)
   if let some env := env? then
     if opts.run then
       return ← runMain env opts.leanOpts args
@@ -560,6 +566,9 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
       profileitIO "LLVM code generation" opts.leanOpts do
         emitLLVM env mainModuleName bc
   displayCumulativeProfilingTimes
+  if heldEnv?.isSome then
+    -- (a chain server child: the caller flushes and `_exit`s)
+    return if env?.isSome then 0 else 1
   if Internal.hasAddressSanitizer () then
     return if env?.isSome then 0 else 1
   else
@@ -579,3 +588,129 @@ where
       if ← tempName.pathExists then
         IO.FS.removeFile tempName
       throw e
+
+@[export lean_shell_main]
+def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 :=
+  shellMainCore args opts none
+
+/-!
+lean-perf (chain batching, lane DP): `lean --chain-server`.
+
+A build tool runs a chain of modules (module `i+1` imports module `i`, e.g. the critical path of a
+build) through one long-lived server process instead of one `lean` process per module. The server
+(the C++ loop in `shell.cpp`) reads one request per line on stdin: the working directory, files for
+the child's stdout and stderr, the `LEAN_PATH` of the request and the `lean` arguments, TAB-separated.
+For each request it parses the arguments like `lean` does, calls `chainServerPrepare`, and forks a
+child: a served child runs `chainServerRun` (the ordinary command line driver, with the header
+environment handed in), a non-served one `exec`s a plain `lean` with the same arguments. The server
+answers `<exit code> served|fallback <seconds>` on stdout once the child has exited.
+
+The server process itself never elaborates: it only imports. Its held import state is the one of
+the last served header, continued for the next request with `Lean.importModulesExtend`, which maps
+only the new modules and runs only their initializers; every child starts from the environment a
+fresh process importing its header would compute (see there for the conditions, checked here: the
+same options, trust level and `LEAN_PATH`, a non-`module` file, no plugins or dynlibs, every held
+module in the new closure, the same artifact paths).
+-/
+
+/-- The import state a chain server holds between requests. -/
+structure ChainHeld where
+  state      : ImportState
+  opts       : Options
+  trustLevel : UInt32
+  /-- the artifact paths used for the modules loaded so far -/
+  arts       : NameMap ImportArtifacts
+  /-- the environment of the held import (its extension states are continued by the next one) -/
+  env        : Environment
+
+/-- The state of a chain server. -/
+structure ChainServerState where
+  held?    : Option ChainHeld := none
+  /-- set when an import failed halfway: the process state is unknown, serve nothing any more -/
+  poisoned : Bool := false
+  served   : Nat := 0
+  fallbacks : Nat := 0
+  /-- the folds of the scoped extensions of the held import (stage C2, `LEAN_CHAIN_FOLD=0` disables) -/
+  foldStore? : Option ImportFoldStore := none
+
+@[export lean_chain_server_initial]
+def chainServerInitial (_ : Unit) : ChainServerState := {}
+
+/-- The environment for the request `args` (after option processing) or `none` (not served: the
+server runs a plain `lean`). Never throws. -/
+@[export lean_chain_server_prepare]
+def chainServerPrepare (st : ChainServerState) (args : List String) (opts : ShellOptions) :
+    IO (ChainServerState × Option Environment) := do
+  if st.poisoned then
+    return ({ st with fallbacks := st.fallbacks + 1 }, none)
+  let debug := (← IO.getEnv "LEAN_CHAIN_DEBUG").isSome
+  let fallback (why : String) : IO (ChainServerState × Option Environment) := do
+    if debug then IO.eprintln s!"[chain] fallback: {why}"
+    return ({ st with fallbacks := st.fallbacks + 1 }, none)
+  let opts := { opts with leanOpts := opts.leanOpts.mergeBy (fun _ _ v => v) (Internal.getOptionOverrides ()) }
+  if !(opts.component matches .frontend) || opts.run || opts.useStdin || opts.onlyDeps ||
+      opts.onlySrcDeps || opts.depsJson || opts.printPrefix || opts.printLibDir ||
+      opts.incrSaveFileName?.isSome || opts.incrLoadFileName?.isSome ||
+      opts.incrHeaderSaveFileName?.isSome || !opts.forwardedArgs.all (·.startsWith "-D") then
+    return ← fallback "options"
+  let [fileName] := args | return ← fallback "arguments"
+  let tp ← IO.monoNanosNow
+  let r ← (do
+    let contents ← String.fromUTF8Lossy <$> IO.FS.readBinFile fileName
+    if contents.startsWith "#lang" then
+      return none
+    let setup? ← opts.setupFileName?.mapM ModuleSetup.load
+    if let some setup := setup? then
+      if !setup.dynlibs.isEmpty || !setup.plugins.isEmpty then
+        return none
+    let mainModuleName ← if let some setup := setup? then pure setup.name
+      else moduleNameOfFileName fileName opts.rootDir?
+    let inputCtx := Parser.mkInputContext contents fileName
+    let (stx, _, msgs) ← Parser.parseHeader inputCtx
+    if msgs.hasErrors then
+      return none
+    let res := Elab.frontendSetupImports stx (Elab.frontendOpts opts.leanOpts) mainModuleName
+      opts.trustLevel #[] setup?
+    if res.isModule || !res.plugins.isEmpty then
+      return none
+    pure (some res) : IO (Option Language.Lean.SetupImportsResult)).toBaseIO
+  let some res := (match r with | .ok r => r | .error _ => none) | return ← fallback "setup"
+  if debug then
+    IO.eprintln s!"[chain] setup read+parsed: {((← IO.monoNanosNow) - tp).toFloat / 1e9} s"
+  let s₀ ← match st.held? with
+    | none => pure default
+    | some held =>
+      if held.opts != res.opts || held.trustLevel != res.trustLevel then
+        return ← fallback "options differ from the held import"
+      for (n, a) in res.importArts do
+        if let some a' := held.arts.find? n then
+          if a'.toArrays != a.toArrays then
+            return ← fallback s!"artifacts of {n} differ"
+      pure held.state
+  let t0 ← IO.monoNanosNow
+  if debug then
+    IO.eprintln s!"[chain] held-state checks: {(t0 - tp).toFloat / 1e9} s since prepare start"
+  let foldStore? ← if (← IO.getEnv "LEAN_CHAIN_FOLD") == some "0" then pure none
+    else if let some r := st.foldStore? then pure (some r) else some <$> (IO.mkRef {} : IO ImportFoldStore)
+  let st := { st with foldStore? }
+  let mkStateFn? := foldStore?.map fun r => ScopedEnvExtension.mkImportStateFn r
+  unsafe enableInitializersExecution
+  match (← (importModulesExtend s₀ res.imports res.opts res.trustLevel res.importArts
+      (prevEnv? := st.held?.map (·.env)) (mkStateFn? := mkStateFn?)).toBaseIO) with
+  | .error e =>
+    if debug then IO.eprintln s!"[chain] import failed: {e}"
+    return ({ st with poisoned := true, fallbacks := st.fallbacks + 1 }, none)
+  | .ok none => fallback "held import not continuable (held module outside the new closure or module order not a prefix)"
+  | .ok (some (env, s)) =>
+    if debug then
+      let dt := ((← IO.monoNanosNow) - t0).toFloat / 1e9
+      IO.eprintln s!"[chain] {res.mainModuleName}: import {dt} s, {env.header.moduleNames.size} modules"
+    let arts := res.importArts.foldl (init := st.held?.map (·.arts) |>.getD {}) fun m n a => m.insert n a
+    return ({ st with
+      held? := some { state := s, opts := res.opts, trustLevel := res.trustLevel, arts, env }
+      served := st.served + 1 }, some env)
+
+/-- A served chain server child: the command line driver with the header environment `env`. -/
+@[export lean_chain_server_run]
+def chainServerRun (args : List String) (opts : ShellOptions) (env : Environment) : IO UInt32 :=
+  shellMainCore args opts (some env)

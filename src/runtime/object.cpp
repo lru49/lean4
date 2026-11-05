@@ -1355,6 +1355,15 @@ extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
 #endif
 }
 
+/* lean-perf (chain batching): in the child of a `fork` (`lean --chain-server`), the task manager's
+   worker threads do not exist; the inherited manager is abandoned (never touched again, its memory
+   is leaked) and replaced by a fresh one. The server forks only between requests, when no task runs. */
+extern "C" LEAN_EXPORT void lean_reinit_task_manager_after_fork(unsigned num_workers) {
+#if defined(LEAN_MULTI_THREAD)
+    g_task_manager = num_workers > 0 ? new task_manager(num_workers) : nullptr;
+#endif
+}
+
 static unsigned get_lean_num_threads() {
 #ifndef LEAN_EMSCRIPTEN
     if (char const * num_threads = std::getenv("LEAN_NUM_THREADS")) {
