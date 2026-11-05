@@ -97,6 +97,32 @@ instance [Inhabited α] : Inhabited (Descr α β σ) where
 def mkInitial (descr : Descr α β σ) : IO (StateStack α β σ) :=
   return { stateStack := [ { state := (← descr.mkInitial ) } ] }
 
+/--
+lean-perf (L01c): parallel folds of imported global entries, by extension name. `f s bs n` registered
+for extension `extName` must equal `bs.foldl addEntry s`, computed on up to `n` threads (`IO` only for
+the tasks and diagnostics); `addImportedFn` uses it for the imported global entries whenever the import
+phase has more than one thread, and `ofOLeanEntry` must then ignore its state argument (it is called
+with the initial state). A registry keyed by name instead of a `Descr` field, so that the object layout
+of `Descr` stays the one stage 0 expects (`Descr` values cross the stage0/stage1 boundary through the
+interpreter during the stage 1 build).
+-/
+builtin_initialize parEntriesFnsRef :
+    IO.Ref (NameMap (EnvExtensionState → Array EnvExtensionEntry → Nat → IO EnvExtensionState)) ← IO.mkRef {}
+
+unsafe def registerParEntriesFnUnsafe {β σ : Type} (extName : Name) (f : σ → Array β → Nat → IO σ) : IO Unit :=
+  parEntriesFnsRef.modify (·.insert extName (unsafeCast f))
+
+/-- See `parEntriesFnsRef`. -/
+@[implemented_by registerParEntriesFnUnsafe]
+opaque registerParEntriesFn {β σ : Type} (extName : Name) (f : σ → Array β → Nat → IO σ) : IO Unit
+
+unsafe def getParEntriesFnUnsafe {β σ : Type} (extName : Name) : IO (Option (σ → Array β → Nat → IO σ)) :=
+  return ((← parEntriesFnsRef.get).find? extName).map unsafeCast
+
+/-- See `parEntriesFnsRef`. -/
+@[implemented_by getParEntriesFnUnsafe]
+opaque getParEntriesFn {β σ : Type} (extName : Name) : IO (Option (σ → Array β → Nat → IO σ))
+
 def ScopedEntries.insert (scopedEntries : ScopedEntries β) (ns : Name) (b : β) : ScopedEntries β :=
   match scopedEntries.map.find? ns with
   | none    => { map := scopedEntries.map.insert ns <| ({} : PArray β).push b }
@@ -105,6 +131,19 @@ def ScopedEntries.insert (scopedEntries : ScopedEntries β) (ns : Name) (b : β)
 def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) := do
   let mut s ← descr.mkInitial
   let mut scopedEntries : ScopedEntries β := {}
+  -- lean-perf (L01c): parallel fold of the global entries when the extension registered one
+  if let some addEntriesPar ← getParEntriesFn (β := β) (σ := σ) descr.name then
+    let numThreads ← ParallelImport.numThreads
+    if numThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_ENTRIES") then
+      let mut bs : Array β := #[]
+      for a in as do
+        for e in a do
+          match e with
+          | Entry.global a => bs := bs.push (← descr.ofOLeanEntry s a)
+          | Entry.scoped ns a => scopedEntries := scopedEntries.insert ns (← descr.ofOLeanEntry s a)
+      s ← addEntriesPar s bs numThreads
+      s := descr.finalizeImport s
+      return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
   for a in as do
     for e in a do
       match e with
