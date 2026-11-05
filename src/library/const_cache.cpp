@@ -207,7 +207,9 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
             // entries are only inserted at the window's first empty slot, so stop searching
             break;
         }
-        if (e->m_root == root && lean_name_eq(e->m_key, n)) {
+        // `m_hash` is on the entry's (already loaded) cache line: comparing it first rejects the
+        // other keys of the probe window without dereferencing their name objects
+        if (e->m_hash == h && e->m_root == root && lean_name_eq(e->m_key, n)) {
             if (idx_only)
                 return mod_idx_of(e->m_val);
             if (fst_only) {
