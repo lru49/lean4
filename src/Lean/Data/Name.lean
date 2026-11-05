@@ -111,7 +111,7 @@ def quickCmp (n₁ n₂ : Name) : Ordering :=
   | Ordering.eq => quickCmpAux n₁ n₂
   | ord => ord
 
-def quickLt (n₁ n₂ : Name) : Bool :=
+@[inline] def quickLt (n₁ n₂ : Name) : Bool :=
   quickCmp n₁ n₂ == Ordering.lt
 
 /-- The frontend does not allow user declarations to start with `_` in any of its parts.
