@@ -29,6 +29,9 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 */
 #include <string>
 #include <vector>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
 #include <shared_mutex>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
@@ -191,6 +194,9 @@ extern "C" object * lean_ir_find_env_decl(object * env, object * n);
 option_ref<decl> find_ir_decl(elab_environment const & env, name const & n) {
     return option_ref<decl>(lean_ir_find_env_decl(env.to_obj_arg(), n.to_obj_arg()));
 }
+
+extern "C" object * lean_ir_find_interp_decl_tagged(object * env, object * n);
+extern "C" object * lean_ir_interp_cache_key(object * env);
 
 extern "C" object * lean_ir_find_env_decl_boxed(object * env, object * n);
 option_ref<decl> find_ir_decl_boxed(elab_environment const & env, name const & n) {
@@ -391,6 +397,71 @@ static inline native_symbol_cache_shard & native_symbol_cache_shard_for(name con
     return g_native_symbol_cache[fn.hash() % g_native_symbol_cache_num_shards];
 }
 
+/* Process-wide cache of the IR declarations of IMPORTED names (`findInterpDeclTagged` in CompilerM.lean).
+
+   Every evaluation starts with empty per-evaluation tables, so each one looked up every callee's IR again through
+   `findInterpDecl` (module index + binary search per name): with per-command linters that is hundreds of thousands of
+   lookups per module. For a name `getModuleIdxFor?` maps to an imported module the answer depends only on the import
+   and on `isExporting`, i.e. on `interpCacheKey`, so it is cached here per key ("generation").
+
+   Soundness (a process may import several times and free the old regions, `Environment.freeRegions`):
+   - a generation is identified by the address of the import's module data array and the `isExporting` flag; the arrays
+     of all generations seen are kept referenced forever (one per import), so an address is never reused;
+   - only declarations and name keys that are persistent (compacted-region objects, rc 0) are cached, and the cache owns
+     no reference to them: keys are raw pointers with their hash, values raw pointers, so dropping a stale generation's
+     entries never touches objects whose regions may have been freed, and entries of a generation are only compared
+     against while that generation is in use;
+   - local (non-imported) names and failed lookups are never cached: they take the uncached path as before. */
+struct imported_decl_key {
+    object * m_name;
+    uint64   m_hash;
+};
+struct imported_decl_key_hash {
+    size_t operator()(imported_decl_key const & k) const noexcept { return static_cast<size_t>(k.m_hash); }
+};
+struct imported_decl_key_eq {
+    bool operator()(imported_decl_key const & a, imported_decl_key const & b) const noexcept {
+        return a.m_name == b.m_name || (a.m_hash == b.m_hash && lean_name_eq(a.m_name, b.m_name));
+    }
+};
+struct imported_decl_cache_slot {
+    unsigned m_gen = 0; // 0: empty
+    std::unordered_map<imported_decl_key, object *, imported_decl_key_hash, imported_decl_key_eq> m_map;
+};
+struct imported_decl_cache_shard {
+    std::shared_mutex m_mutex;
+    // two generations per shard: the public and private views of one import (`isExporting`) alternate
+    imported_decl_cache_slot m_slots[2];
+};
+static constexpr size_t g_imported_decl_cache_num_shards = 64;
+static imported_decl_cache_shard * g_imported_decl_cache = nullptr;
+static std::mutex * g_imported_gen_mutex = nullptr;
+// generation `i + 1` = entry `i`; the module data arrays are referenced forever
+static std::vector<std::pair<object *, bool>> * g_imported_gens = nullptr;
+
+static unsigned imported_decl_generation(elab_environment const & env) {
+    object * k = lean_ir_interp_cache_key(env.to_obj_arg());
+    object * md = cnstr_get(k, 0);
+    bool exporting = unbox(cnstr_get(k, 1)) != 0;
+    unsigned gen = 0;
+    {
+        std::lock_guard<std::mutex> lock(*g_imported_gen_mutex);
+        for (size_t i = 0; i < g_imported_gens->size(); i++) {
+            if ((*g_imported_gens)[i].first == md && (*g_imported_gens)[i].second == exporting) {
+                gen = static_cast<unsigned>(i + 1);
+                break;
+            }
+        }
+        if (gen == 0) {
+            inc_ref(md); // kept forever: the address identifies the generation
+            g_imported_gens->emplace_back(md, exporting);
+            gen = static_cast<unsigned>(g_imported_gens->size());
+        }
+    }
+    dec_ref(k);
+    return gen;
+}
+
 class interpreter {
     // stack of IR variable slots
     std::vector<value> m_arg_stack;
@@ -423,6 +494,8 @@ class interpreter {
     };
     // caches symbol lookup successes _and_ failures
     name_hash_map<symbol_cache_entry> m_symbol_cache;
+    // generation of `m_env` in the imported-declaration cache; 0 until the first `get_decl`
+    unsigned m_imported_gen = 0;
 
     /** \brief Get current stack frame */
     inline frame & get_frame() {
@@ -894,13 +967,52 @@ private:
         return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
     }
 
-    /** \brief Retrieve Lean declaration from elab_environment. */
+    /** \brief Retrieve Lean declaration from elab_environment (`findInterpDecl`), answering imported names from the
+        process-wide imported-declaration cache. */
     decl get_decl(name const & fn) {
-        option_ref<decl> d = find_ir_decl(m_env, fn);
-        if (!d) {
+        if (m_imported_gen == 0)
+            m_imported_gen = imported_decl_generation(m_env);
+        unsigned gen = m_imported_gen;
+        object * key_obj = fn.raw();
+        bool cacheable_key = !lean_is_scalar(key_obj) && lean_is_persistent(key_obj);
+        imported_decl_key key { key_obj, fn.hash() };
+        imported_decl_cache_shard & shard = g_imported_decl_cache[fn.hash() % g_imported_decl_cache_num_shards];
+        if (cacheable_key) {
+            std::shared_lock<std::shared_mutex> lock(shard.m_mutex);
+            for (imported_decl_cache_slot & s : shard.m_slots) {
+                if (s.m_gen == gen) {
+                    auto it = s.m_map.find(key);
+                    if (it != s.m_map.end())
+                        return decl(it->second, true);
+                    break;
+                }
+            }
+        }
+        object * r = lean_ir_find_interp_decl_tagged(m_env.to_obj_arg(), fn.to_obj_arg());
+        if (lean_is_scalar(r)) {
             throw exception(sstream() << "(interpreter) unknown declaration '" << fn << "'");
         }
-        return d.get().value();
+        object * p = cnstr_get(r, 0);
+        object * d = cnstr_get(p, 0);
+        bool imported = unbox(cnstr_get(p, 1)) != 0;
+        decl result(d, true);
+        dec(r);
+        if (imported && cacheable_key && lean_is_persistent(d)) {
+            std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
+            imported_decl_cache_slot * slot = nullptr;
+            for (imported_decl_cache_slot & s : shard.m_slots) {
+                if (s.m_gen == gen) { slot = &s; break; }
+            }
+            if (!slot) {
+                // replace the slot of the older generation (empty slots have generation 0)
+                slot = shard.m_slots[0].m_gen <= shard.m_slots[1].m_gen ? &shard.m_slots[0] : &shard.m_slots[1];
+                slot->m_map.clear(); // keys/values are raw pointers: nothing of the old generation is dereferenced
+                slot->m_gen = gen;
+            }
+            // first insertion wins; another thread's answer for the same key is the same object
+            slot->m_map.emplace(key, d);
+        }
+        return result;
     }
 
     /** \brief Evaluate nullary function ("constant"). */
@@ -1249,9 +1361,14 @@ void initialize_ir_interpreter() {
         register_trace_class(*ir::g_interpreter_step);
     });
     ir::g_native_symbol_cache = new ir::native_symbol_cache_shard[ir::g_native_symbol_cache_num_shards];
+    ir::g_imported_decl_cache = new ir::imported_decl_cache_shard[ir::g_imported_decl_cache_num_shards];
+    ir::g_imported_gen_mutex = new std::mutex();
+    ir::g_imported_gens = new std::vector<std::pair<object *, bool>>();
 }
 
 void finalize_ir_interpreter() {
+    // the imported-declaration cache and its generation list are left alone: their entries may point into regions
+    // that are already freed, and the module data arrays are deliberately kept
     delete[] ir::g_native_symbol_cache;
     DEBUG_CODE({
         delete ir::g_interpreter_call;
