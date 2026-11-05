@@ -738,22 +738,21 @@ partial def smartUnfoldingReduce? (e : Expr) : MetaM (Option Expr) :=
   go e |>.run
 where
   /--
-  `go` returns a term structurally equal to its input when the input contains no smart-unfolding
-  `match` marker (the only place `go` reduces or fails), no `let` (which `mapLetDecl` drops when
-  unused) and no binder whose body has metavariables (which `mkLambdaFVars` instantiates).
-  `Expr.find?` checks that on the shared term graph without allocating, so such subterms (typically
-  the arguments the `_sunfold` body was applied to) are returned as they are instead of being
-  rebuilt node by node.
+  `go` returns a term structurally equal to its input, and has no other effect, when the input
+  contains no smart-unfolding `match` marker (the only place `go` reduces, fails or creates
+  metavariables), no `let` (`mapLetDecl` drops an unused `let`) and no lambda (each lambda is
+  re-opened with `lambdaTelescope`, which takes fresh names from the name generator, and those
+  names can end up in the environment). `Expr.find?` checks this on the shared term graph without
+  allocating, so such arguments (typically the large concrete data a `_sunfold` body is applied to)
+  are kept as they are instead of being rebuilt node by node.
   -/
   isInert (e : Expr) : Bool :=
-    (e.find? fun s => s.isLet || (s.isLambda && s.hasMVar) || (smartUnfoldingMatch? s).isSome).isNone
+    (e.find? fun s => s.isLet || s.isLambda || (smartUnfoldingMatch? s).isSome).isNone
 
   go (e : Expr) : OptionT MetaM Expr := do
     match e with
     | .letE n t v b nondep => mapLetDecl n t (← go v) (nondep := nondep) fun x => go (b.instantiate1 x)
-    | .lam .. =>
-      if isInert e then return e
-      lambdaTelescope e fun xs b => do mkLambdaFVars xs (← go b)
+    | .lam .. => lambdaTelescope e fun xs b => do mkLambdaFVars xs (← go b)
     | .app f a .. =>
       let f' ← go f
       let a' ← if isInert a then pure a else go a
