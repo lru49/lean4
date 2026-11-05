@@ -1094,6 +1094,31 @@ where
     | ``HMod.hMod, ``instHMod, ``Nat.instMod => some (Nat.mod, ``Mod.mod)
     | _, _, _ => none
 
+/--
+`@OfNat.ofNat Nat (lit n) (instOfNatNat (lit n))`, the elaborated form of a numeral `n : Nat`, reduces to the
+raw literal `n` through two unfolding steps (`OfNat.ofNat` to the projection out of `instOfNatNat n`, then
+`instOfNatNat` to `⟨n⟩`). Same conditions and the same argument for the unchanged result and fresh-name
+sequence as `reduceNatInstBinOp?`.
+-/
+private def reduceNatOfNatLit? (e : Expr) : MetaM (Option Expr) := do
+  let .app (.app (.app (.const ``OfNat.ofNat [_]) (.const ``Nat [])) n@(.lit (.natVal _)))
+      (.app (.const ``instOfNatNat []) (.lit (.natVal _))) := e | return none
+  let .app _ (.lit (.natVal m)) := e.appArg! | return none
+  let .lit (.natVal k) := n | return none
+  unless k == m do return none
+  let ctx ← read
+  if ctx.customCanUnfoldPredicate?.isSome || !(ctx.config.canUnfoldPredicateConfig matches .default) then
+    return none
+  let cfg ← getConfig
+  unless cfg.proj matches .yesWithDelta do return none
+  if (← isDiagnosticsEnabled) then return none
+  match cfg.transparency with
+  | .all => pure ()
+  | .default =>
+    if (← isIrreducible ``OfNat.ofNat) || (← isIrreducible ``instOfNatNat) then return none
+  | _ => return none
+  return some (e.appArg!.appArg!)
+
 @[inline] private def useWHNFCache (e : Expr) : MetaM Bool := do
   -- We cache only closed terms without expr metavars.
   -- Potential refinement: cache if `e` is not stuck at a metavariable
@@ -1126,6 +1151,9 @@ where
       | some v => return v
       | none   =>
       match (← reduceNatInstBinOp? e') with
+      | some v => return v
+      | none   =>
+      match (← reduceNatOfNatLit? e') with
       | some v => return v
       | none   =>
         match (← unfoldDefinition? e') with
