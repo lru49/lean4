@@ -452,6 +452,45 @@ extern "C" LEAN_EXPORT void lean_inc_ref_huge_n(lean_object * o, size_t n) {
     }
 }
 
+/* lean-perf (DS): the deletion cascade as a graph traversal with a lookahead window.
+   The cascade frees a tree of objects whose counts drop to zero. Each step loads the counts of the
+   children of the object being freed; those loads usually miss the cache, and with a pure LIFO
+   worklist the next object is popped (and its children's counts requested) only after the current
+   one is done, so roughly one miss is outstanding at a time. Objects popped from the worklist now
+   pass through a small FIFO window: on entry the counts of their children are prefetched (the
+   object's own header and fields are in cache: its count was just read when it was queued), and
+   the object is freed when it leaves the window, `LEAN_DEL_WINDOW - 1` frees later. Up to
+   `LEAN_DEL_WINDOW` objects' child misses are thus in flight together (the "prefetch-on-grey FIFO"
+   of software-prefetching collectors, applied to freeing). Only the order in which the dying
+   objects are freed changes; the set of freed objects and every count update are the same. A
+   cascade of one object (the common case) never touches the window. */
+#ifndef LEAN_DEL_WINDOW
+#define LEAN_DEL_WINDOW 8
+#endif
+static_assert((LEAN_DEL_WINDOW & (LEAN_DEL_WINDOW - 1)) == 0, "LEAN_DEL_WINDOW must be a power of two");
+
+static inline void del_prefetch_children(object * o) {
+    uint8 tag = lean_ptr_tag(o);
+    object ** it;
+    object ** end;
+    if (LEAN_LIKELY(tag <= LeanMaxCtorTag)) {
+        it  = lean_ctor_obj_cptr(o);
+        end = it + lean_ctor_num_objs(o);
+    } else if (tag == LeanClosure) {
+        it  = lean_closure_arg_cptr(o);
+        end = it + lean_closure_num_fixed(o);
+    } else if (tag == LeanArray) {
+        it  = lean_array_cptr(o);
+        end = it + std::min<size_t>(lean_array_size(o), LEAN_DEL_WINDOW);
+    } else {
+        return;
+    }
+    for (; it != end; ++it) {
+        object * c = *it;
+        if (!lean_is_scalar(c)) __builtin_prefetch(c, 1, 3);
+    }
+}
+
 // sync with tests/elab/rc_model.lean (`decRefCold`)
 extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
     // `rc == 1` is the hot single-threaded free path and can never be sticky, so the sticky check
@@ -462,12 +501,24 @@ extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
         if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) != -1)
             return;
     }
-    object * todo = nullptr;
+    object * todo = lean_del_core(o, nullptr);
+    if (LEAN_LIKELY(todo == nullptr))
+        return;
+    object * window[LEAN_DEL_WINDOW];
+    unsigned head = 0, count = 0;
     while (true) {
-        todo = lean_del_core(o, todo);
-        if (todo == nullptr)
+        while (count < LEAN_DEL_WINDOW && todo != nullptr) {
+            object * c = pop_back(todo);
+            del_prefetch_children(c);
+            window[(head + count) & (LEAN_DEL_WINDOW - 1)] = c;
+            count++;
+        }
+        if (count == 0)
             return;
-        o = pop_back(todo);
+        o = window[head];
+        head = (head + 1) & (LEAN_DEL_WINDOW - 1);
+        count--;
+        todo = lean_del_core(o, todo);
     }
 }
 
