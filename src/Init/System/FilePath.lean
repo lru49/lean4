@@ -136,8 +136,26 @@ instance : Div FilePath where
 instance : HDiv FilePath String FilePath where
   hDiv p sub := FilePath.join p ⟨sub⟩
 
+/--
+The byte index of the last path separator among the first `i` bytes of `s`, if any. Path separators
+are ASCII and an ASCII byte never occurs inside a multi-byte UTF-8 sequence, so the last separator
+byte is the start of the last separator character.
+-/
+private def lastSepByteIdx? (s : String) : Nat → Option Nat
+  | 0 => none
+  | i + 1 =>
+    if h : (⟨i⟩ : String.Pos.Raw) < s.rawEndPos then
+      let b := s.getUTF8Byte ⟨i⟩ h
+      if b == 47 || (isWindows && b == 92) then some i else lastSepByteIdx? s i
+    else
+      lastSepByteIdx? s i
+
+/-
+Same result as `p.toString.revFind? pathSeparators.contains` (`pathSeparators` is `['/']`, plus
+`'\\'` on Windows), by a plain backward byte scan instead of a character-decoding backward search.
+-/
 private def posOfLastSep (p : FilePath) : Option p.toString.Pos :=
-  p.toString.revFind? pathSeparators.contains
+  (lastSepByteIdx? p.toString p.toString.utf8ByteSize).bind fun i => p.toString.pos? ⟨i⟩
 
 private def afterRootDirectory (p : FilePath) : p.toString.Pos :=
   if pathSeparators.contains p.toString.front then
