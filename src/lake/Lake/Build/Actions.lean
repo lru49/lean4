@@ -39,6 +39,48 @@ public def compileLeanIR
     env := #[("LEAN_PATH", leanPath.toString)]
   }
 
+/--
+The compact JSON of one `importArts` entry of a module setup (`"<module>":<artifacts>`) per
+module, with the artifacts it was rendered from. Every module of a build lists (mostly) the
+same transitive imports, so the entries are rendered once instead of once per module.
+-/
+builtin_initialize setupImportArtsJsonCache : IO.Ref (NameMap (ImportArtifacts × String)) ←
+  IO.mkRef {}
+
+/--
+Renders `setup` as compact JSON with the same value as `(toJson setup).compress` (the
+`importArts` object lists the same entries, in name order), reusing the cached rendering of
+each `importArts` entry.
+-/
+def renderModuleSetup (setup : ModuleSetup) : IO String := do
+  let .obj fields := toJson {setup with importArts := {}}
+    | return (toJson setup).compress
+  let cache ← setupImportArtsJsonCache.get
+  let mut fresh : Array (Name × ImportArtifacts × String) := #[]
+  let mut arts := "{"
+  let mut first := true
+  for (n, a) in setup.importArts do
+    let mut frag := ""
+    if let some (cached, f) := cache.find? n then
+      if cached.toArrays == a.toArrays then frag := f
+    if frag.isEmpty then
+      frag := (Json.str n.toString).compress ++ ":" ++ (toJson a).compress
+      fresh := fresh.push (n, a, frag)
+    unless first do arts := arts.push ','
+    arts := arts ++ frag
+    first := false
+  arts := arts.push '}'
+  unless fresh.isEmpty do
+    setupImportArtsJsonCache.modify fun c => fresh.foldl (init := c) fun c (n, a, frag) =>
+      c.insert n (a, frag)
+  let mut out := "{"
+  first := true
+  for (k, v) in fields do
+    unless first do out := out.push ','
+    first := false
+    out := out ++ (Json.str k).compress ++ ":" ++ (if k == "importArts" then arts else v.compress)
+  return out.push '}'
+
 public def compileLeanModule
   (leanFile relLeanFile : FilePath)
   (setup : ModuleSetup) (setupFile : FilePath)
@@ -64,7 +106,7 @@ public def compileLeanModule
     createParentDirs bcFile
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
-  IO.FS.writeFile setupFile (toJson setup).pretty
+  IO.FS.writeFile setupFile (← renderModuleSetup setup)
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
