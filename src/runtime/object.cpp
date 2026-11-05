@@ -976,6 +976,19 @@ struct scoped_current_task_object : flet<lean_task_object *> {
     scoped_current_task_object(lean_task_object * t):flet(g_current_task_object, t) {}
 };
 
+/* lean-perf (targeted wake-up): a thread blocked in `Task.get` (`wait_for`) or `IO.waitAny` (`wait_any`)
+   registers one of these on its own stack while it waits. `resolve_core` wakes only the waiters of the
+   task that just finished (and every `wait_any` waiter, `m_task == nullptr`), instead of broadcasting one
+   shared condition variable to every blocked thread on every task completion. All fields are protected by
+   the task manager mutex; a node is unlinked by its owner under that mutex before it goes out of scope. */
+struct task_waiter {
+    lean_task_object * m_task;  // the awaited task; nullptr = woken on every completion (`wait_any`)
+    condition_variable m_cv;
+    task_waiter *      m_prev{nullptr};
+    task_waiter *      m_next{nullptr};
+    explicit task_waiter(lean_task_object * t):m_task(t) {}
+};
+
 class task_manager {
     mutex                                         m_mutex;
     std::vector<std::unique_ptr<lthread>>         m_std_workers;
@@ -986,7 +999,7 @@ class task_manager {
     unsigned                                      m_queues_size{0};
     unsigned                                      m_max_prio{0};
     condition_variable                            m_queue_cv;
-    condition_variable                            m_task_finished_cv;
+    task_waiter *                                 m_waiters{nullptr};  // blocked `wait_for`/`wait_any` callers
     condition_variable                            m_dedicated_finished_cv;
     bool                                          m_shutting_down{false};
 
@@ -1157,7 +1170,22 @@ class task_manager {
         /* After the task has been finished and we propagated
            dependencies, we can release `imp` and keep just the value */
         free_task_imp(imp);
-        m_task_finished_cv.notify_all();
+        for (task_waiter * w = m_waiters; w; w = w->m_next) {
+            if (w->m_task == t || w->m_task == nullptr)
+                w->m_cv.notify_one();
+        }
+    }
+
+    void add_waiter(task_waiter * w) {
+        w->m_prev = nullptr;
+        w->m_next = m_waiters;
+        if (m_waiters) m_waiters->m_prev = w;
+        m_waiters = w;
+    }
+
+    void remove_waiter(task_waiter * w) {
+        if (w->m_prev) w->m_prev->m_next = w->m_next; else m_waiters = w->m_next;
+        if (w->m_next) w->m_next->m_prev = w->m_prev;
     }
 
     void handle_finished(unique_lock<mutex> & lock, lean_task_object * t, lean_task_imp * imp) {
@@ -1270,7 +1298,13 @@ public:
             else
                 m_queue_cv.notify_one();
         }
-        m_task_finished_cv.wait(lock, [&]() { return t->m_value != nullptr; });
+        {
+            task_waiter w(t);
+            add_waiter(&w);
+            while (t->m_value == nullptr)
+                w.m_cv.wait(lock);
+            remove_waiter(&w);
+        }
         if (in_pool) {
             m_max_std_workers--;
         }
@@ -1280,10 +1314,14 @@ public:
         if (object * t = wait_any_check(task_list))
             return t;
         unique_lock<mutex> lock(m_mutex);
+        task_waiter w(nullptr);
+        add_waiter(&w);
         while (true) {
-            if (object * t = wait_any_check(task_list))
+            if (object * t = wait_any_check(task_list)) {
+                remove_waiter(&w);
                 return t;
-            m_task_finished_cv.wait(lock);
+            }
+            w.m_cv.wait(lock);
         }
     }
 
