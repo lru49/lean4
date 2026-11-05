@@ -93,12 +93,15 @@ inline expr to_cnstr_when_structure(environment const & env, recursor_val const 
     return expand_eta_struct(env, e_type, e);
 }
 
-/* `inst_rhs(rec_fn, rule_rhs, lparams)` must return `instantiate_lparams(rule_rhs, lparams, const_levels(rec_fn))`
+/* The iota-reduct of `e` is `mk_app(head, args)`: `inductive_reduce_rec` returns `head` and APPENDS the arguments to
+   `args` (forward order) instead of building the application, which the type checker usually takes apart again at once.
+   `inst_rhs(rec_fn, rule_rhs, lparams)` must return `instantiate_lparams(rule_rhs, lparams, const_levels(rec_fn))`
    (the type checker memoises it per recursor constant and rule). */
 template<typename WHNF, typename INFER, typename IS_DEF_EQ, typename IS_PROP, typename INST_RHS>
 inline optional<expr> inductive_reduce_rec(environment const & env, expr const & e,
                                            WHNF const & whnf, INFER const & infer_type, IS_DEF_EQ const & is_def_eq,
-                                           IS_PROP const & is_prop, INST_RHS const & inst_rhs) {
+                                           IS_PROP const & is_prop, INST_RHS const & inst_rhs,
+                                           buffer<expr> & args) {
     expr const & rec_fn   = get_app_fn(e);
     if (!is_constant(rec_fn)) return none_expr();
     optional<constant_info> rec_info = env.find(const_name(rec_fn));
@@ -134,17 +137,17 @@ inline optional<expr> inductive_reduce_rec(environment const & env, expr const &
     if (length(const_levels(rec_fn)) != length(rec_info->get_lparams())) return none_expr();
     expr rhs = inst_rhs(rec_fn, rule->get_rhs(), rec_info->get_lparams());
     /* apply parameters, motives and minor premises from recursor application. */
-    rhs      = mk_app(rhs, rec_val.get_nparams() + rec_val.get_nmotives() + rec_val.get_nminors(), rec_args.data());
+    args.append(rec_val.get_nparams() + rec_val.get_nmotives() + rec_val.get_nminors(), rec_args.data());
     /* The number of parameters in the constructor is not necessarily
        equal to the number of parameters in the recursor when we have
        nested inductive types. */
     unsigned nparams = major_args.size() - rule->get_nfields();
     /* apply fields from major premise */
-    rhs      = mk_app(rhs, rule->get_nfields(), major_args.data() + nparams);
+    args.append(rule->get_nfields(), major_args.data() + nparams);
     if (rec_args.size() > major_idx + 1) {
         /* recursor application has more arguments after major premise */
         unsigned nextra = rec_args.size() - major_idx - 1;
-        rhs = mk_app(rhs, nextra, rec_args.data() + major_idx + 1);
+        args.append(nextra, rec_args.data() + major_idx + 1);
     }
     return some_expr(rhs);
 }

@@ -55,6 +55,20 @@ public:
     LEAN_EXPORT ~scope_rec_depth();
 };
 
+/* A guard that holds a variable number of recursion-depth levels (released together at scope exit): `push()`
+   is the entry of one `scope_rec_depth` that stays live, `probe()` the entry and exit of one that does not.
+   Used where a loop replaces a chain of nested calls that each held a `scope_rec_depth`, so that the depth
+   accounting (and the `maxRecDepth` failure point) is the one of the nested calls. */
+class LEAN_EXPORT scope_rec_depth_n {
+    size_t m_n = 0;
+public:
+    scope_rec_depth_n() {}
+    scope_rec_depth_n(scope_rec_depth_n const &) = delete;
+    LEAN_EXPORT void push();
+    LEAN_EXPORT void probe();
+    LEAN_EXPORT ~scope_rec_depth_n();
+};
+
 /* Update the thread local `IO.CancelToken` (`nullptr` if unset) */
 class LEAN_EXPORT scope_cancel_tk : flet<lean_object *> {
 public:

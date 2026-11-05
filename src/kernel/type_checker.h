@@ -110,8 +110,10 @@ private:
     expr infer_type(expr const & e);
 
     enum class reduction_status { Continue, DefUnknown, DefEqual, DefDiff };
-    optional<expr> reduce_recursor(expr const & e, bool cheap_rec, bool cheap_proj);
+    optional<expr> reduce_recursor(expr const & e, bool cheap_rec, bool cheap_proj, buffer<expr> & args);
     expr whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_proj, bool cache_result);
+    expr whnf_core_beta(expr f, buffer<expr> & rev_args, bool cheap_rec, bool cheap_proj);
+    bool fresh_app_may_be_cached(expr const & f, unsigned num_args, expr const * args, bool rev) const;
     expr instantiate_rec_rhs(expr const & rec_fn, expr const & rhs, names const & lps);
     optional<expr> reduce_proj_core(expr c, name const & sname, unsigned idx);
     optional<expr> reduce_proj(expr const & e, bool cheap_rec, bool cheap_proj);
