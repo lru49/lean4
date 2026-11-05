@@ -2545,6 +2545,15 @@ where
         env := env.setCheckedSync { env.base.private with extensions := (← setImportedEntries env.base.private.extensions mods prevSize) }
         -- See comment at `updateEnvAttributesRef`
         env ← updateEnvAttributes env
+        -- lean-perf (L02 crash fix v2 A2): the `[init]` declarations registered extensions whose descriptors
+        -- (closures, initial states, interpreted constants such as `Aesop.BaseRuleSet.empty`) every task of the
+        -- next batch and the import thread share; make the whole registry graph persistent NOW, on the import
+        -- thread while the only running tasks are the native folds of the first batch, so that the tasks'
+        -- `markPersistentSeq` of their states never writes `rc := 0` into a live-counted shared object
+        -- (the rule: a task may mark its result persistent only if everything it reaches is either created by
+        -- the task or already persistent).
+        if par then
+          discard <| unsafe Runtime.markPersistent (← persistentEnvExtensionsRef.get)
         -- lean-perf: the new extensions now have their imported entries
         if par then
           tasks ← spawnTasks env prevSize tasks
@@ -3247,6 +3256,13 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
     ParallelImport.tick "markPersistent 1"
+  -- lean-perf (L02 crash fix v2 A1): the options object is captured by every interpreter stub closure the
+  -- import creates (parsers, delaborators, macros, extension `addEntry`s) and reference-counted by every thread
+  -- that evaluates; a leaked environment's options are made persistent (rc 0, never counted) here, before any
+  -- task or dedicated thread exists, so no later persistent-marking walk can turn them persistent in the middle of
+  -- another thread's reference-count update (docs/levers/L02-interp-symtab-crash.md: that race corrupted the
+  -- count of shared interpreted constants and freed them in use).
+  let opts ← if leakEnv then unsafe Runtime.markPersistent opts else pure opts
   if let some t := conflicts? then
     let rootChildren ← IO.ofExcept (← IO.wait t)
     ParallelImport.tick s!"import conflicts checked, trie roots expanded ({rootChildren} root children; task joined)"
