@@ -345,66 +345,6 @@ private def ParserExtension.OLeanEntry.toEntry (s : State) : OLeanEntry → Impo
     let (leading, p) ← mkParserOfConstant s.categories declName
     return Entry.parser catName declName leading p prio
 
-/--
-lean-perf (L05): `ScopedEnvExtension.addImportedFn` of the parser extension with the imported parser
-constants evaluated on several threads. Pass 1 applies the token, kind and category entries in order
-(their folds are order-independent and `addParser` never reads tokens or kinds, so applying them before
-the parsers gives the same state) and collects the parser entries; pass 2 evaluates every collected
-parser constant (`mkParserOfConstant`: a read of the environment and of the alias tables; it consults
-the categories only for existence, and every category a parser refers to is declared by an earlier
-entry) on `ParallelImport.numThreads` tasks; pass 3 walks the entries again in their original order
-and adds the parsers to the categories and the scoped entries, so the parser tables and every
-namespace's scoped-entry list come out in the sequential order. The first evaluation error in entry
-order is rethrown, as the sequential fold would.
--/
-private def ParserExtension.addImportedPar (as : Array (Array (ScopedEnvExtension.Entry OLeanEntry))) :
-    ImportM (ScopedEnvExtension.StateStack OLeanEntry Entry State) := do
-  let ctx ← read
-  let mut s ← ParserExtension.mkInitial
-  let mut pending : Array Name := #[]
-  for a in as do
-    for e in a do
-      match e with
-      | .global (.parser _ declName _) | .scoped _ (.parser _ declName _) => pending := pending.push declName
-      | .global (.token tk) => s := ParserExtension.addEntryImpl s (.token tk)
-      | .global (.kind k) => s := ParserExtension.addEntryImpl s (.kind k)
-      | .global (.category c d b) => s := ParserExtension.addEntryImpl s (.category c d b)
-      | .scoped _ _ => pure ()
-  let categories := s.categories
-  let numThreads ← ParallelImport.numThreads
-  let chunk := max 1 ((pending.size + numThreads - 1) / numThreads)
-  let mut tasks : Array (Task (Array (Except IO.Error (Bool × Parser)))) := #[]
-  let mut start := 0
-  while start < pending.size do
-    let names := pending.extract start (min pending.size (start + chunk))
-    let t ← BaseIO.asTask (prio := .default) <| names.mapM fun declName =>
-      ((mkParserOfConstant categories declName).run ctx).toBaseIO
-    tasks := tasks.push t
-    start := start + chunk
-  let mut results : Array (Except IO.Error (Bool × Parser)) := #[]
-  for t in tasks do
-    results := results ++ t.get
-  if results.size != pending.size then
-    throw <| IO.userError "parser extension: parallel evaluation of the imported parsers lost results"
-  let mut scopedEntries : ScopedEnvExtension.ScopedEntries Entry := {}
-  let mut k := 0
-  for a in as do
-    for e in a do
-      match e with
-      | .global (.parser catName declName prio) =>
-        let (leading, p) ← IO.ofExcept results[k]!
-        k := k + 1
-        s := ParserExtension.addEntryImpl s (.parser catName declName leading p prio)
-      | .scoped ns (.parser catName declName prio) =>
-        let (leading, p) ← IO.ofExcept results[k]!
-        k := k + 1
-        scopedEntries := scopedEntries.insert ns (.parser catName declName leading p prio)
-      | .scoped ns (.token tk) => scopedEntries := scopedEntries.insert ns (.token tk)
-      | .scoped ns (.kind kd) => scopedEntries := scopedEntries.insert ns (.kind kd)
-      | .scoped ns (.category c d b) => scopedEntries := scopedEntries.insert ns (.category c d b)
-      | .global _ => pure ()
-  return { stateStack := [ { state := s } ], scopedEntries }
-
 builtin_initialize parserExtension : ParserExtension ←
   registerScopedEnvExtension {
     mkInitial       := ParserExtension.mkInitial
@@ -412,10 +352,6 @@ builtin_initialize parserExtension : ParserExtension ←
     toOLeanEntry    := ParserExtension.Entry.toOLeanEntry
     ofOLeanEntry    := ParserExtension.OLeanEntry.toEntry
   }
-
-builtin_initialize
-  -- lean-perf (L05): see `ParserExtension.addImportedPar`
-  ScopedEnvExtension.registerParImportFn parserExtension.descr.name ParserExtension.addImportedPar
 
 def getParserCategory? (env : Environment) (catName : Name) : Option ParserCategory :=
   (parserExtension.getState env).categories.find? catName

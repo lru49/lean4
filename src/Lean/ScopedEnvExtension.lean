@@ -120,46 +120,12 @@ unsafe def getParEntriesFnUnsafe {β σ : Type} (extName : Name) : IO (Option (�
 @[implemented_by getParEntriesFnUnsafe]
 opaque getParEntriesFn {β σ : Type} (extName : Name) : IO (Option (σ → Array β → Nat → IO σ))
 
-/--
-lean-perf (L05): replacement `addImportedFn`s by extension name, for extensions whose conversion of
-the imported entries (`ofOLeanEntry`) is the expensive part and can be done on several threads (the
-parser extension: evaluating the imported parser constants). `f as` registered for `extName` must
-return the same `StateStack` as `addImportedFn descr as`; it is used whenever the import phase has
-more than one thread (`LEAN_IMPORT_PAR_CONVERT=0` disables it). Name-keyed for the same reason as
-`parEntriesFnsRef`.
--/
-builtin_initialize parImportFnsRef :
-    IO.Ref (NameMap (Array (Array (Entry EnvExtensionEntry)) →
-      ImportM (StateStack EnvExtensionEntry EnvExtensionEntry EnvExtensionState))) ← IO.mkRef {}
-
-unsafe def registerParImportFnUnsafe {α β σ : Type} (extName : Name)
-    (f : Array (Array (Entry α)) → ImportM (StateStack α β σ)) : IO Unit :=
-  parImportFnsRef.modify (·.insert extName (unsafeCast f))
-
-/-- See `parImportFnsRef`. -/
-@[implemented_by registerParImportFnUnsafe]
-opaque registerParImportFn {α β σ : Type} (extName : Name)
-    (f : Array (Array (Entry α)) → ImportM (StateStack α β σ)) : IO Unit
-
-unsafe def getParImportFnUnsafe {α β σ : Type} (extName : Name) :
-    IO (Option (Array (Array (Entry α)) → ImportM (StateStack α β σ))) :=
-  return ((← parImportFnsRef.get).find? extName).map unsafeCast
-
-/-- See `parImportFnsRef`. -/
-@[implemented_by getParImportFnUnsafe]
-opaque getParImportFn {α β σ : Type} (extName : Name) :
-    IO (Option (Array (Array (Entry α)) → ImportM (StateStack α β σ)))
-
 def ScopedEntries.insert (scopedEntries : ScopedEntries β) (ns : Name) (b : β) : ScopedEntries β :=
   match scopedEntries.map.find? ns with
   | none    => { map := scopedEntries.map.insert ns <| ({} : PArray β).push b }
   | some bs => { map := scopedEntries.map.insert ns <| bs.push b }
 
 def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) := do
-  -- lean-perf (L05): a registered multi-threaded replacement (see `parImportFnsRef`)
-  if let some f ← getParImportFn (α := α) (β := β) (σ := σ) descr.name then
-    if (← ParallelImport.numThreads) > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_CONVERT") then
-      return ← f as
   let mut s ← descr.mkInitial
   let mut scopedEntries : ScopedEntries β := {}
   -- lean-perf (L01c): parallel fold of the global entries when the extension registered one
