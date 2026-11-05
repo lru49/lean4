@@ -1325,8 +1325,25 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
           { r with expr := r.expr.instantiateRev c.idx2fvar } }
         insertCacheEntry rawKey entry (persist := false)
         return entry
+    let diag := (← (IO.getEnv "LEAN_CN_DIAG" : IO (Option String))).isSome
+    let diagInfo : MetaM String := do
+      let env ← getEnv
+      let opts ← getOptionsUnrestricted
+      let cls (c : SynthInstanceCache) (k : SynthInstanceCacheKey) : String :=
+        match c.find? k with
+        | none => "absent"
+        | some es => String.intercalate "," <| es.map fun e =>
+            s!"o{validOptionAccesses opts e.deps}x{e.deps.extGens.all (fun (idx, gen) => EnvExtension.getGenAt env idx == gen)}l{env.checkDeclChangeLog e.deps.baseChangeLogPos e.deps.baseConstGen}"
+      let line := match (← getRef).getPos? with
+        | some p => toString ((← getFileMap).toPosition p).line
+        | none => "?"
+      let kindS := match kind with | .noMVars => "nomv" | .mvarsNoOutputParams => "mvno" | .mvarsOutputParams => "mvout"
+      let txc := (← get).cache.synthInstance
+      return s!"line={line} par={parentRecording} kind={kindS} norm={norm?.isSome} rawhit={rawEntry?.isSome} nli={localInsts.size} fv={cacheKeyType.hasFVar} spd={cacheKey.synthPendingDepth} mrs={maxResultSize} exp={cacheKey.isExporting} kh={hash cacheKey} rh={hash rawKey} tg={env.trackedGen} clp={env.declChangeLog.size} cg={env.constGen} psEmpty={env.synthCache.isEmpty} txRaw={cls txc rawKey} txKey={cls txc cacheKey} psKey={cls env.synthCache cacheKey} psRaw={cls env.synthCache rawKey} type={(toString type).replace "\n" " "}"
     match entry? with
     | some entry =>
+      if diag then
+        IO.eprintln s!"CNDIAG hit {← diagInfo}"
       trace[Meta.synthInstance.cache] "cached: {type}"
       -- The used entry's dependencies become dependencies of the enclosing query, if any.
       if parentRecording then
@@ -1337,8 +1354,12 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       return result?
     | none =>
       trace[Meta.synthInstance.cache] "new: {type}"
+      let info ← if diag then diagInfo else pure ""
+      let t0 ← IO.monoNanosNow
       let abstResult? ← runSearch
       let result? ← applyAbstractResult? type abstResult?
+      if diag then
+        IO.eprintln s!"CNDIAG miss ns={(← IO.monoNanosNow) - t0} ok={result?.isSome} {info}"
       trace[Meta.synthInstance] "result {result?}"
       cacheResult cacheKey rawKey norm? ((← getThe Core.State).recordedDeps) kind abstResult? result?
       return result?
