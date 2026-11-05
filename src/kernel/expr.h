@@ -274,14 +274,42 @@ inline bool            is_shared(expr const & e)             { return !is_exclus
 
 // =======================================
 // Update
-expr update_app(expr const & e, expr const & new_fn, expr const & new_arg);
-expr update_binding(expr const & e, expr const & new_domain, expr const & new_body);
+/* lean-perf (CV updinline): the "nothing changed" test of the `update_*` functions is inlined into the traversals
+   (`replace_rec_fn` & co. call one of them for every visited compound node, and almost all of those calls return `e`
+   unchanged); only the construction of a new node stays out of line (`*_core`). Same results. */
+expr update_app_core(expr const & e, expr const & new_fn, expr const & new_arg);
+expr update_binding_core(expr const & e, expr const & new_domain, expr const & new_body);
+expr update_let_core(expr const & e, expr const & new_type, expr const & new_value, expr const & new_body);
+expr update_mdata_core(expr const & e, expr const & new_e);
+expr update_proj_core(expr const & e, expr const & new_e);
+inline expr update_app(expr const & e, expr const & new_fn, expr const & new_arg) {
+    if (is_eqp(app_fn(e), new_fn) && is_eqp(app_arg(e), new_arg))
+        return e;
+    return update_app_core(e, new_fn, new_arg);
+}
+inline expr update_binding(expr const & e, expr const & new_domain, expr const & new_body) {
+    if (is_eqp(binding_domain(e), new_domain) && is_eqp(binding_body(e), new_body))
+        return e;
+    return update_binding_core(e, new_domain, new_body);
+}
 expr update_binding(expr const & e, expr const & new_domain, expr const & new_body, binder_info bi);
 expr update_sort(expr const & e, level const & new_level);
 expr update_const(expr const & e, levels const & new_levels);
-expr update_let(expr const & e, expr const & new_type, expr const & new_value, expr const & new_body);
-expr update_mdata(expr const & e, expr const & new_e);
-expr update_proj(expr const & e, expr const & new_e);
+inline expr update_let(expr const & e, expr const & new_type, expr const & new_value, expr const & new_body) {
+    if (is_eqp(let_type(e), new_type) && is_eqp(let_value(e), new_value) && is_eqp(let_body(e), new_body))
+        return e;
+    return update_let_core(e, new_type, new_value, new_body);
+}
+inline expr update_mdata(expr const & e, expr const & new_e) {
+    if (is_eqp(mdata_expr(e), new_e))
+        return e;
+    return update_mdata_core(e, new_e);
+}
+inline expr update_proj(expr const & e, expr const & new_e) {
+    if (is_eqp(proj_expr(e), new_e))
+        return e;
+    return update_proj_core(e, new_e);
+}
 // =======================================
 
 

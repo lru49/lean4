@@ -259,28 +259,28 @@ bool let_nondep_core(expr const & e) {
 // =======================================
 // Update
 
-expr update_mdata(expr const & e, expr const & t) {
+expr update_mdata_core(expr const & e, expr const & t) {
     if (!is_eqp(mdata_expr(e), t))
         return mk_mdata(mdata_data(e), t);
     else
         return e;
 }
 
-expr update_proj(expr const & e, expr const & t) {
+expr update_proj_core(expr const & e, expr const & t) {
     if (!is_eqp(proj_expr(e), t))
         return mk_proj(proj_sname(e), proj_idx(e), t);
     else
         return e;
 }
 
-expr update_app(expr const & e, expr const & new_fn, expr const & new_arg) {
+expr update_app_core(expr const & e, expr const & new_fn, expr const & new_arg) {
     if (!is_eqp(app_fn(e), new_fn) || !is_eqp(app_arg(e), new_arg))
         return mk_app(new_fn, new_arg);
     else
         return e;
 }
 
-expr update_binding(expr const & e, expr const & new_domain, expr const & new_body) {
+expr update_binding_core(expr const & e, expr const & new_domain, expr const & new_body) {
     if (!is_eqp(binding_domain(e), new_domain) || !is_eqp(binding_body(e), new_body))
         return mk_binding(e.kind(), binding_name(e), new_domain, new_body, binding_info(e));
     else
@@ -308,7 +308,7 @@ expr update_const(expr const & e, levels const & new_levels) {
         return e;
 }
 
-expr update_let(expr const & e, expr const & new_type, expr const & new_value, expr const & new_body) {
+expr update_let_core(expr const & e, expr const & new_type, expr const & new_value, expr const & new_body) {
     if (!is_eqp(let_type(e), new_type) || !is_eqp(let_value(e), new_value) || !is_eqp(let_body(e), new_body))
         return mk_let(let_name(e), new_type, new_value, new_body, let_nondep(e));
     else
