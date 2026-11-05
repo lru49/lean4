@@ -30,6 +30,8 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <string>
 #include <vector>
 #include <shared_mutex>
+#include <deque>
+#include <utility>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #include <psapi.h>
@@ -391,6 +393,82 @@ static inline native_symbol_cache_shard & native_symbol_cache_shard_for(name con
     return g_native_symbol_cache[fn.hash() % g_native_symbol_cache_num_shards];
 }
 
+/** \brief Per-evaluation table from names to values of type `V`, for the interpreter's symbol and constant
+    caches (which an evaluation consults on every call and constant load).
+
+    Same semantics as `name_hash_map<V>` (keys compared with `name::eq`), but: (1) values live in a
+    `std::deque`, so references returned by `find`/`insert` stay valid while more entries are added (the
+    interpreter keeps a reference to a symbol entry across nested calls); (2) the index is a flat
+    open-addressing array of (key pointer, hash, value pointer) with linear probing, so a lookup is one or
+    two cache lines, and the key pointer is compared before the name (the IR refers to a callee through the
+    very same `Name` object every time, so almost every hit is a pointer match); (3) nothing is allocated
+    until the first insertion and the index grows by doubling, instead of one heap node per entry plus
+    rehashing from a single bucket. The table lives exactly as long as one interpreter instance. */
+template<class V>
+class name_table {
+    struct slot {
+        lean_object * m_key;   // nullptr: empty slot; the key is kept alive by the entry in `m_entries`
+        uint64_t m_hash;
+        std::pair<name, V> * m_entry;
+    };
+    std::deque<std::pair<name, V>> m_entries;
+    std::vector<slot> m_slots;   // size is 0 or a power of two
+    size_t m_size = 0;
+
+    void grow() {
+        std::vector<slot> old;
+        old.swap(m_slots);
+        m_slots.assign(old.empty() ? 32 : old.size() * 2, slot{nullptr, 0, nullptr});
+        size_t mask = m_slots.size() - 1;
+        for (slot const & s : old) {
+            if (s.m_key) {
+                size_t i = s.m_hash & mask;
+                while (m_slots[i].m_key) i = (i + 1) & mask;
+                m_slots[i] = s;
+            }
+        }
+    }
+public:
+    typedef typename std::deque<std::pair<name, V>>::iterator iterator;
+    iterator begin() { return m_entries.begin(); }
+    iterator end() { return m_entries.end(); }
+
+    /** \brief Return the value stored for `n`, or `nullptr`. */
+    V * find(name const & n) {
+        if (m_slots.empty())
+            return nullptr;
+        lean_object * k = n.raw();
+        size_t mask = m_slots.size() - 1;
+        uint64_t h = n.hash();
+        for (size_t i = h & mask; ; i = (i + 1) & mask) {
+            slot const & s = m_slots[i];
+            if (s.m_key == k)
+                return &s.m_entry->second;
+            if (!s.m_key)
+                return nullptr;
+            if (s.m_hash == h && name::eq(s.m_key, k))
+                return &s.m_entry->second;
+        }
+    }
+
+    /** \brief Insert `n -> v` unless `n` is already present; return the stored value. */
+    V & insert(name const & n, V && v) {
+        if (V * e = find(n))
+            return *e;
+        if (2 * (m_size + 1) > m_slots.size())
+            grow();
+        m_entries.emplace_back(n, std::move(v));
+        std::pair<name, V> * e = &m_entries.back();
+        size_t mask = m_slots.size() - 1;
+        uint64_t h = n.hash();
+        size_t i = h & mask;
+        while (m_slots[i].m_key) i = (i + 1) & mask;
+        m_slots[i] = slot{e->first.raw(), h, e};
+        m_size++;
+        return e->second;
+    }
+};
+
 class interpreter {
     // stack of IR variable slots
     std::vector<value> m_arg_stack;
@@ -414,7 +492,7 @@ class interpreter {
       value m_val;
     };
     // caches values of nullary functions ("constants")
-    name_hash_map<constant_cache_entry> m_constant_cache;
+    name_table<constant_cache_entry> m_constant_cache;
     struct symbol_cache_entry {
         // looking up IR from .oleans is slow enough to warrant its own cache; but as local IR can
         // be backtracked, this cache needs to be local as well.
@@ -422,7 +500,7 @@ class interpreter {
         native_symbol_cache_entry m_native;
     };
     // caches symbol lookup successes _and_ failures
-    name_hash_map<symbol_cache_entry> m_symbol_cache;
+    name_table<symbol_cache_entry> m_symbol_cache;
 
     /** \brief Get current stack frame */
     inline frame & get_frame() {
@@ -848,9 +926,8 @@ private:
 
     /** \brief Return cached lookup result for given unmangled function name in the current binary. */
     const symbol_cache_entry& lookup_symbol(name const & fn) {
-        auto e = m_symbol_cache.find(fn);
-        if (e != m_symbol_cache.end()) {
-            return e->second;
+        if (symbol_cache_entry * e = m_symbol_cache.find(fn)) {
+            return *e;
         }
         symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
         native_symbol_cache_shard & shard = native_symbol_cache_shard_for(fn);
@@ -860,7 +937,7 @@ private:
             if (ne != shard.m_map.end()) {
                 e_new.m_native = ne->second;
                 lock.unlock();
-                return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
+                return m_symbol_cache.insert(fn, std::move(e_new));
             }
         }
         // not cached yet: resolve without holding any lock (`dlsym` and the name mangling below are
@@ -891,7 +968,7 @@ private:
                 e_new.m_native = r.first->second;
             }
         }
-        return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
+        return m_symbol_cache.insert(fn, std::move(e_new));
     }
 
     /** \brief Retrieve Lean declaration from elab_environment. */
@@ -905,10 +982,8 @@ private:
 
     /** \brief Evaluate nullary function ("constant"). */
     value load(name const & fn, type t) {
-        auto cached_entry = m_constant_cache.find(fn);
-        if (cached_entry != m_constant_cache.end()) {
-            auto cached = cached_entry->second;
-            return cached.m_val;
+        if (constant_cache_entry * cached = m_constant_cache.find(fn)) {
+            return cached->m_val;
         }
         auto o_entry = g_init_globals->find(fn);
         if (o_entry != g_init_globals->end()) {
@@ -956,7 +1031,7 @@ private:
         push_frame(e.m_decl, m_arg_stack.size());
         value r = eval_decl_body(e.m_decl);
         pop_frame(r, t);
-        m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
+        m_constant_cache.insert(fn, constant_cache_entry { type_is_scalar(t), r });
         return r;
     }
 
