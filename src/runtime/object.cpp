@@ -905,7 +905,11 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 #endif
     if (lean_is_scalar(o) || !is_unshared(o)) return;
 
+    // Only children that still need marking are queued (scalars and objects that are already
+    // thread-shared, persistent or sticky are skipped at push time instead of being pushed and
+    // popped); the pop-time test stays because a DAG can queue an object twice.
     buffer<object*> todo;
+    auto push = [&](object * c) { if (!lean_is_scalar(c) && is_unshared(c)) todo.push_back(c); };
     todo.push_back(o);
     while (!todo.empty()) {
         object * o = todo.back();
@@ -920,7 +924,7 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
             if (tag <= LeanMaxCtorTag) {
                 object ** it  = lean_ctor_obj_cptr(o);
                 object ** end = it + lean_ctor_num_objs(o);
-                for (; it != end; ++it) todo.push_back(*it);
+                for (; it != end; ++it) push(*it);
             } else {
                 switch (tag) {
                 case LeanScalarArray:
@@ -934,29 +938,29 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
                     break;
                 }
                 case LeanTask:
-                    todo.push_back(lean_task_get(o));
+                    push(lean_task_get(o));
                     break;
                 case LeanPromise:
-                    todo.push_back((lean_object *)lean_to_promise(o)->m_result);
+                    push((lean_object *)lean_to_promise(o)->m_result);
                     break;
                 case LeanClosure: {
                     object ** it  = lean_closure_arg_cptr(o);
                     object ** end = it + lean_closure_num_fixed(o);
-                    for (; it != end; ++it) todo.push_back(*it);
+                    for (; it != end; ++it) push(*it);
                     break;
                 }
                 case LeanArray: {
                     object ** it  = lean_array_cptr(o);
                     object ** end = it + lean_array_size(o);
-                    for (; it != end; ++it) todo.push_back(*it);
+                    for (; it != end; ++it) push(*it);
                     break;
                 }
                 case LeanThunk:
-                    if (object * c = lean_to_thunk(o)->m_closure) todo.push_back(c);
-                    if (object * v = lean_to_thunk(o)->m_value) todo.push_back(v);
+                    if (object * c = lean_to_thunk(o)->m_closure) push(c);
+                    if (object * v = lean_to_thunk(o)->m_value) push(v);
                     break;
                 case LeanRef:
-                    if (object * v = lean_to_ref(o)->m_value) todo.push_back(v);
+                    if (object * v = lean_to_ref(o)->m_value) push(v);
                     break;
                 default:
                     lean_unreachable();
