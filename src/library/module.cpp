@@ -440,6 +440,19 @@ static bool olean_mmap_random() {
 }
 #endif
 
+#if !defined(LEAN_WINDOWS)
+// `LEAN_MMAP_POPULATE_MAX` (bytes; default 16384; 0 = never): see `lean_compacted_region_read`.
+static size_t olean_mmap_populate_max() {
+    static long cached = -1;
+    if (cached < 0) {
+        char const * v = getenv("LEAN_MMAP_POPULATE_MAX");
+        cached = (v != nullptr && *v) ? atol(v) : 16384;
+        if (cached < 0) cached = 0;
+    }
+    return static_cast<size_t>(cached);
+}
+#endif
+
 static object * mk_compacted_region(b_obj_arg ofname, object * root,
                                     char * buffer, size_t base_addr, size_t full_sz, bool is_mmap) {
     object * r = lean_alloc_ctor(0, 2, sizeof(size_t) * 3 + 1);
@@ -542,6 +555,15 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             | MAP_FIXED_NOREPLACE
 #endif
             ;
+#ifdef MAP_POPULATE
+        // lean-perf (L04): parts of at most `LEAN_MMAP_POPULATE_MAX` bytes (default 16 KiB: every
+        // `.ir.sig`, most `.olean.server` and `.ir` parts of Mathlib, ~21k of 55k parts) are
+        // populated by the `mmap` call itself; such a part is always touched (its root object or
+        // entries are read at import), so this replaces its first page fault with a few PTEs set up
+        // inside the call. Larger parts keep demand faulting. `LEAN_MMAP_POPULATE_MAX=0` disables.
+        if (size <= olean_mmap_populate_max())
+            mmap_flags |= MAP_POPULATE;
+#endif
         buffer = static_cast<char *>(mmap(base_addr, size, PROT_READ | PROT_WRITE,
             mmap_flags, fd.get(), 0));
         if (buffer != MAP_FAILED && buffer == base_addr) {
