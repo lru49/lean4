@@ -805,6 +805,74 @@ def processCommands (inputCtx : Parser.InputContext) (parserState : Parser.Modul
     |>.run { inputCtx with }
   return prom.result!
 
+/--
+lean-perf (chain batching): the snapshot `process.processHeader` produces for a header whose imports
+were imported elsewhere: `importedEnv` is the environment `Elab.processHeaderCore` would import for
+`setup` (e.g. continued by a chain server with `Lean.importModulesExtend`). Meant to be returned as
+the `.error` result of a `setupImports` hook; mirrors `process.processHeader` after its
+`Elab.processHeaderCore` call. `stx` is the trimmed header syntax passed to `setupImports`,
+`origStx` and `parserState` are the results of `Parser.parseHeader`.
+-/
+def processHeaderWithEnv (inputCtx : Parser.InputContext) (stx origStx : HeaderSyntax)
+    (parserState : Parser.ModuleParserState) (setup : SetupImportsResult)
+    (importedEnv : Environment) : IO HeaderProcessedSnapshot := do
+  let startTime := (← IO.monoNanosNow).toFloat / 1000000000
+  let mut opts := setup.opts
+  let (headerEnv, msgLog) := Elab.processHeaderCoreWith importedEnv stx.startPos setup.imports
+    setup.opts .empty inputCtx setup.mainModuleName setup.package?
+    (headerStx? := stx) (origHeaderStx? := origStx)
+  let stopTime := (← IO.monoNanosNow).toFloat / 1000000000
+  let diagnostics := (← Snapshot.Diagnostics.ofMessageLog msgLog)
+  if msgLog.hasErrors then
+    return { diagnostics, result? := none, metaSnap := default }
+  let mut traceState := default
+  if trace.profiler.isExporting setup.opts then
+    traceState := {
+      traces := #[{
+        ref := .missing,
+        msg := .trace { cls := `Import, startTime, stopTime }
+          (.ofFormat "importing") #[]
+        : TraceElem
+      }].toPArray'
+    }
+  opts ← reparseOptions opts
+  let cmdState := Elab.Command.mkState headerEnv msgLog opts
+  let cmdState := { cmdState with
+    infoState := {
+      enabled := true
+      trees := #[Elab.InfoTree.context (.commandCtx {
+        env     := headerEnv
+        fileMap := inputCtx.fileMap
+        ngen    := { namePrefix := `_import }
+      }) (Elab.InfoTree.node
+          (Elab.Info.ofCommandInfo { elaborator := `header, stx })
+          (stx.raw[2].getArgs.toList.map (fun importStx =>
+            Elab.InfoTree.node (Elab.Info.ofCommandInfo {
+              elaborator := `import
+              stx := importStx
+            }) #[].toPArray'
+          )).toPArray'
+      )].toPArray'
+    }
+    traceState
+  }
+  let prom ← IO.Promise.new
+  let cancelTk ← IO.CancelToken.new
+  process.parseCmd none parserState cmdState prom (sync := true) cancelTk []
+    |>.run none
+    |>.run { inputCtx with }
+  return {
+    diagnostics := .empty
+    metaSnap := .finished stx {
+      diagnostics
+      infoTree? := cmdState.infoState.trees[0]!
+    }
+    result? := some {
+      cmdState
+      firstCmdSnap := { stx? := none, task := prom.result!, cancelTk? := cancelTk }
+    }
+  }
+
 /-- Waits for and returns final command state, if importing was successful. -/
 partial def waitForFinalCmdState? (snap : InitialSnapshot) : Option Command.State := do
   let snap ← snap.result?

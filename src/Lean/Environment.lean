@@ -2356,6 +2356,34 @@ private def setImportedEntries (states : Array EnvExtensionState) (mods : Array 
   return states
 
 /--
+lean-perf (chain batching): `setImportedEntries states mods` when the first `numOld` modules of `mods`
+are the modules of a previous import whose extension states are `old` (with every persistent
+extension registered now already registered then): reuses their `importedEntries` and adds the
+entries of the new modules only.
+-/
+private def setImportedEntriesFrom (states old : Array EnvExtensionState) (numOld : Nat)
+    (mods : Array ModuleData) : IO (Array EnvExtensionState) := do
+  let mut states := states
+  let extDescrs ← persistentEnvExtensionsRef.get
+  if extDescrs.any (·.toEnvExtension.idx ≥ old.size) then
+    return ← setImportedEntries states mods
+  for extDescr in extDescrs do
+    -- safety: as in `modifyState`
+    let oldEntries := unsafe (extDescr.toEnvExtension.getStateImpl old).importedEntries
+    if oldEntries.size != numOld then
+      return ← setImportedEntries states mods
+    states := unsafe extDescr.toEnvExtension.modifyStateImpl states fun s =>
+      { s with importedEntries := oldEntries ++ .replicate (mods.size - numOld) #[] }
+  let extNameIdx ← mkExtNameMap 0
+  for modIdx in numOld...mods.size do
+    for (extName, entries) in mods[modIdx]!.entries do
+      if let some entryIdx := extNameIdx[extName]? then
+        -- safety: as in `modifyState`
+        states := unsafe extDescrs[entryIdx]!.toEnvExtension.modifyStateImpl states fun s =>
+          { s with importedEntries := s.importedEntries.set! modIdx entries }
+  return states
+
+/--
 Variant of `setImportedEntries` for `irBaseExts` that leaves `importedEntries` empty for extensions
 without entries in `mods`, which `getModuleIREntries` accounts for.
 -/
@@ -2467,8 +2495,28 @@ private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
 /-- lean-perf: the pending `addImportedFn` task of a parallel-import extension (state, start, end). -/
 private abbrev ExtTask := Task (Except IO.Error (EnvExtensionState × Nat × Nat))
 
+/--
+lean-perf (chain batching): computes the imported state of a persistent extension from its imported
+entries in place of its `addImportedFn`, or returns `none` to use `addImportedFn`. A function given
+to `finalizeImport` must return exactly what `addImportedFn` would (e.g. by continuing a fold over
+the entries of a previous import whose modules are a prefix of the current ones; see
+`ScopedEnvExtension.mkImportStateFn`).
+-/
+abbrev ImportStateFn :=
+  PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState →
+    Array (Array EnvExtensionEntry) → ImportM (Option EnvExtensionState)
+
+/-- `d.addImportedFn es`, or the state `stateFn?` computes for it. -/
+@[inline] private def computeImportedState (stateFn? : Option ImportStateFn)
+    (d : PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState)
+    (es : Array (Array EnvExtensionEntry)) : ImportM EnvExtensionState := do
+  if let some f := stateFn? then
+    if let some st ← f d es then
+      return st
+  d.addImportedFn es
+
 private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options)
-    (par : Bool := false) : IO Environment := do
+    (par : Bool := false) (stateFn? : Option ImportStateFn := none) : IO Environment := do
   let tasks ← if par then spawnTasks env 0 #[] else pure #[]
   loop 0 env tasks
 where
@@ -2487,7 +2535,8 @@ where
         let s := d.toEnvExtension.getState (asyncMode := .sync) env
         let t ← IO.asTask (prio := .default) (do
           let ta ← IO.monoNanosNow
-          let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
+          let st : EnvExtensionState ←
+            computeImportedState stateFn? d s.importedEntries { env := env, opts := opts }
           -- The state is NOT marked persistent here: the task's result graph is not private to the task
           -- (it shares the extension's initial state and other interpreted constants with the other
           -- tasks and with the import thread, e.g. `Aesop.BaseRuleSet.empty` as the state of every empty
@@ -2525,7 +2574,7 @@ where
       let prevSize := (← persistentEnvExtensionsRef.get).size
       let prevAttrSize ← getNumBuiltinAttributes
       let t0 ← IO.monoNanosNow
-      let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+      let newState ← computeImportedState stateFn? extDescr s.importedEntries { env := env, opts := opts }
       if (← ParallelImport.debugEnabled) then
         let t1 ← IO.monoNanosNow
         if t1 - t0 ≥ 1000000 then
@@ -2724,10 +2773,13 @@ private structure PrefetchState where
   /-- the loader tasks: kept alive here (a task whose last reference is dropped is deactivated by the
   runtime, i.e. cancelled before it runs) and joined by `finish` -/
   loaders : IO.Ref (Array (Task Unit))
+  /-- modules already loaded (by a held import state continued with `importModulesExtend`): never
+  queued -/
+  known : Std.HashMap Name ImportedModule := {}
 
-private def PrefetchState.new : BaseIO PrefetchState := do
+private def PrefetchState.new (known : Std.HashMap Name ImportedModule := {}) : BaseIO PrefetchState := do
   return { mutex := ← Std.BaseMutex.new, cond := ← Std.Condvar.new, map := ← IO.mkRef {},
-           stack := ← IO.mkRef [], done := ← IO.mkRef false, loaders := ← IO.mkRef #[] }
+           stack := ← IO.mkRef [], done := ← IO.mkRef false, loaders := ← IO.mkRef #[], known }
 
 /-- The result task of a promise; a dropped promise (cannot happen: every queued item is loaded or
 drained) surfaces as an error instead of a panic. -/
@@ -2744,6 +2796,8 @@ private def prefetchModules (st : PrefetchState) (imports : Array Import) :
   let mut ts : Array PrefetchTask := #[]
   let mut queued := false
   for i in imports do
+    if st.known.contains i.module then
+      continue
     match (← st.map.get).find? i.module with
     | some (t, _) => ts := ts.push t
     | none =>
@@ -2852,7 +2906,9 @@ partial def importModulesCore
   -- is loaded with all its parts, so the parts are loaded ahead of the DFS on tasks (see above)
   let pref? ← if globalLevel == .private && (← ParallelImport.numThreads) > 1 &&
       (← ParallelImport.envEnabled "LEAN_IMPORT_PREFETCH") then do
-    let pref ← PrefetchState.new
+    -- the modules already in the state (empty unless called by `importModulesExtend`) are not
+    -- prefetched again
+    let pref ← PrefetchState.new (known := (← get).moduleNameMap)
     pref.start arts globalLevel (← ParallelImport.numThreads)
     discard <| prefetchModules pref imports
     pure (some pref)
@@ -3143,7 +3199,12 @@ See also `importModules` for parameter documentation.
 def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (trustLevel : UInt32 := 0)
     (leakEnv loadExts : Bool) (level := OLeanLevel.private) (isModule := level != .private)
     -- If true, prefer loading `.ir.sig` over `.ir` unless `import all`ed; used by leanir
-    (loadIRSig := false) :
+    (loadIRSig := false)
+    -- lean-perf (chain batching, `importModulesExtend`): see `ImportStateFn`
+    (stateFn? : Option ImportStateFn := none)
+    -- lean-perf (chain batching): a previous import's environment whose modules are the first
+    -- `n` modules of `s` (see `setImportedEntriesFrom`)
+    (prev? : Option (Environment × Nat) := none) :
     IO Environment := do
   /- lean-perf (race #2 fix, L-race2fix-opts-persistent): make `opts` persistent BEFORE any other thread can
      hold a reference to it. Every import-time task closure captures `opts` (the parallel extension-state
@@ -3235,7 +3296,9 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     }
   }
   let publicBase := { privateBase with constants := { map₁ := publicImported }, header.regions := #[] }
-  let extensions ← setImportedEntries privateBase.extensions moduleData
+  let extensions ← match prev? with
+    | some (prev, n) => setImportedEntriesFrom privateBase.extensions prev.base.private.extensions n moduleData
+    | none => setImportedEntries privateBase.extensions moduleData
   ParallelImport.tick "setImportedEntries"
   -- fall back to basic data when not in server
   let serverData := modules.mapIdx (fun idx mod => mod.serverData? level |>.getD moduleData[idx]!)
@@ -3276,7 +3339,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
     -- already persistent then, so capturing it in task closures costs nothing)
     let parExts := leakEnv && importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_EXTS")
-    env ← finalizePersistentExtensions env moduleData opts (par := parExts)
+    env ← finalizePersistentExtensions env moduleData opts (par := parExts) (stateFn? := stateFn?)
     ParallelImport.tick "extension states"
     if leakEnv then
       /- Ensure the final environment including environment extension states is
@@ -3328,6 +3391,93 @@ def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32
       s imports opts trustLevel
     ParallelImport.tick "finalizeImport done"
     return env
+
+/-!
+lean-perf (chain batching, lane DP): continuing a held import.
+
+A process that elaborates a chain of modules (module `i+1` imports module `i`) can keep the import
+state of module `i`'s header and continue it with module `i`'s fresh `.olean` instead of importing
+module `i+1`'s header from scratch: `importModulesExtend` loads only the modules that are not in the
+held state, runs the `[init]` declarations of the new modules only (`runInitAttrs` skips modules
+whose initializers already ran, see `interpretedModInits`), and computes the environment of the new
+header with `finalizeImport`. The result is the environment a fresh process importing `imports`
+computes, provided
+
+* the held state was produced by `importModulesExtend` at the plain import level (`.private`, i.e.
+  the root is not a `module`) with the same options, trust level and no plugins, and nothing else
+  (in particular no elaboration) ran in the process since: the elaboration of a module happens in a
+  forked child that inherits the environment (see `lean --chain-server`);
+* every held module is in the import closure of `imports` (checked; `none` otherwise);
+* the module order is that of a fresh import with the held modules first (the "prefix property"):
+  the DFS post-order of `importModulesCore` is recomputed in memory from the loaded module data and
+  must equal the held order followed by the new modules (`none` otherwise); the `Import` records of
+  modules first reached through a different import are updated.
+-/
+
+/-- The module order and first-reaching imports of a fresh `importModulesCore imports` at the
+plain import level, computed from the module data already in `s` (every module reachable from
+`imports` must be in `s`; `none` otherwise). -/
+private partial def ImportState.freshOrder (s : ImportState) (imports : Array Import) :
+    Option (Array Name × Std.HashMap Name Import) := do
+  let (vis, order) ← go imports ({}, #[])
+  return (order, vis)
+where
+  go (imports : Array Import) (acc : Std.HashMap Name Import × Array Name) :
+      Option (Std.HashMap Name Import × Array Name) := do
+    let mut (vis, order) := acc
+    for i in imports do
+      if vis.contains i.module then
+        continue
+      let some mod := s.moduleNameMap[i.module]? | none
+      vis := vis.insert i.module i
+      if let some data := mod.mainModule? then
+        (vis, order) ← go data.imports (vis, order)
+      order := order.push i.module
+    return (vis, order)
+
+/--
+lean-perf (chain batching): continues the held import state `s` (`default` for a fresh import) with
+`imports`, see above. Returns the environment (leaked, extensions loaded, as for the frontend) and
+the new state to hold, or `none` if `s` cannot be continued to `imports` (a held module outside the
+new closure, or the prefix property fails); then nothing has been changed except that new modules
+may have been mapped.
+-/
+def importModulesExtend (s : ImportState) (imports : Array Import) (opts : Options)
+    (trustLevel : UInt32 := 0) (arts : NameMap ImportArtifacts := {})
+    (prevEnv? : Option Environment := none) (mkStateFn? : Option (Nat → IO ImportStateFn) := none) :
+    IO (Option (Environment × ImportState)) := profileitIO "import" opts do
+  for imp in imports do
+    if imp.module matches .anonymous then
+      throw <| IO.userError "import failed, trying to import module with anonymous name"
+  withImporting do
+    ParallelImport.timelineStart
+    let s₀ := s
+    let (_, s) ← importModulesCore (globalLevel := .private) imports arts |>.run s
+    ParallelImport.tick "importModulesCore (new modules mapped)"
+    let some (order, firstImport) := s.freshOrder imports | return none
+    if order.size != s.moduleNameMap.size then
+      return none
+    let numOld := s₀.moduleNames.size
+    -- The held modules must keep their order and come first (the prefix property): their `[init]`
+    -- declarations ran in that order (registering e.g. environment extensions, whose order shows in
+    -- the exported entries) and are not re-run.
+    if order != s.moduleNames then
+      return none
+    let mut s := s
+    let numKept := numOld
+    for (n, i) in firstImport do
+      let some mod := s.moduleNameMap[n]? | return none
+      -- (`importModulesCore` takes `module` and `isMeta` from the reaching import and computes the
+      -- other flags, which agree at the plain import level)
+      if mod.isMeta != i.isMeta then
+        s := { s with moduleNameMap := s.moduleNameMap.insert n { mod with isMeta := i.isMeta } }
+    ParallelImport.tick s!"module order checked: {numOld} held, {order.size - numOld} new"
+    let stateFn? ← mkStateFn?.mapM (· numKept)
+    let prev? := if numKept > 0 then prevEnv?.map (·, numKept) else none
+    let env ← finalizeImport (leakEnv := true) (loadExts := true) (level := .private)
+      s imports opts trustLevel (stateFn? := stateFn?) (prev? := prev?)
+    ParallelImport.tick "finalizeImport done"
+    return some (env, s)
 
 /--
 Creates environment object from imports and frees compacted regions after calling `act`. No live
