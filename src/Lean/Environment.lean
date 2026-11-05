@@ -2710,10 +2710,14 @@ private structure PrefetchState where
   head  : IO.Ref Nat
   /-- no more modules will be queued; loaders exit once the queue is drained -/
   done  : IO.Ref Bool
+  /-- the loader tasks: kept alive here (a task whose last reference is dropped is deactivated by the
+  runtime, i.e. cancelled before it runs) and joined by `finish` -/
+  loaders : IO.Ref (Array (Task Unit))
 
 private def PrefetchState.new : BaseIO PrefetchState := do
   return { mutex := ← Std.BaseMutex.new, cond := ← Std.Condvar.new, map := ← IO.mkRef {},
-           queue := ← IO.mkRef #[], head := ← IO.mkRef 0, done := ← IO.mkRef false }
+           queue := ← IO.mkRef #[], head := ← IO.mkRef 0, done := ← IO.mkRef false,
+           loaders := ← IO.mkRef #[] }
 
 /-- The result task of a promise; a dropped promise (cannot happen: every queued item is loaded or
 drained) surfaces as an error instead of a panic. -/
@@ -2792,14 +2796,18 @@ private partial def loaderLoop (st : PrefetchState) (arts : NameMap ImportArtifa
 private def PrefetchState.start (st : PrefetchState) (arts : NameMap ImportArtifacts)
     (globalLevel : OLeanLevel) (n : Nat) : BaseIO Unit := do
   for _ in [:n] do
-    discard <| BaseIO.asTask (prio := .dedicated) (loaderLoop st arts globalLevel)
+    let t ← BaseIO.asTask (prio := .dedicated) (loaderLoop st arts globalLevel)
+    st.loaders.modify (·.push t)
 
-/-- No more modules will be queued: loaders exit once the queue is drained. -/
+/-- No more modules will be queued: loaders exit once the queue is drained; joined here, so no loader
+thread outlives the import and every queued promise has been resolved. -/
 private def PrefetchState.finish (st : PrefetchState) : BaseIO Unit := do
   st.mutex.lock
   st.done.set true
   st.mutex.unlock
   st.cond.notifyAll
+  for t in (← st.loaders.get) do
+    IO.wait t
 
 /--
 The result task of `i` for the DFS. If `i` is still waiting in the queue, the calling (DFS) thread
