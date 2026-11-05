@@ -1091,7 +1091,7 @@ private def reduceNatInstBinOp? (e : Expr) : MetaM (Option Expr) := do
   let .app (.app (.app (.app (.app (.app (.const hop [_, _, _]) (.const ``Nat [])) (.const ``Nat []))
       (.const ``Nat [])) (.app (.app (.const hinst [_]) (.const ``Nat [])) (.const natInst []))) a) b := e
     | return none
-  let some (op, cls, f) := opInfo? hop hinst natInst | return none
+  let some (op, cls) := opInfo? hop hinst natInst | return none
   let ctx ← read
   if ctx.customCanUnfoldPredicate?.isSome || !(ctx.config.canUnfoldPredicateConfig matches .default) then
     return none
@@ -1106,14 +1106,14 @@ private def reduceNatInstBinOp? (e : Expr) : MetaM (Option Expr) := do
   | _ => return none
   reduceBinNatOp op a b
 where
-  /-- the operation, the class projection `Add.add`/..., and the core `Nat` instance of each operator -/
-  opInfo? (hop hinst natInst : Name) : Option ((Nat → Nat → Nat) × Name × Name) :=
+  /-- the operation and the class projection (`Add.add`, ...) of each operator/instance pair -/
+  opInfo? (hop hinst natInst : Name) : Option ((Nat → Nat → Nat) × Name) :=
     match hop, hinst, natInst with
-    | ``HAdd.hAdd, ``instHAdd, ``instAddNat => some (Nat.add, ``Add.add, ``instAddNat)
-    | ``HSub.hSub, ``instHSub, ``instSubNat => some (Nat.sub, ``Sub.sub, ``instSubNat)
-    | ``HMul.hMul, ``instHMul, ``instMulNat => some (Nat.mul, ``Mul.mul, ``instMulNat)
-    | ``HDiv.hDiv, ``instHDiv, ``Nat.instDiv => some (Nat.div, ``Div.div, ``Nat.instDiv)
-    | ``HMod.hMod, ``instHMod, ``Nat.instMod => some (Nat.mod, ``Mod.mod, ``Nat.instMod)
+    | ``HAdd.hAdd, ``instHAdd, ``instAddNat => some (Nat.add, ``Add.add)
+    | ``HSub.hSub, ``instHSub, ``instSubNat => some (Nat.sub, ``Sub.sub)
+    | ``HMul.hMul, ``instHMul, ``instMulNat => some (Nat.mul, ``Mul.mul)
+    | ``HDiv.hDiv, ``instHDiv, ``Nat.instDiv => some (Nat.div, ``Div.div)
+    | ``HMod.hMod, ``instHMod, ``Nat.instMod => some (Nat.mod, ``Mod.mod)
     | _, _, _ => none
 
 @[inline] private def useWHNFCache (e : Expr) : MetaM Bool := do
