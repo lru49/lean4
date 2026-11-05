@@ -74,6 +74,15 @@ public:
         free_block(m_tab);
     }
     size_t size() const { return m_size; }
+    /** \brief Release every entry and the table (the next `insert` starts from the initial capacity again). */
+    void clear() {
+        if (m_tab == nullptr) return;
+        for (size_t i = 0; i <= m_mask; i++) {
+            if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
+        }
+        free_block(m_tab);
+        m_tab = nullptr; m_mask = 0; m_size = 0;
+    }
     /** \brief Borrowed reference to the value stored for a key structurally equal to `k`, or nullptr. */
     lean_object * find(expr const & k) const {
         if (m_tab == nullptr) return nullptr;
