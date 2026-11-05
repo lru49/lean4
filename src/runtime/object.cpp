@@ -958,8 +958,11 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
     }
     if (g_mt_stats) { g_mt_calls.fetch_add(1, std::memory_order_relaxed); g_mt_objs.fetch_add(n_marked, std::memory_order_relaxed); if (n_marked >= 1000) g_mt_big.fetch_add(1, std::memory_order_relaxed);
         if (n_marked >= 5000) { Dl_info di; void * fn = g_mt_cur_fn; void * ra = __builtin_return_address(0); Dl_info dr;
-            fprintf(stderr, "mt-big: %llu objs root-tag %u task-fn %s caller %s\n", (unsigned long long)n_marked, (unsigned)lean_ptr_tag(o),
-                (fn && dladdr(fn, &di) && di.dli_sname) ? di.dli_sname : "-", (dladdr(ra, &dr) && dr.dli_sname) ? dr.dli_sname : "?"); } }
+            void * ra2 = __builtin_return_address(1);
+            fprintf(stderr, "mt-big: %llu objs root-tag %u task-fn %s+%lx caller %s+%lx caller2 %lx\n", (unsigned long long)n_marked, (unsigned)lean_ptr_tag(o),
+                (fn && dladdr(fn, &di)) ? di.dli_fname : "-", fn && dladdr(fn, &di) ? (unsigned long)((char*)fn - (char*)di.dli_fbase) : 0ul,
+                dladdr(ra, &dr) ? dr.dli_fname : "?", dladdr(ra, &dr) ? (unsigned long)((char*)ra - (char*)dr.dli_fbase) : 0ul,
+                dladdr(ra2, &dr) ? (unsigned long)((char*)ra2 - (char*)dr.dli_fbase) : 0ul); } }
 }
 
 // =======================================
