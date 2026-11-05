@@ -1508,11 +1508,10 @@ where
 For a fieldname `fieldName`, locate all the environment constants with that name
 -/
 private def reverseFieldLookup (env : Environment) (fieldName : String) :=
-  env.constants.fold (init := #[]) (fun accum name _ =>
-      match name with
-      | .str _ s => if s = fieldName && !name.isInternal then accum.push name else accum
-      | _ => accum)
-    |>.qsort (lt := Name.lt)
+  -- Only used for error-message hints, but on error paths that are taken (and the message thrown
+  -- away) every time a postponed elaboration problem is retried: a direct search instead of a
+  -- closure call per constant of the environment.
+  env.constants.namesWithLastStr fieldName |>.filter (!·.isInternal) |>.qsort (lt := Name.lt)
 
 private def resolveLValAux (e : Expr) (eType : Expr) (lval : LVal) : TermElabM LValResolution := do
   match eType.getAppFn, lval with

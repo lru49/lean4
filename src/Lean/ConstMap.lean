@@ -101,6 +101,14 @@ public instance {m : Type → Type} [Monad m] : ForM m ConstMap (Name × Constan
 public instance {m : Type → Type} [Monad m] : ForIn m ConstMap (Name × ConstantInfo) :=
   ⟨ForM.forIn⟩
 
+/--
+The names of all constants whose final component is the string `s`, in no particular order. Same
+result as filtering `fold`, without visiting every constant through a closure.
+-/
+public def namesWithLastStr (m : ConstMap) (s : String) : Array Name :=
+  m.map₂.foldl (init := m.map₁.collectLastStr s) fun acc n _ =>
+    if ConstTrie.lastStrIs n s then acc.push n else acc
+
 public def toList (m : ConstMap) : List (Name × ConstantInfo) :=
   m.fold (init := []) fun es n v => (n, v) :: es
 

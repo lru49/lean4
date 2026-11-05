@@ -132,6 +132,22 @@ public def foldlM [Monad m] (t : ConstTrie α) (f : σ → Name → α → m σ)
   | .inner _ cs => cs.foldlM (fun s c => c.foldlM f s) init
   | .node k v cs => cs.foldlM (fun s c => c.foldlM f s) (← f init k v)
 
+/-- Whether the final component of `n` is the string `s`. -/
+@[inline] public def lastStrIs (n : Name) (s : String) : Bool :=
+  match n with
+  | .str _ s' => s' == s
+  | _ => false
+
+/--
+Pushes onto `acc` the key of every entry of `t` whose final component is the string `s`. A direct
+traversal without the monadic plumbing of `foldlM`, for whole-environment name searches.
+-/
+public partial def collectLastStr (t : ConstTrie α) (s : String) (acc : Array Name) : Array Name :=
+  let acc := match t with
+    | .leaf k _ | .node k _ _ => if lastStrIs k s then acc.push k else acc
+    | .inner .. => acc
+  t.children.foldl (init := acc) fun acc c => c.collectLastStr s acc
+
 /-- Intermediate state for constructing a `ConstTrie`, mapping each prefix to its data. -/
 structure Builder (α : Type) where
   values   : Std.HashMap Name α := {}
@@ -630,6 +646,17 @@ partial def foldlEntriesM [Monad m] (t : ImportedTree α) (f : σ → Name → �
       s ← f s k e
     children.get.foldlM (fun s c => c.foldlEntriesM f s) s
 
+@[inherit_doc ConstTrie.collectLastStr]
+partial def collectLastStr (t : ImportedTree α) (s : String) (acc : Array Name) : Array Name :=
+  match t with
+  | .mod _ tr => tr.collectLastStr s acc
+  | .merged k e? cs =>
+    let acc := if e?.isSome && ConstTrie.lastStrIs k s then acc.push k else acc
+    cs.foldl (init := acc) fun acc c => c.collectLastStr s acc
+  | .lazy k e? children =>
+    let acc := if e?.isSome && ConstTrie.lastStrIs k s then acc.push k else acc
+    children.get.foldl (init := acc) fun acc c => c.collectLastStr s acc
+
 end ImportedTree
 
 namespace ImportedConsts
@@ -652,6 +679,10 @@ public def foldl (t : ImportedConsts α) (f : σ → Name → α → σ) (init :
 public def foldlEntriesM [Monad m] (t : ImportedConsts α) (f : σ → Name → α × Nat → m σ)
     (init : σ) : m σ :=
   t.tree.foldlEntriesM f init
+
+@[inherit_doc ConstTrie.collectLastStr]
+public def collectLastStr (t : ImportedConsts α) (s : String) (acc : Array Name := #[]) : Array Name :=
+  t.tree.collectLastStr s acc
 
 public def forM [Monad m] (t : ImportedConsts α) (f : Name → α → m PUnit) : m PUnit :=
   t.foldlM (fun _ n v => f n v) ⟨⟩
