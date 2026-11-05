@@ -30,6 +30,9 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <string>
 #include <vector>
 #include <shared_mutex>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #include <psapi.h>
@@ -364,6 +367,15 @@ void * lookup_symbol_in_cur_exe(char const * sym) {
 
 class interpreter;
 LEAN_THREAD_PTR(interpreter, g_interpreter);
+// CM DIAGNOSTIC (not for merge): interpreter statistics, printed at exit when LEAN_INTERP_STATS is set
+#define CMS(X) X(eval_new) X(eval_nested) X(lookup) X(lookup_miss) X(global_miss) X(dlsym_ok) X(dlsym_fail) X(boxed_fail_skippable) X(boxed_fail_other) X(call_native) X(call_interp) X(load) X(load_miss) X(call_boxed) X(find_boxed) X(stub) X(run_init) X(init_globals_hit)
+#define CMS_DECL(n) static std::atomic<uint64_t> g_cms_##n{0};
+CMS(CMS_DECL)
+#define CMS_INC(n) g_cms_##n.fetch_add(1, std::memory_order_relaxed)
+struct cms_printer { ~cms_printer() { if (getenv("LEAN_INTERP_STATS")) {
+#define CMS_PR(n) fprintf(stderr, "interp-stat %s %llu\n", #n, (unsigned long long)g_cms_##n.load());
+CMS(CMS_PR) } } };
+static cms_printer g_cms_printer;
 
 struct native_symbol_cache_entry {
     // symbol address; `nullptr` if function does not have native code
@@ -449,8 +461,10 @@ public:
     template<class T>
     static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f) {
         if (g_interpreter && is_eqp(g_interpreter->m_env, env) && is_eqp(g_interpreter->m_opts, opts)) {
+            CMS_INC(eval_nested);
             return f(*g_interpreter);
         } else {
+            CMS_INC(eval_new);
             // We changed threads or the closure was stored and called in a different context.
             time_task t("interpretation", opts, fn);
             scope_trace_env scope_trace(env, opts);
@@ -848,10 +862,12 @@ private:
 
     /** \brief Return cached lookup result for given unmangled function name in the current binary. */
     const symbol_cache_entry& lookup_symbol(name const & fn) {
+        CMS_INC(lookup);
         auto e = m_symbol_cache.find(fn);
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
+        CMS_INC(lookup_miss);
         symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
         native_symbol_cache_shard & shard = native_symbol_cache_shard_for(fn);
         {
@@ -863,6 +879,7 @@ private:
                 return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
             }
         }
+        CMS_INC(global_miss);
         // not cached yet: resolve without holding any lock (`dlsym` and the name mangling below are
         // the expensive part), then publish
         if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
@@ -870,14 +887,21 @@ private:
             string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
             // check for boxed version first
             if (void *p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data())) {
+                CMS_INC(dlsym_ok);
                 e_new.m_native.m_addr = p_boxed;
                 e_new.m_native.m_boxed = true;
             } else {
+                CMS_INC(dlsym_fail);
+                bool skippable = decl_tag(e_new.m_decl) == decl_kind::Fun && !type_is_scalar(decl_type(e_new.m_decl)) && decl_params(e_new.m_decl).size() <= LEAN_CLOSURE_MAX_ARGS;
+                if (skippable) for (param const & p : decl_params(e_new.m_decl)) { if (type_is_scalar(param_type(p)) || param_borrow(p) || param_type(p) == type::Void) skippable = false; }
+                if (skippable) CMS_INC(boxed_fail_skippable); else CMS_INC(boxed_fail_other);
                 // `@[export]` affects only the unboxed symbol name
                 if (optional<name> n = get_export_name_for(m_env, fn)) {
                     mangled = n->get_string();
                 }
-                if (void *p = lookup_symbol_in_cur_exe(mangled.data())) {
+                void *p = lookup_symbol_in_cur_exe(mangled.data());
+                if (p) CMS_INC(dlsym_ok); else CMS_INC(dlsym_fail);
+                if (p) {
                     // if there is no boxed version, there are no unboxed parameters, so use default version
                     e_new.m_native.m_addr = p;
                 }
@@ -905,13 +929,16 @@ private:
 
     /** \brief Evaluate nullary function ("constant"). */
     value load(name const & fn, type t) {
+        CMS_INC(load);
         auto cached_entry = m_constant_cache.find(fn);
         if (cached_entry != m_constant_cache.end()) {
             auto cached = cached_entry->second;
             return cached.m_val;
         }
+        CMS_INC(load_miss);
         auto o_entry = g_init_globals->find(fn);
         if (o_entry != g_init_globals->end()) {
+            CMS_INC(init_globals_hit);
             // persistent, so no `inc` needed
             auto o = o_entry->second;
             return type_is_scalar(t) ? unbox_t(o, t) : o;
@@ -966,6 +993,7 @@ private:
         const symbol_cache_entry& e = lookup_symbol(fn);
         type t = decl_type(e.m_decl);
         if (e.m_native.m_addr) {
+            CMS_INC(call_native);
             object ** args2 = static_cast<object **>(LEAN_ALLOCA(args.size() * sizeof(object *))); // NOLINT
             for (size_t i = 0; i < args.size(); i++) {
                 type t = param_type(decl_params(e.m_decl)[i]);
@@ -1000,6 +1028,7 @@ private:
                                           << "For declarations from `Init`, `Std`, or `Lean`, you need to set `supportInterpreter := true` "
                                           << "in the relevant `lean_exe` statement in your `lakefile.lean`.");
             }
+            CMS_INC(call_interp);
             // evaluate args in old stack frame
             for (const auto & arg : args) {
                 m_arg_stack.push_back(eval_arg(arg));
@@ -1013,6 +1042,7 @@ private:
 
     // closure stub
     object * stub_m(object ** args) {
+        CMS_INC(stub);
         decl d(args[2]);
         size_t old_size = m_arg_stack.size();
         for (size_t i = 0; i < decl_params(d).size(); i++) {
@@ -1094,6 +1124,7 @@ public:
      *  * supports under- and over-application.
      *  * supports "calling" (evaluating) nullary constants. */
     object * call_boxed(name const & fn, unsigned n, object ** args) {
+        CMS_INC(call_boxed);
         const symbol_cache_entry& e = lookup_symbol(fn);
         unsigned arity = decl_params(e.m_decl).size();
         object * r;
@@ -1112,6 +1143,7 @@ public:
             } else {
                 // `lookup_symbol` does not prefer the boxed version for interpreted functions, so check manually.
                 decl d = e.m_decl;
+                CMS_INC(find_boxed);
                 if (option_ref<decl> d_boxed = find_ir_decl_boxed(m_env, fn)) {
                     d = *d_boxed.get();
                 }
@@ -1156,6 +1188,7 @@ public:
     }
 
     object * run_init(name const & decl, name const & init_decl) {
+        CMS_INC(run_init);
         try {
             object * args[] = { io_mk_world() };
             object * r = call_boxed(init_decl, 1, args);
