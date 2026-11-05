@@ -2511,7 +2511,11 @@ where
         continue
       if parExts.contains d.name || afterInitExts.contains d.name then
         let s := d.toEnvExtension.getState (asyncMode := .sync) env
-        let t ← IO.asTask (prio := .default) (do
+        -- lean-perf (L05): after-init states are joined within milliseconds of being spawned, while the
+        -- registry tasks spawned at the start still occupy the pool's workers; a dedicated thread avoids
+        -- queueing behind them (measured: the delaborator task started 85 ms after its spawn otherwise)
+        let prio := if afterInit && afterInitExts.contains d.name then Task.Priority.dedicated else Task.Priority.default
+        let t ← IO.asTask (prio := prio) (do
           let ta ← IO.monoNanosNow
           let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
           -- The state is NOT marked persistent here: the task's result graph is not private to the task
