@@ -385,13 +385,11 @@ def runFrontend
   if hasErrors then
     return none
 
-  if let some oleanFileName := oleanFileName? then
-    profileitIO ".olean serialization" finalOpts do
-      let commandLints := collectCommandLints snaps none #[]
-      let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-
-  if let some ileanFileName := ileanFileName? then
+  -- The `.ilean` (server references) is a function of the info trees and the header only, not of
+  -- the `.olean`, so it is computed on a dedicated thread while the environment is serialized
+  -- below; both are on the critical path of every module build. It is still written only after a
+  -- successful `.olean` serialization, as before.
+  let ileanTask? ← ileanFileName?.mapM fun _ => IO.asTask (prio := .dedicated) do
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
@@ -402,7 +400,17 @@ def runFrontend
       decls
       : Lean.Server.Ilean
     }
-    IO.FS.writeFile ileanFileName $ Json.compress $ toJson ilean
+    return Json.compress $ toJson ilean
+
+  if let some oleanFileName := oleanFileName? then
+    profileitIO ".olean serialization" finalOpts do
+      let commandLints := collectCommandLints snaps none #[]
+      let env ← Linter.recordLints inputCtx.fileMap env commandLints
+      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+
+  if let some ileanFileName := ileanFileName? then
+    if let some ileanTask := ileanTask? then
+      IO.FS.writeFile ileanFileName (← IO.ofExcept ileanTask.get)
 
   if let some out := trace.profiler.output.get? opts then
     let traceStates := snaps.getAll.map (·.traces)
