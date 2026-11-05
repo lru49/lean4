@@ -34,6 +34,7 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
+#include <vector>
 #include <chrono>
 #include <sstream>
 #include <fstream>
@@ -86,6 +87,7 @@ obj_res io_result_mk_error(std::string const & msg) {
 
 static bool g_initializing = true;
 extern "C" LEAN_EXPORT void lean_io_mark_end_initialization() {
+    flush_deferred_ref_marks();
     g_initializing = false;
 }
 extern "C" LEAN_EXPORT uint8_t lean_io_initializing() {
@@ -1508,6 +1510,46 @@ static inline atomic<object*> * mt_ref_val_addr(object * o) {
 */
 static inline bool ref_maybe_mt(b_obj_arg ref) { return lean_is_mt(ref) || lean_is_persistent(ref); }
 
+/* Deferred MT marking of values stored into global refs during startup.
+   Every `builtin_initialize`/`initialize` ref is persistent, so upstream marks each value stored into it as MT, and MT
+   objects are never exclusive: each later `modify` copies the whole value (a hash map's bucket array, an array) and
+   re-walks it with `lean_mark_mt`. The registration loops of the builtin initializers (builtin parsers, delaborators,
+   macros, elaborators, simprocs, options, extensions) therefore copy their tables once per registration, quadratic in
+   the table size, in every process.
+   Before `lean_io_mark_end_initialization` there is exactly one thread running Lean code (the task manager is created
+   after it, both by the `lean` driver and by the `main` that the compiler emits), so the MT marks have no reader yet.
+   We store the value unmarked, remember the (persistent, never freed) ref, and mark every remembered ref's current
+   value MT once when initialization ends, before any other thread can exist: from then on the invariant "no ST object is
+   reachable from an MT object" holds exactly as upstream. Deferral is off as soon as a task manager exists (an embedder
+   that starts one before ending initialization; creating a task manager also flushes the deferred marks) and with
+   `LEAN_DEFER_INIT_REF_MARKS=0`. */
+static std::vector<object *> * g_deferred_ref_marks = nullptr;
+static bool g_defer_ref_marks_disabled = [] { char const * e = getenv("LEAN_DEFER_INIT_REF_MARKS"); return e && e[0] == '0'; }();
+
+static inline bool defer_ref_mark(b_obj_arg ref) {
+    if (!g_initializing || g_defer_ref_marks_disabled || !lean_is_persistent(ref) || lean_task_manager_exists())
+        return false;
+    if (!g_deferred_ref_marks)
+        g_deferred_ref_marks = new std::vector<object *>();
+    // the same ref is usually written in runs, so a tail check removes almost all duplicates; the remaining ones cost
+    // one check each at the flush (`mark_mt` stops at an object that is already MT)
+    if (g_deferred_ref_marks->empty() || g_deferred_ref_marks->back() != ref)
+        g_deferred_ref_marks->push_back(ref);
+    return true;
+}
+
+void flush_deferred_ref_marks() {
+    if (!g_deferred_ref_marks) return;
+    std::vector<object *> * refs = g_deferred_ref_marks;
+    g_deferred_ref_marks = nullptr;
+    for (object * ref : *refs) {
+        object * v = lean_to_ref(ref)->m_value;
+        if (v != nullptr && !lean_is_scalar(v))
+            mark_mt(v); // stops at objects that are already MT or persistent, so duplicates cost one check
+    }
+    delete refs;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
@@ -1555,8 +1597,10 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_put(b_obj_arg ref, obj_arg a) {
     if (ref_maybe_mt(ref)) {
         /* We must mark `a` as multi-threaded if `ref` is marked as multi-threaded.
            Reason: our runtime relies on the fact that a single-threaded object
-           cannot be reached from a multi-thread object. */
-        mark_mt(a);
+           cannot be reached from a multi-thread object. (During single-threaded startup the mark is deferred, see
+           `defer_ref_mark`.) */
+        if (!defer_ref_mark(ref))
+            mark_mt(a);
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
         object * old_a = val_addr->exchange(a);
         lean_assert(old_a == nullptr);
@@ -1573,7 +1617,8 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_put(b_obj_arg ref, obj_arg a) {
 extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
     if (ref_maybe_mt(ref)) {
         /* See io_ref_write */
-        mark_mt(a);
+        if (!defer_ref_mark(ref))
+            mark_mt(a);
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
         while (true) {
             object * old_a = val_addr->load();

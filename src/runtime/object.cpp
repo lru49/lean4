@@ -1346,8 +1346,11 @@ extern "C" LEAN_EXPORT lean_obj_res lean_runtime_mark_persistent_seq(lean_obj_ar
     return a;
 }
 
+bool lean_task_manager_exists() { return g_task_manager != nullptr; }
+
 extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
     lean_assert(g_task_manager == nullptr);
+    flush_deferred_ref_marks(); // other threads may run Lean code from now on
 #if defined(LEAN_MULTI_THREAD)
     if (num_workers > 0) {
         g_task_manager = new task_manager(num_workers);
@@ -1382,6 +1385,7 @@ extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
 
 scoped_task_manager::scoped_task_manager(unsigned num_workers) {
     lean_assert(g_task_manager == nullptr);
+    flush_deferred_ref_marks(); // other threads may run Lean code from now on
 #if defined(LEAN_MULTI_THREAD)
     if (num_workers > 0) {
         g_task_manager = new task_manager(num_workers);
