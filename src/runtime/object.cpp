@@ -12,6 +12,11 @@ Author: Leonardo de Moura
 #include <deque>
 #include <cmath>
 #include <lean/lean.h>
+#if defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/membarrier.h>
+#endif
 #include "runtime/object.h"
 #include "runtime/thread.h"
 #include "runtime/utf8.h"
@@ -460,27 +465,35 @@ extern "C" LEAN_EXPORT void lean_inc_ref_huge_n(lean_object * o, size_t n) {
    committed (`modifyEnv` resetting the Core/Meta caches, `setEnv`, kernel and elaborator states): the caller
    used to walk and free the whole graph on the critical thread.
 
-   Soundness. Every object on the handed-over worklist is owned by the cascade (its count reached zero, or it is
-   a single-threaded object whose last reference was a field of an object being freed), so no other thread can
-   reach it. The release thread then frees the graph below it and must decide for every child `c`:
-   - thread-shared (count < 0): atomic decrement, as `dec` does on any thread; freed when it was the last one;
-   - persistent / frozen counts: skipped, as `dec` does;
-   - single-threaded (count > 0): `c` belongs to the owner thread, whose non-atomic count updates the release
-     thread must never race with. The release thread only READS the count (relaxed) and tallies how many
-     references to `c` it has dropped so far (k, per batch, in a pointer-keyed table). If the count equals k,
-     every reference to `c` is a field of an object in the dying graph: no live object and no thread holds `c`
-     (a thread cannot hold even a borrowed pointer to it, since borrowing requires an owned reference
-     somewhere), so the count cannot change any more and `c` is owned by the release thread (freed). Otherwise
-     the owner may hold references; the k pending decrements are returned to the owner thread, which applies
-     them with ordinary `lean_dec_ref`s at its next drain point (its next large cascade, the end of each task it
-     runs on a task-manager worker, thread exit). A pending decrement only keeps a count higher than the true
-     number of live references for a while: the object is treated as shared (copied instead of updated in
-     place) and freed at the drain, never earlier. Counts read concurrently with an owner's non-atomic update
-     see either the old or the new value (aligned 32-bit word); both cases are covered above (the count can
-     only reach k after the owner dropped its last reference, and a count above k is returned to the owner).
-     An owner's `mark_mt` turning `c` thread-shared mid-batch is also covered: the release thread then
-     decrements atomically, the pending ones are applied by the owner through `lean_dec_ref` (which handles
-     both kinds).
+   Soundness (v2: explicit memory ordering; v1 crashed nondeterministically on aarch64).
+   Every object on the handed-over worklist is owned by the cascade (count reached zero, or a single-threaded object
+   whose last reference was a field of an object being freed). The owner's accesses to them happen-before the release
+   thread's (queue mutex: release on push, acquire on pop), so they may be visited and freed at once. For every child
+   `c` the release thread meets:
+   - thread-shared (count < 0): `fetch_add(acq_rel)`. Every other holder dropped its reference with the same acq_rel
+     RMW (lean_dec_ref_cold), so when ours is the last one, all their accesses to `c` happen-before ours (release
+     sequence on the count): `c` may be freed right after its visit.
+   - persistent / frozen counts: skipped.
+   - single-threaded (count > 0): `c` belongs to the owner thread, which updates its count with PLAIN stores (no
+     release). The release thread only READS the count (relaxed) and tallies how many references to `c` it has dropped
+     (k). count == k (or count == 1 for a first encounter) means every reference is a field of the dying graph, so no
+     live object or thread can obtain `c` any more: logically it is ours. But nothing orders the owner's earlier
+     accesses to `c` before our observation: the owner may have read `c` (its tag, a field) and then dropped its last
+     reference with a plain decrement after the handoff, and on a weakly ordered machine (aarch64: load->store
+     reordering) that load may still be outstanding when the count store is visible (v1's bug: we overwrote the header
+     with the worklist link and freed the block; x86's TSO hides it). v2 therefore treats such a `c` as GRACE: it is only
+     READ (its children are dropped by the same rules; its fields are immutable, an object referenced by the dying
+     graph is never exclusive for the owner) and kept in a list; before any GRACE object is written or freed the
+     release thread calls `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`, which returns only after every thread of
+     the process has executed a full barrier, so every access the owner issued before its count store is complete.
+     The compiler side is closed by a compiler-only release fence in `lean_dec_ref` before its plain decrement (no
+     instruction emitted). Without membarrier (non-Linux, old kernels) deferral is disabled.
+     Otherwise (count > k) the k owed decrements are returned to the owner thread (per-thread slot, mutex), which
+     applies them with ordinary `lean_dec_ref`s at its next drain point (its next cascade of >= 1024 objects, the end of
+     each task it runs on a task-manager worker, thread exit). A pending decrement only keeps a count higher than the
+     number of live references for a while (copy instead of in-place update), never frees early.
+   Owner-only kinds (External/Task/Promise) are never taken over when single-threaded (their deletion runs foreign
+   code): their decrements are returned to the owner.
    Observable differences: memory of a deferred graph is returned a little later (bounded queue: at most
    `LEAN_DEFER_FREE_QUEUE` batches, default 64; above that the caller frees inline as before); finalizers of
    external objects / tasks inside a deferred graph run on the release thread (as for any thread-shared object
@@ -565,68 +578,101 @@ static inline int defer_load_rc(lean_object * o) {
     return std::atomic_load_explicit(lean_get_rc_mt_addr(o), std::memory_order_relaxed);
 }
 
-static inline void defer_dec(lean_object * o, lean_object * & todo, defer_tally & tally, uint64_t & owned_st) {
+/* Work stack of the release thread (v2): pointers to objects it owns and has not visited yet. Bit 0 set = GRACE: a
+   single-threaded object whose ownership the release thread inferred from a relaxed read of its count (see the comment
+   at the top). Such an object is only READ (its fields are visited) until a process-wide memory barrier
+   (`membarrier`) has run on every thread; only then is its memory freed. Objects without the bit (the handed-over
+   worklist, thread-shared objects whose last decrement this thread made with acq_rel) may be freed at once. The
+   worklist is an explicit vector, not the intrusive header list, because a GRACE object must not be written. */
+typedef std::vector<uintptr_t> defer_stack;
+static constexpr uintptr_t DEFER_GRACE = 1;
+
+static inline void defer_dec(lean_object * o, defer_stack & stack, defer_tally & tally, uint64_t & owned_st) {
     if (lean_is_scalar(o))
         return;
     int rc = defer_load_rc(o);
     if (rc == 1) {
         if (LEAN_UNLIKELY(defer_owner_only(o))) tally.add(o);
-        else push_back(todo, o);
+        else stack.push_back((uintptr_t)o | DEFER_GRACE);
     } else if (rc > 1) {
         size_t k = tally.add(o);
         if ((size_t)defer_load_rc(o) == k && !defer_owner_only(o)) {
-            // every reference to `o` was a field of a dying object: it is ours
+            // every reference to `o` was a field of a dying object: it is ours (after the grace barrier)
             tally.consume(o);
             owned_st++;
-            push_back(todo, o);
+            stack.push_back((uintptr_t)o | DEFER_GRACE);
         }
     } else if (rc == 0 || (unsigned)rc <= (unsigned)LEAN_RC_STICKY_DROP) {
         return;
     } else if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) == -1) {
-        push_back(todo, o);
+        // acq_rel: synchronizes with the release half of every other holder's decrement, so their accesses to `o`
+        // happen-before ours; `o` may be freed right after its visit
+        stack.push_back((uintptr_t)o);
     }
 }
 
-static object * defer_del_core(object * o, object * todo, defer_tally & tally, uint64_t & owned_st) {
+/* Visit `o` (owned by the release thread): drop its references to its children. Writes nothing into `o` except for
+   the owner-only kinds, which only ever arrive here thread-shared (acq_rel-owned) or handed over. */
+static void defer_visit(object * o, defer_stack & stack, defer_tally & tally, uint64_t & owned_st) {
     uint8 tag = lean_ptr_tag(o);
     if (LEAN_LIKELY(tag <= LeanMaxCtorTag)) {
         object ** it  = lean_ctor_obj_cptr(o);
         object ** end = it + lean_ctor_num_objs(o);
-        for (; it != end; ++it) defer_dec(*it, todo, tally, owned_st);
-        lean_free_small_object(o);
-        return todo;
+        for (; it != end; ++it) defer_dec(*it, stack, tally, owned_st);
+        return;
     }
     switch (tag) {
     case LeanClosure: {
         object ** it  = lean_closure_arg_cptr(o);
         object ** end = it + lean_closure_num_fixed(o);
-        for (; it != end; ++it) defer_dec(*it, todo, tally, owned_st);
-        lean_dealloc(o, lean_closure_byte_size(o));
+        for (; it != end; ++it) defer_dec(*it, stack, tally, owned_st);
         break;
     }
     case LeanArray: {
         object ** it  = lean_array_cptr(o);
         object ** end = it + lean_array_size(o);
-        for (; it != end; ++it) defer_dec(*it, todo, tally, owned_st);
-        lean_dealloc(o, lean_array_byte_size(o));
+        for (; it != end; ++it) defer_dec(*it, stack, tally, owned_st);
         break;
     }
     case LeanThunk:
-        if (object * c = lean_to_thunk(o)->m_closure) defer_dec(c, todo, tally, owned_st);
-        if (object * v = lean_to_thunk(o)->m_value) defer_dec(v, todo, tally, owned_st);
-        lean_free_small_object(o);
+        if (object * c = lean_to_thunk(o)->m_closure) defer_dec(c, stack, tally, owned_st);
+        if (object * v = lean_to_thunk(o)->m_value) defer_dec(v, stack, tally, owned_st);
         break;
     case LeanRef:
-        if (object * v = lean_to_ref(o)->m_value) defer_dec(v, todo, tally, owned_st);
-        lean_free_small_object(o);
+        if (object * v = lean_to_ref(o)->m_value) defer_dec(v, stack, tally, owned_st);
         break;
     default:
-        // scalar arrays, strings, mpz, tasks, promises, externals: no Lean children to visit here
-        todo = lean_del_core_other(o, tag, todo);
-        break;
+        break;  // scalar arrays, strings, mpz: no children; tasks/promises/externals: handled by `defer_release`
     }
-    return todo;
 }
+
+/* Free the memory of a visited object (children already dropped). */
+static void defer_release(object * o) {
+    uint8 tag = lean_ptr_tag(o);
+    if (LEAN_UNLIKELY(tag == LeanTask || tag == LeanPromise || tag == LeanExternal)) {
+        object * junk = nullptr;
+        junk = lean_del_core_other(o, tag, junk);  // no Lean children pushed for these kinds
+        lean_assert(junk == nullptr);
+        return;
+    }
+    lean_free_object(o);
+}
+
+#if defined(__linux__)
+static bool defer_membarrier_register() {
+    long cmds = syscall(__NR_membarrier, MEMBARRIER_CMD_QUERY, 0, 0);
+    if (cmds < 0 || !(cmds & MEMBARRIER_CMD_PRIVATE_EXPEDITED)) return false;
+    return syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
+}
+/* After this returns, every thread of the process has executed a full memory barrier: every load or store that
+   another thread issued before the moment it ran the barrier is complete. */
+static void defer_grace_barrier() {
+    if (syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) != 0) lean_internal_panic("membarrier failed");
+}
+#else
+static bool defer_membarrier_register() { return false; }
+static void defer_grace_barrier() {}
+#endif
 
 static void defer_return_to_owner(std::shared_ptr<deferred_owner_slot> const & owner, defer_tally & tally) {
     std::vector<std::pair<lean_object *, size_t>> items;
@@ -643,6 +689,8 @@ static void defer_return_to_owner(std::shared_ptr<deferred_owner_slot> const & o
 static void defer_worker_main() {
     lean_initialize_thread();
     defer_tally tally;
+    defer_stack stack;
+    std::vector<object *> grace;
     std::unique_lock<std::mutex> lock(*g_defer_mutex);
     while (true) {
         while (g_defer_queue->empty() && !g_defer_stop.load(std::memory_order_relaxed)) g_defer_cv->wait(lock);
@@ -651,23 +699,36 @@ static void defer_worker_main() {
         g_defer_queue->pop_front();
         g_defer_busy = true;
         lock.unlock();
-        object * todo = b.m_todo;
         uint64_t n = 0, owned_st = 0;
         bool stopped = false;
         size_t next_ref = 0;
+        stack.clear(); grace.clear();
+        // the handed-over worklist: owned since before the handoff (the queue mutex orders the owner's accesses first)
+        for (object * todo = b.m_todo; todo != nullptr; ) stack.push_back((uintptr_t)pop_back(todo));
         while (true) {
-            if (todo == nullptr) {
+            if (stack.empty()) {
                 // refs batch: drop the next reference (each one is handled like a field of a dying object)
-                while (todo == nullptr && next_ref < b.m_nrefs) {
+                while (stack.empty() && next_ref < b.m_nrefs) {
                     lean_object * r = b.m_refs[next_ref++];
-                    if (r != nullptr) defer_dec(r, todo, tally, owned_st);
+                    if (r != nullptr) defer_dec(r, stack, tally, owned_st);
                 }
-                if (todo == nullptr) break;
+                if (stack.empty()) break;
             }
-            object * o = pop_back(todo);
-            todo = defer_del_core(o, todo, tally, owned_st);
+            uintptr_t e = stack.back(); stack.pop_back();
+            object * o = (object *)(e & ~DEFER_GRACE);
+            defer_visit(o, stack, tally, owned_st);
+            if (e & DEFER_GRACE) {
+                grace.push_back(o);
+                if (grace.size() >= (1u << 20)) { defer_grace_barrier(); for (object * g : grace) defer_release(g); grace.clear(); }
+            } else {
+                defer_release(o);
+            }
             if ((++n & 4095) == 0 && g_defer_stop.load(std::memory_order_relaxed)) { stopped = true; break; }
         }
+        if (!stopped && !grace.empty()) { defer_grace_barrier(); for (object * g : grace) defer_release(g); }
+        grace.clear();
+        if (stack.capacity() > (1u << 22)) { defer_stack s; stack.swap(s); }
+        if (grace.capacity() > (1u << 22)) { std::vector<object *> s; grace.swap(s); }
         if (!stopped && b.m_free_fn != nullptr) b.m_free_fn(b.m_block);
         if (!stopped) defer_return_to_owner(b.m_owner, tally);
         else tally.for_each_and_clear([](lean_object *, size_t) {});
@@ -756,6 +817,11 @@ static bool defer_prepare(std::unique_lock<std::mutex> & lock) {
     }
     if (!g_defer_started) {
         g_defer_started = true;
+        if (!defer_membarrier_register()) {
+            // no process-wide barrier available: the grace period cannot be implemented, so never defer
+            g_defer_min = SIZE_MAX; g_defer_min_refs = SIZE_MAX; g_defer_stop.store(true, std::memory_order_relaxed);
+            return false;
+        }
         std::thread(defer_worker_main).detach();
         std::atexit(defer_atexit);
     }
