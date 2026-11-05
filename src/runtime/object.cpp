@@ -1056,21 +1056,17 @@ class task_manager {
         return result;
     }
 
-    /* lean-perf: with `defer_notify`, the idle worker is not signalled here; `enqueue_core` returns true
-       and the caller signals `m_queue_cv` after releasing the mutex, so the woken worker does not
-       immediately block on the mutex the signalling thread still holds (glibc condition variables do not
-       hand the mutex over to the woken thread). */
-    bool enqueue_core(unique_lock<mutex> & lock, lean_task_object * t, bool defer_notify = false) {
+    void enqueue_core(unique_lock<mutex> & lock, lean_task_object * t) {
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
         lean_assert(imp);
         unsigned prio = imp->m_prio;
         if (prio == LEAN_SYNC_PRIO) {
             run_task(lock, t);
-            return false;
+            return;
         }
         if (prio > LEAN_MAX_PRIO) {
             spawn_dedicated_worker(t);
-            return false;
+            return;
         }
         if (prio > m_max_prio)
             m_max_prio = prio;
@@ -1078,11 +1074,8 @@ class task_manager {
         m_queues_size++;
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
             spawn_worker();
-        else if (defer_notify)
-            return true;
         else
             m_queue_cv.notify_one();
-        return false;
     }
 
     void deactivate_task_core(unique_lock<mutex> & lock, lean_task_object * t) {
@@ -1293,10 +1286,7 @@ public:
 
     void enqueue(lean_task_object * t) {
         unique_lock<mutex> lock(m_mutex);
-        bool notify = enqueue_core(lock, t, /* defer_notify */ true);
-        lock.unlock();
-        if (notify)
-            m_queue_cv.notify_one();
+        enqueue_core(lock, t);
     }
 
     void resolve(lean_task_object * t, object * v) {
