@@ -73,8 +73,8 @@ class expr_flat_map {
             if (i + RELEASE_DISTANCE < cap) {
                 entry const & f = m_tab[i + RELEASE_DISTANCE];
                 if (f.m_key != nullptr) {
-                    __builtin_prefetch(f.m_key, 1, 3);
-                    if (!lean_is_scalar(f.m_val)) __builtin_prefetch(f.m_val, 1, 3);
+                    __builtin_prefetch(f.m_key, 0, 3);
+                    if (!lean_is_scalar(f.m_val)) __builtin_prefetch(f.m_val, 0, 3);
                 }
             }
             if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
