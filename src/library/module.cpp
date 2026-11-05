@@ -428,6 +428,18 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
     return io_result_mk_ok(cs_obj.steal());
 }
 
+#if !defined(LEAN_WINDOWS)
+// `LEAN_MMAP_RANDOM` (unset or != "0": on): see `lean_compacted_region_read`.
+static bool olean_mmap_random() {
+    static int cached = -1;
+    if (cached < 0) {
+        char const * v = getenv("LEAN_MMAP_RANDOM");
+        cached = (v != nullptr && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return cached == 1;
+}
+#endif
+
 static object * mk_compacted_region(b_obj_arg ofname, object * root,
                                     char * buffer, size_t base_addr, size_t full_sz, bool is_mmap) {
     object * r = lean_alloc_ctor(0, 2, sizeof(size_t) * 3 + 1);
@@ -534,6 +546,14 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             mmap_flags, fd.get(), 0));
         if (buffer != MAP_FAILED && buffer == base_addr) {
             is_mmap = true;
+            // lean-perf (L04): the import touches an .olean's pages sparsely (header, constant prefix
+            // tree, entry arrays), but the kernel's fault-around maps up to 16 neighbouring page-cache
+            // pages on every file fault, so a Mathlib import ends with ~6 GB of file pages mapped per
+            // process (RssFile) although it reads a fraction of them. `MADV_RANDOM` disables
+            // fault-around for the mapping (one page per fault, no readahead); the page cache itself is
+            // unaffected and nothing observable changes. `LEAN_MMAP_RANDOM=0` keeps the default.
+            if (olean_mmap_random())
+                madvise(buffer, size, MADV_RANDOM);
         } else {
             if (buffer != MAP_FAILED) munmap(buffer, size);
             buffer = nullptr;
