@@ -1626,7 +1626,7 @@ Registers `ext` as cache-safe (see `metaCacheSafeExtsRef`): its writes never cha
 (`Environment.cachesSurvive`). Call once, right after registering the extension.
 -/
 def markMetaCacheSafe (ext : EnvExtension σ) : IO Unit :=
-  metaCacheSafeExtsRef.modify (·.push ext.idx)
+  Environment.metaCacheSafeExtsRef.modify (·.push ext.idx)
 
 private builtin_initialize envExtensionsRef : IO.Ref (Array (EnvExtension EnvExtensionState)) ← IO.mkRef #[]
 private builtin_initialize numTrackedExtsRef : IO.Ref Nat ← IO.mkRef 0
