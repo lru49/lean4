@@ -1561,9 +1561,13 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
             object * val = val_addr->exchange(nullptr);
             if (val != nullptr) {
                 inc(val);
-                object * tmp = val_addr->exchange(val);
-                lean_assert(tmp == nullptr);
-                (void)tmp;
+                /* While the slot is null this thread holds the ref's token exclusively: `get`/`take`
+                   spin on a null slot, `swap` only replaces a non-null value and `put` only follows
+                   this thread's own `take`. So the token is put back with a release store (a plain
+                   `mov` on x86) instead of a second locked exchange; the acquiring exchange of the next
+                   reader synchronizes with it. */
+                lean_assert(val_addr->load(std::memory_order_relaxed) == nullptr);
+                val_addr->store(val, std::memory_order_release);
                 return val;
             }
         }
