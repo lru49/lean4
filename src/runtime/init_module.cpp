@@ -20,10 +20,16 @@ namespace lean {
 // idempotent as it may be called both by the generated `main` and, via `lean_initialize`,
 // by generated module initializers
 static bool g_initialized = false;
+#ifdef LEAN_MIMALLOC
+extern "C" void lean_mi_set_default_options(void);  // runtime/mimalloc.cpp
+#endif
 extern "C" LEAN_EXPORT void lean_initialize_runtime_module() {
     if (g_initialized)
         return;
     g_initialized = true;
+#ifdef LEAN_MIMALLOC
+    lean_mi_set_default_options();
+#endif
     initialize_alloc();
     initialize_debug();
     initialize_object();

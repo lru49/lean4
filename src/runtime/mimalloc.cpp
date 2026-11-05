@@ -50,3 +50,18 @@ extern "C" LEAN_EXPORT LEAN_ATTR_MALLOC lean_object * lean_alloc_small_object_co
     o->m_cs_sz = sz;
     return o;
 }
+
+/* Default purge delay of Lean's embedded mimalloc. The elaboration heap of a large module is a sawtooth: every
+   declaration builds caches and intermediate terms that are freed when the declaration finishes, and the next one
+   re-touches the same pages. With mimalloc's default of returning freed pages to the OS after 1 s (`purge_delay`),
+   one 47 s kernel-bound module purged 3.2 GiB in 20.8 K `MADV_DONTNEED` calls while never committing more than
+   3.3 GiB, and paid the page faults again for the next declaration (docs/profiles/memory-breakdown-20261105.md).
+   Keeping freed pages (`LEAN_MI_PURGE_DELAY` ms, -1 = never purge) made that module 6.6 % faster at the same peak
+   RSS. This is only a default: `MIMALLOC_PURGE_DELAY` in the environment still wins (`mi_option_set_default` does
+   not override an option that was already read or set). */
+#ifndef LEAN_MI_PURGE_DELAY
+#define LEAN_MI_PURGE_DELAY (-1)
+#endif
+extern "C" void lean_mi_set_default_options(void) {
+    mi_option_set_default(mi_option_purge_delay, LEAN_MI_PURGE_DELAY);
+}
