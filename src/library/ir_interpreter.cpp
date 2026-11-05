@@ -556,7 +556,73 @@ struct native_symbol_cache_entry {
 // name the first insertion wins and the other result is identical.
 struct native_symbol_cache_shard {
     std::shared_mutex m_mutex;
-    name_hash_map<native_symbol_cache_entry> m_map;
+    /* Flat open-addressing table (linear probing, at most half full) instead of a node-based
+       `std::unordered_map`: the cache holds one entry per distinct symbol the process ever asked for (tens of
+       thousands after a Mathlib import) and is consulted on every first use of a callee in an evaluation,
+       where chasing a node per probe was a cache miss. Values are copied out under the lock, so entries
+       may move when the table grows. Keys are owned references (released when the shard is destroyed),
+       compared by pointer first, then with `name::eq`. The shard was chosen by `hash % 64`, so the slot index
+       is taken from the high bits of the mixed hash (`home`), never from the low bits all keys of a shard share. */
+    struct slot {
+        lean_object * m_key;   // nullptr: empty
+        uint64_t m_hash;
+        native_symbol_cache_entry m_val;
+    };
+    std::vector<slot> m_slots;  // size is 0 or a power of two
+    size_t m_size = 0;
+    unsigned m_shift = 64;      // 64 - log2(m_slots.size())
+
+    size_t home(uint64_t h) const { return static_cast<size_t>((h * 0x9E3779B97F4A7C15ull) >> m_shift); }
+
+    ~native_symbol_cache_shard() {
+        for (slot const & s : m_slots)
+            if (s.m_key) lean_dec(s.m_key);
+    }
+
+    native_symbol_cache_entry const * find(name const & n) const {
+        if (m_slots.empty())
+            return nullptr;
+        lean_object * k = n.raw();
+        size_t mask = m_slots.size() - 1;
+        uint64_t h = n.hash();
+        for (size_t i = home(h); ; i = (i + 1) & mask) {
+            slot const & s = m_slots[i];
+            if (s.m_key == k)
+                return &s.m_val;
+            if (!s.m_key)
+                return nullptr;
+            if (s.m_hash == h && name::eq(s.m_key, k))
+                return &s.m_val;
+        }
+    }
+
+    /** \brief Insert `n -> v` unless present; return the stored entry (the existing one if present). */
+    native_symbol_cache_entry insert(name const & n, native_symbol_cache_entry const & v) {
+        if (native_symbol_cache_entry const * e = find(n))
+            return *e;
+        if (2 * (m_size + 1) > m_slots.size()) {
+            std::vector<slot> old;
+            old.swap(m_slots);
+            m_slots.assign(old.empty() ? 64 : old.size() * 2, slot{nullptr, 0, {nullptr, false}});
+            m_shift = 64 - __builtin_ctzll(m_slots.size());
+            size_t mask = m_slots.size() - 1;
+            for (slot const & s : old) {
+                if (s.m_key) {
+                    size_t i = home(s.m_hash);
+                    while (m_slots[i].m_key) i = (i + 1) & mask;
+                    m_slots[i] = s;
+                }
+            }
+        }
+        size_t mask = m_slots.size() - 1;
+        uint64_t h = n.hash();
+        size_t i = home(h);
+        while (m_slots[i].m_key) i = (i + 1) & mask;
+        lean_inc(n.raw());
+        m_slots[i] = slot{n.raw(), h, v};
+        m_size++;
+        return v;
+    }
 };
 static constexpr size_t g_native_symbol_cache_num_shards = 64;
 native_symbol_cache_shard * g_native_symbol_cache;
@@ -1130,9 +1196,8 @@ private:
         native_symbol_cache_shard & shard = native_symbol_cache_shard_for(fn);
         {
             std::shared_lock<std::shared_mutex> lock(shard.m_mutex);
-            auto ne = shard.m_map.find(fn);
-            if (ne != shard.m_map.end()) {
-                e_new.m_native = ne->second;
+            if (native_symbol_cache_entry const * ne = shard.find(fn)) {
+                e_new.m_native = *ne;
                 lock.unlock();
                 return m_symbol_cache.insert(fn, std::move(e_new));
             }
@@ -1163,11 +1228,8 @@ private:
         }
         {
             std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
-            auto r = shard.m_map.insert({ fn, e_new.m_native });
-            if (!r.second) {
-                // another thread resolved the same name meanwhile; the results are identical
-                e_new.m_native = r.first->second;
-            }
+            // if another thread resolved the same name meanwhile, keep its (identical) result
+            e_new.m_native = shard.insert(fn, e_new.m_native);
         }
         return m_symbol_cache.insert(fn, std::move(e_new));
     }
