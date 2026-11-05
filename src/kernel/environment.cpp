@@ -14,6 +14,7 @@ Author: Leonardo de Moura
 #include "kernel/environment.h"
 #include "kernel/kernel_exception.h"
 #include "kernel/type_checker.h"
+#include "runtime/cache_stats.h"
 #include "kernel/quot.h"
 
 namespace lean {
@@ -127,6 +128,8 @@ static void check_constant_val(environment const & env, constant_val const & v, 
     check_name(env, v.get_name());
     check_duplicated_univ_params(env, v.get_lparams());
     check_no_metavar_no_fvar(env, v.get_name(), v.get_type());
+    struct dl_sub_guard { unsigned m_old; dl_sub_guard():m_old(dl_get_sub()) { dl_set_sub(1); } ~dl_sub_guard() { dl_set_sub(m_old); } };
+    dl_sub_guard dl_g;   // the declaration's statement (type) is checked here: misses count as header-derivable
     expr sort = checker.check(v.get_type(), v.get_lparams());
     checker.ensure_sort(sort, v.get_type());
 }

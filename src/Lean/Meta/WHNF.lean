@@ -1068,10 +1068,14 @@ partial def whnfImp (e : Expr) : MetaM Expr :=
       -- one key for the lookup and the insertion: the configuration does not change in between
       let key ← mkExprConfigCacheKey e
       match (← get).cache.whnf.find? key with
-      | some e' => pure e'
+      | some e' =>
+        DlStats.ev 10 0 0
+        pure e'
       | none    =>
+        DlStats.ev 10 1 (hash key)
         let r ← whnfUncached e
         modify fun s => { s with cache.whnf := s.cache.whnf.insert key r }
+        DlStats.ev 10 2 (hash key)
         return r
     else
       whnfUncached e

@@ -31,6 +31,22 @@ import Std.Sync.Mutex -- lean-perf (L01c): the region-prefetch map
 
 public section
 
+/- lean-perf DL diagnostic (NOT a candidate): cache event counters in the C++ runtime (src/runtime/cache_stats.cpp). -/
+namespace Lean.DlStats
+@[extern "lean_dl_ev"] opaque evRaw (c e : UInt32) (h : UInt64) : BaseIO Unit
+@[extern "lean_dl_reset"] opaque resetRaw (c reason : UInt32) (size : UInt64) : BaseIO Unit
+@[extern "lean_dl_phase"] opaque phaseRaw (p : UInt32) : BaseIO Unit
+@[extern "lean_dl_sub"] opaque subRaw (s : UInt32) : BaseIO Unit
+/- The externs exist only in this binary's runtime; the stage0 interpreter (stage1 build) must never reach them, so
+   every call is guarded by `IO.getEnv "LEAN_DL_ON"`, which this runtime answers from a cached object and stage0
+   answers `none` (the variable is never set during the build). -/
+def on : BaseIO Bool := return (← IO.getEnv "LEAN_DL_ON").isSome
+def ev (c e : UInt32) (h : UInt64) : BaseIO Unit := do if (← on) then evRaw c e h
+def reset (c reason : UInt32) (size : UInt64) : BaseIO Unit := do if (← on) then resetRaw c reason size
+def phase (p : UInt32) : BaseIO Unit := do if (← on) then phaseRaw p
+def sub (s : UInt32) : BaseIO Unit := do if (← on) then subRaw s
+end Lean.DlStats
+
 /-!
 # Note [Environment Branches]
 

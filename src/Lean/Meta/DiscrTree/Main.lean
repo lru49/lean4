@@ -495,8 +495,10 @@ private def getMatchCore (d : DiscrTree α) (e : Expr) : MetaM (Key × Array α)
 /--
   Find values that match `e` in `d`.
 -/
-def getMatch (d : DiscrTree α) (e : Expr) : MetaM (Array α) :=
-  return (← getMatchCore d e).2
+def getMatch (d : DiscrTree α) (e : Expr) : MetaM (Array α) := do
+  let r := (← getMatchCore d e).2
+  DlStats.ev 19 (if r.isEmpty then 1 else 0) 0
+  return r
 
 /--
   Similar to `getMatch`, but returns solutions that are prefixes of `e`.

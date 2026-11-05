@@ -766,7 +766,7 @@ instance : MonadMCtx MetaM where
 
 instance : MonadEnv MetaM where
   getEnv      := return (← getThe Core.State).env
-  modifyEnv f := do modifyThe Core.State fun s => { s with env := f s.env, cache := {} }; modify fun s => { s with cache := {} }
+  modifyEnv f := do DlStats.reset 10 1 0; DlStats.reset 11 1 0; DlStats.reset 12 1 0; DlStats.reset 13 1 0; DlStats.reset 14 1 0; DlStats.reset 16 1 0; DlStats.reset 20 1 0; modifyThe Core.State fun s => { s with env := f s.env, cache := {} }; modify fun s => { s with cache := {} }
 
 instance : AddMessageContext MetaM where
   addMessageContext := addMessageContextFull
@@ -863,7 +863,8 @@ variable [MonadControlT MetaM n] [Monad n]
 @[inline] def modifyCache (f : Cache → Cache) : MetaM Unit :=
   modify fun { mctx, cache, zetaDeltaFVarIds, postponed, diag } => { mctx, cache := f cache, zetaDeltaFVarIds, postponed, diag }
 
-def resetCache : MetaM Unit :=
+def resetCache : MetaM Unit := do
+  DlStats.reset 10 3 0; DlStats.reset 11 3 0; DlStats.reset 12 3 0; DlStats.reset 13 3 0; DlStats.reset 14 3 0; DlStats.reset 16 3 0
   modifyCache fun _ => {}
 
 @[inline] def modifyInferTypeCache (f : InferTypeCache → InferTypeCache) : MetaM Unit :=
@@ -893,6 +894,7 @@ def mkInfoCacheKey (expr : Expr) (nargs? : Option Nat) : MetaM InfoCacheKey :=
 
 /-- Resets both tiers of the type class resolution cache; see `SynthInstanceCache`. -/
 def resetSynthInstanceCache : MetaM Unit := do
+  DlStats.reset 14 7 0; DlStats.reset 15 7 0
   modifyThe Core.State fun s => { s with env := { s.env with synthCacheRaw? := none } }
   modifyCache fun c => {c with synthInstance := {}}
 
@@ -1404,6 +1406,7 @@ def elimMVarDeps (xs : Array Expr) (e : Expr) (preserveOrder : Bool := false) : 
 @[inline] def withFreshCache : n α → n α :=
   mapMetaM fun x => do
     let cacheSaved := (← get).cache
+    DlStats.reset 10 4 0; DlStats.reset 11 4 0; DlStats.reset 12 4 0; DlStats.reset 13 4 0; DlStats.reset 14 4 0; DlStats.reset 16 4 0
     modify fun s => { s with cache := {} }
     try
       x
@@ -2667,6 +2670,7 @@ partial def processPostponed (mayPostpone : Bool := true) (exceptionOnFailure :=
     See issue #1102 for an example that triggers an exponential blowup if we don't use this more
     aggressive form of caching.
   -/
+  DlStats.reset 12 5 0
   modifyDefEqTransientCache fun _ => {}
   let postponed ← getResetPostponed
   try
@@ -2713,6 +2717,7 @@ def isExprDefEq (t s : Expr) : MetaM Bool :=
 
     Remark: the kernel does *not* update the type of variables in the local context.
     -/
+    DlStats.reset 13 6 0
     resetDefEqPermCaches
     checkpointDefEq (mayPostpone := true) <| Meta.isExprDefEqAux t s
 

@@ -22,8 +22,11 @@ deriving BEq, Hashable, TypeName
 @[inline] private def checkFunInfoCache (fn : Expr) (maxArgs? : Option Nat) (k : MetaM FunInfo) : MetaM FunInfo := do
   let key ← mkInfoCacheKey fn maxArgs?
   match (← get).cache.funInfo.find? key with
-  | some finfo => return finfo
+  | some finfo =>
+    DlStats.ev 16 0 0
+    return finfo
   | none       => do
+    DlStats.ev 16 1 (hash key)
     let finfo ← match fn with
       | .const c ls =>
         -- If `fn` is only a single constant, we can share the result with any thread that can see `c`
@@ -36,6 +39,7 @@ deriving BEq, Hashable, TypeName
           realizeValue c { c, ls, maxArgs? : FunInfoEnvCacheKey } k
       | _ => k
     modify fun s => { s with cache := { s.cache with funInfo := s.cache.funInfo.insert key finfo } }
+    DlStats.ev 16 2 (hash key)
     return finfo
 
 @[inline] private def whenHasVar {α} (e : Expr) (deps : α) (k : α → α) : α :=

@@ -510,6 +510,7 @@ def inDSimp : SimpM Bool :=
 Save current cache, reset it, execute `x`, and then restore original cache.
 -/
 @[inline] def withFreshCache (x : SimpM α) : SimpM α := do
+  DlStats.reset 17 4 0
   let cacheSaved := (← get).cache
   modify fun s => { s with cache := {} }
   try x finally modify fun s => { s with cache := cacheSaved }
@@ -775,10 +776,14 @@ def mkCongrSimp? (f : Expr) : SimpM (Option CongrTheorem) := do profileitM Excep
     -- We always use simple congruence theorems for auxiliary match applications
     return none
   match (← get).congrCache[f]? with
-  | some thm? => return thm?
+  | some thm? =>
+    DlStats.ev 18 0 0
+    return thm?
   | none =>
+    DlStats.ev 18 1 (hash f)
     let thm? ← go?
     modify fun s => { s with congrCache := s.congrCache.insert f thm? }
+    DlStats.ev 18 2 (hash f)
     return thm?
 where
   go? : SimpM (Option CongrTheorem) := do

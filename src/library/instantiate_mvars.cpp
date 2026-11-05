@@ -14,6 +14,7 @@ Authors: Joachim Breitner
 #include "kernel/expr.h"
 #include "kernel/replace_fn.h"
 #include "library/scope_cache.h"
+#include "runtime/cache_stats.h"
 
 /*
 This module provides an implementation of `instantiateMVars` with linear
@@ -289,7 +290,7 @@ class instantiate_direct_fn {
 
 public:
     instantiate_direct_fn(metavar_ctx & mctx)
-        : m_mctx(mctx), m_level_fn(mctx), m_has_updateable_delayed(false) {}
+        : m_mctx(mctx), m_level_fn(mctx), m_has_updateable_delayed(false) { dl_reset(DLX_IMV, 0, 0); }
     bool has_updateable_delayed() const { return m_has_updateable_delayed; }
 
     expr visit(expr const & e) {
@@ -297,8 +298,11 @@ public:
             return e;
         bool shared = false;
         if (is_shared(e)) {
-            if (lean_object * r = m_cache.find(e.raw()))
+            if (lean_object * r = m_cache.find(e.raw())) {
+                dl_ev(DLX_IMV, DL_HIT, 0);
                 return expr(r, true);
+            }
+            dl_ev(DLX_IMV, DL_MISS, 0);
             shared = true;
         }
 

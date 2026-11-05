@@ -17,6 +17,7 @@ Author: Leonardo de Moura
 #include "runtime/flet.h"
 #include "util/lbool.h"
 #include "kernel/type_checker.h"
+#include "runtime/cache_stats.h"
 #include "kernel/expr_maps.h"
 #include "kernel/instantiate.h"
 #include "kernel/kernel_exception.h"
@@ -55,7 +56,14 @@ static expr * g_nat_shiftLeft  = nullptr;
 static expr * g_nat_shiftRight = nullptr;
 
 type_checker::state::state(environment const & env):
-    m_env(env), m_ngen(*g_kernel_fresh) {}
+    m_env(env), m_ngen(*g_kernel_fresh) { dl_reset(DLK_POOL, 0, 0); }
+type_checker::state::~state() {
+    /* reason 10 = state destroyed: the size is what dies with it */
+    dl_reset(DLK_INFER_CHECK, 10, m_infer_type[0].size()); dl_reset(DLK_INFER_ONLY, 10, m_infer_type[1].size());
+    dl_reset(DLK_WHNF_CORE, 10, m_whnf_core.size()); dl_reset(DLK_WHNF, 10, m_whnf.size());
+    dl_reset(DLK_DEFEQ_OK, 10, m_success.size()); dl_reset(DLK_DEFEQ_FAIL, 10, m_failure.size());
+    dl_reset(DLK_UNFOLD, 10, m_unfold.size()); dl_reset(DLK_REC_RHS, 10, m_rec_rhs.size());
+}
 
 size_t type_checker::state::num_entries() const {
     return m_infer_type[0].size() + m_infer_type[1].size() + m_whnf_core.size() + m_whnf.size() + m_unfold.size()
@@ -69,6 +77,7 @@ void type_checker::state::retarget(environment const & env) {
        and the `unsafe`/`partial` safety checks of `infer_constant`. `m_failure` holds negative `is_def_eq` answers,
        which are incomplete and depend on `m_eager_reduce`; a stale failure could reject a declaration another checker
        would accept. Everything else is a function of the environment and of this state's own fvars. */
+    dl_reset(DLK_INFER_CHECK, 9, m_infer_type[0].size()); dl_reset(DLK_DEFEQ_FAIL, 9, m_failure.size());
     m_infer_type[0].clear();
     m_failure.clear();
 }
@@ -122,6 +131,7 @@ public:
             if (e2.raw() != e1.raw())
                 m_entries.push_back(pool_entry{object_ref(e2), st});
             while (m_entries.size() > slots) {
+                dl_ev(DLK_POOL, DL_EVICT, 0);
                 evicted.push_back(std::move(m_entries.front()));
                 m_entries.pop_front();
             }
@@ -143,6 +153,7 @@ void init_kernel_state_pool_config() {
 type_checker::pooled_state::pooled_state(environment const & env, bool enabled):m_fresh(true) {
     if (enabled && g_pool_enabled && g_kernel_state_pool) {
         m_st = g_kernel_state_pool->take(env);
+        if (m_st) dl_ev(DLK_POOL, DL_HIT, 0); else dl_ev(DLK_POOL, DL_MISS, 0);
         if (m_st) {
             m_st->retarget(env);
             m_fresh = false;
@@ -159,8 +170,11 @@ type_checker::pooled_state::~pooled_state() {
 void type_checker::pooled_state::commit(environment const & in_env, environment const & out_env) {
     if (!g_pool_enabled || !g_kernel_state_pool || !m_st)
         return;
-    if (m_st->num_entries() > g_pool_max_entries)
+    if (m_st->num_entries() > g_pool_max_entries) {
+        dl_reset(DLK_POOL, 11, m_st->num_entries());
         return;
+    }
+    dl_ev(DLK_POOL, DL_INSERT, 0);
     g_kernel_state_pool->put(m_st, in_env, out_env, g_pool_slots);
 }
 
@@ -439,8 +453,12 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     scope_rec_depth guard;
     check_system("type checker", /* do_check_interrupted */ true);
 
-    if (lean_object * cached = m_st->m_infer_type[infer_only].find(e))
-        return expr(cached, true);
+    uint64_t dl_t0 = dl_tsc();
+    lean_object * dl_c = m_st->m_infer_type[infer_only].find(e);
+    dl_cyc((infer_only ? DLK_INFER_ONLY : DLK_INFER_CHECK), 0, dl_tsc() - dl_t0);
+    if (dl_c) dl_ev((infer_only ? DLK_INFER_ONLY : DLK_INFER_CHECK), DL_HIT, 0); else dl_ev((infer_only ? DLK_INFER_ONLY : DLK_INFER_CHECK), DL_MISS, hash(e));
+    if (dl_c)
+        return expr(dl_c, true);
 
     expr r;
     switch (e.kind()) {
@@ -462,7 +480,7 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     case expr_kind::Let:      r = infer_let(e, infer_only);            break;
     }
 
-    m_st->m_infer_type[infer_only].insert(e, r);
+    { uint64_t dl_t1 = dl_tsc(); m_st->m_infer_type[infer_only].insert(e, r); dl_cyc((infer_only ? DLK_INFER_ONLY : DLK_INFER_CHECK), 1, dl_tsc() - dl_t1); dl_ev((infer_only ? DLK_INFER_ONLY : DLK_INFER_CHECK), DL_INSERT, hash(e)); }
     return r;
 }
 
@@ -527,10 +545,14 @@ expr type_checker::instantiate_rec_rhs(expr const & rec_fn, expr const & rhs, na
     if (is_nil(ls) || !has_param_univ(rhs))
         return rhs;   // = instantiate_lparams(rhs, lps, ls): nothing to substitute
     expr key = mk_app(rec_fn, rhs);
-    if (lean_object * cached = m_st->m_rec_rhs.find(key))
-        return expr(cached, true);
+    uint64_t dl_t0 = dl_tsc();
+    lean_object * dl_c = m_st->m_rec_rhs.find(key);
+    dl_cyc(DLK_REC_RHS, 0, dl_tsc() - dl_t0);
+    if (dl_c) dl_ev(DLK_REC_RHS, DL_HIT, 0); else dl_ev(DLK_REC_RHS, DL_MISS, hash(key));
+    if (dl_c)
+        return expr(dl_c, true);
     expr r = instantiate_lparams(rhs, lps, ls);
-    m_st->m_rec_rhs.insert(key, r);
+    { uint64_t dl_t1 = dl_tsc(); m_st->m_rec_rhs.insert(key, r); dl_cyc(DLK_REC_RHS, 1, dl_tsc() - dl_t1); dl_ev(DLK_REC_RHS, DL_INSERT, hash(key)); }
     return r;
 }
 
@@ -628,8 +650,12 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
     }
 
     // check cache
-    if (lean_object * cached = m_st->m_whnf_core.find(e))
-        return expr(cached, true);
+    uint64_t dl_t0 = dl_tsc();
+    lean_object * dl_c = m_st->m_whnf_core.find(e);
+    dl_cyc(DLK_WHNF_CORE, 0, dl_tsc() - dl_t0);
+    if (dl_c) dl_ev(DLK_WHNF_CORE, DL_HIT, 0); else dl_ev(DLK_WHNF_CORE, DL_MISS, hash(e));
+    if (dl_c)
+        return expr(dl_c, true);
 
     // do the actual work
     expr r;
@@ -684,7 +710,7 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
     }
 
     if (cache_result && !cheap_rec && !cheap_proj) {
-        m_st->m_whnf_core.insert(e, r);
+        { uint64_t dl_t1 = dl_tsc(); m_st->m_whnf_core.insert(e, r); dl_cyc(DLK_WHNF_CORE, 1, dl_tsc() - dl_t1); dl_ev(DLK_WHNF_CORE, DL_INSERT, hash(e)); }
     }
     return r;
 }
@@ -710,10 +736,14 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
                 m_diag->record_unfold(d->get_name());
             }
             if (len > 0) {
-                if (lean_object * cached = m_st->m_unfold.find(e))
-                    return some_expr(expr(cached, true));
+                uint64_t dl_t0 = dl_tsc();
+    lean_object * dl_c = m_st->m_unfold.find(e);
+    dl_cyc(DLK_UNFOLD, 0, dl_tsc() - dl_t0);
+    if (dl_c) dl_ev(DLK_UNFOLD, DL_HIT, 0); else dl_ev(DLK_UNFOLD, DL_MISS, hash(e));
+    if (dl_c)
+        return some_expr(expr(dl_c, true));
                 expr result = instantiate_value_lparams(*d, us);
-                m_st->m_unfold.insert(e, result);
+                { uint64_t dl_t1 = dl_tsc(); m_st->m_unfold.insert(e, result); dl_cyc(DLK_UNFOLD, 1, dl_tsc() - dl_t1); dl_ev(DLK_UNFOLD, DL_INSERT, hash(e)); }
                 return some_expr(result);
             } else {
                 return some_expr(instantiate_value_lparams(*d, us));
@@ -860,20 +890,24 @@ expr type_checker::whnf(expr const & e) {
     }
 
     // check cache
-    if (lean_object * cached = m_st->m_whnf.find(e))
-        return expr(cached, true);
+    uint64_t dl_t0 = dl_tsc();
+    lean_object * dl_c = m_st->m_whnf.find(e);
+    dl_cyc(DLK_WHNF, 0, dl_tsc() - dl_t0);
+    if (dl_c) dl_ev(DLK_WHNF, DL_HIT, 0); else dl_ev(DLK_WHNF, DL_MISS, hash(e));
+    if (dl_c)
+        return expr(dl_c, true);
 
     expr t = e;
     while (true) {
         expr t1 = whnf_core(t);
         if (auto v = reduce_nat(t1)) {
-            m_st->m_whnf.insert(e, *v);
+            { uint64_t dl_t1 = dl_tsc(); m_st->m_whnf.insert(e, *v); dl_cyc(DLK_WHNF, 1, dl_tsc() - dl_t1); dl_ev(DLK_WHNF, DL_INSERT, hash(e)); }
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
             t = *next_t;
         } else {
             auto r = t1;
-            m_st->m_whnf.insert(e, r);
+            { uint64_t dl_t1 = dl_tsc(); m_st->m_whnf.insert(e, r); dl_cyc(DLK_WHNF, 1, dl_tsc() - dl_t1); dl_ev(DLK_WHNF, DL_INSERT, hash(e)); }
             return r;
         }
     }
@@ -1061,7 +1095,13 @@ lbool type_checker::is_def_eq_proof_irrel(expr const & t, expr const & s) {
     return to_lbool(is_def_eq(t_type, s_type));
 }
 
+static uint64_t dl_pair_hash(expr const & t, expr const & s) { unsigned a = hash(t), b = hash(s); if (a > b) std::swap(a, b); return (uint64_t(a) << 32) | b; }
 bool type_checker::failed_before(expr const & t, expr const & s) const {
+    uint64_t dl_t0 = dl_tsc(); bool dl_r = failed_before_core(t, s); dl_cyc(DLK_DEFEQ_FAIL, 0, dl_tsc() - dl_t0);
+    if (dl_r) dl_ev(DLK_DEFEQ_FAIL, DL_HIT, 0); else dl_ev(DLK_DEFEQ_FAIL, DL_MISS, dl_pair_hash(t, s));
+    return dl_r;
+}
+bool type_checker::failed_before_core(expr const & t, expr const & s) const {
     if (hash(t) < hash(s)) {
         return m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end();
     } else if (hash(t) > hash(s)) {
@@ -1074,6 +1114,9 @@ bool type_checker::failed_before(expr const & t, expr const & s) const {
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
+    uint64_t dl_t1 = dl_tsc(); cache_failure_core(t, s); dl_cyc(DLK_DEFEQ_FAIL, 1, dl_tsc() - dl_t1); dl_ev(DLK_DEFEQ_FAIL, DL_INSERT, dl_pair_hash(t, s));
+}
+void type_checker::cache_failure_core(expr const & t, expr const & s) {
     if (hash(t) <= hash(s))
         m_st->m_failure.insert(mk_pair(t, s));
     else
@@ -1081,6 +1124,11 @@ void type_checker::cache_failure(expr const & t, expr const & s) {
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
+    uint64_t dl_t0 = dl_tsc(); bool dl_r = succeeded_before_core(t, s); dl_cyc(DLK_DEFEQ_OK, 0, dl_tsc() - dl_t0);
+    if (dl_r) dl_ev(DLK_DEFEQ_OK, DL_HIT, 0); else dl_ev(DLK_DEFEQ_OK, DL_MISS, dl_pair_hash(t, s));
+    return dl_r;
+}
+bool type_checker::succeeded_before_core(expr const & t, expr const & s) const {
     if (hash(t) < hash(s)) {
         return m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end();
     } else if (hash(t) > hash(s)) {
@@ -1093,6 +1141,9 @@ bool type_checker::succeeded_before(expr const & t, expr const & s) const {
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
+    uint64_t dl_t1 = dl_tsc(); cache_success_core(t, s); dl_cyc(DLK_DEFEQ_OK, 1, dl_tsc() - dl_t1); dl_ev(DLK_DEFEQ_OK, DL_INSERT, dl_pair_hash(t, s));
+}
+void type_checker::cache_success_core(expr const & t, expr const & s) {
     if (hash(t) <= hash(s))
         m_st->m_success.insert(mk_pair(t, s));
     else

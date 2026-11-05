@@ -234,13 +234,17 @@ private def inferFVarType (fvarId : FVarId) : MetaM Expr := do
     inferType
   else
     let key ← mkExprConfigCacheKey e
-    match ← (← get).cache.inferType.find? key (fun c => modifyInferTypeCache fun _ => c) with
-    | some type => return type
+    match ← (← get).cache.inferType.find? key (fun c => do DlStats.ev 11 3 0; modifyInferTypeCache fun _ => c) with
+    | some type =>
+      DlStats.ev 11 0 0
+      return type
     | none =>
+      DlStats.ev 11 1 (hash key)
       Core.checkInterrupted
       let type ← inferType
       unless type.hasMVar do
         modifyInferTypeCache fun c => c.insert key type
+        DlStats.ev 11 2 (hash key)
       return type
 
 /--

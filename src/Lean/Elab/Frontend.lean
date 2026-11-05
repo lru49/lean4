@@ -402,6 +402,7 @@ def runFrontend
     return Json.compress $ toJson ilean
 
   if let some oleanFileName := oleanFileName? then
+    DlStats.phase 2
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints

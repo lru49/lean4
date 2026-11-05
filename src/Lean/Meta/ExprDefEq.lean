@@ -2501,20 +2501,28 @@ private def getCachedResult (keyInfo : DefEqCacheKeyInfo) : MetaM LBool := do
   let cache ← match keyInfo.kind with
     | .transient => pure (← get).cache.defEqTrans
     | .permanent => pure (← get).cache.defEqPerm
+  let dlc : UInt32 := match keyInfo.kind with | .transient => 12 | .permanent => 13
   match cache.find? keyInfo.key with
-  | some val => return val.toLBool
-  | none => return .undef
+  | some val =>
+    DlStats.ev dlc 0 0
+    return val.toLBool
+  | none =>
+    DlStats.ev dlc 1 (hash keyInfo.key)
+    return .undef
 
 private def cacheResult (keyInfo : DefEqCacheKeyInfo) (result : Bool) : MetaM Unit := do
   let key := keyInfo.key
   match keyInfo.kind with
-  | .permanent => modifyDefEqPermCache fun c => c.insert key result
+  | .permanent =>
+    modifyDefEqPermCache fun c => c.insert key result
+    DlStats.ev 13 2 (hash key)
   | .transient =>
     /-
     We must ensure that all assigned metavariables in the key are replaced by their current assignments.
     Otherwise, the key is invalid after the assignment is "backtracked".
     See issue #1870 for an example.
     -/
+    DlStats.ev 12 2 (hash key)
     let key ← mkDefEqCacheKey (← instantiateMVars key.lhs) (← instantiateMVars key.rhs)
     modifyDefEqTransientCache fun c => c.insert key result
 

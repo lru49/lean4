@@ -967,7 +967,9 @@ private def SynthInstanceCache.insertEntry (c : SynthInstanceCache) (key : Synth
 /-- Adds `entry` to the transient tier, and to the persistent tier if `persist` is set. -/
 private def insertCacheEntry (key : SynthInstanceCacheKey) (entry : SynthInstanceCacheEntry)
     (persist : Bool) : MetaM Unit := do
+  DlStats.ev 14 2 (hash key)
   if persist then
+    DlStats.ev 15 2 (hash key)
     -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
     modifyThe Core.State fun s =>
       { s with env := s.env.setSynthCache (s.env.synthCache.insertEntry key entry) }
@@ -984,10 +986,15 @@ private def findCachedResult? (key : SynthInstanceCacheKey) : MetaM (Option Synt
   let find? (c : SynthInstanceCache) := c.find? key |>.bind fun entries =>
     entries.find? fun e => validOptionAccesses opts e.deps && validEnvDeps env e.deps
   let (entry, persistent) ← if let some entry := find? (← get).cache.synthInstance then
+      DlStats.ev 14 0 0
       pure (entry, false)
     else if let some entry := find? env.synthCache then
+      DlStats.ev 14 1 (hash key)
+      DlStats.ev 15 0 0
       pure (entry, true)
     else
+      DlStats.ev 14 1 (hash key)
+      DlStats.ev 15 1 (hash key)
       return none
   if entry.deps.baseTrackedGen != env.trackedGen ||
       entry.deps.baseChangeLogPos != env.declChangeLog.size then

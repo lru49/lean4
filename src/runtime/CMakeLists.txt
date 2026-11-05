@@ -64,6 +64,7 @@ set(
   mpz.cpp
   utf8.cpp
   object.cpp
+  cache_stats.cpp
   apply.cpp
   exception.cpp
   interrupt.cpp

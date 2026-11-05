@@ -676,6 +676,7 @@ def simpStep (e : Expr) : SimpM Result := do
 def cacheResult (e : Expr) (cfg : Config) (r : Result) : SimpM Result := do
   if cfg.memoize && r.cache then
     modify fun s => { s with cache := s.cache.insert e r }
+    DlStats.ev 17 2 (hash e)
   return r
 
 partial def simpLoop (e : Expr) : SimpM Result := withIncRecDepth do
@@ -683,7 +684,9 @@ partial def simpLoop (e : Expr) : SimpM Result := withIncRecDepth do
   if cfg.memoize then
     let cache := (← get).cache
     if let some result := cache.find? e then
+      DlStats.ev 17 0 0
       return result
+    DlStats.ev 17 1 (hash e)
   if (← get).numSteps > cfg.maxSteps then
     throwError "`simp` failed: maximum number of steps exceeded"
   else

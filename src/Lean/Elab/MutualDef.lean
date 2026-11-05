@@ -1222,7 +1222,8 @@ where
       views.any (fun view => view.kind != .example || view.modifiers.isPublic) &&
       expandedDeclIds.any (!isPrivateName ·.declName)) do
     withSaveInfoContext do  -- save adjusted env in info tree
-    let headers ← elabHeaders views expandedDeclIds bodyPromises tacPromises
+    DlStats.sub 1
+    let headers ← tryFinally (elabHeaders views expandedDeclIds bodyPromises tacPromises) (DlStats.sub 0)
     let headers ← levelMVarToParamHeaders views headers
     for header in headers do
       let info : DeclValueInfo := { header with isProof := (← isProp header.type) }

@@ -37,6 +37,7 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <dlfcn.h>
 #endif
 #include "library/ir_interpreter.h"
+#include "runtime/cache_stats.h"
 #include "runtime/flet.h"
 #include "runtime/apply.h"
 #include "runtime/interrupt.h"
@@ -449,8 +450,10 @@ public:
     template<class T>
     static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f) {
         if (g_interpreter && is_eqp(g_interpreter->m_env, env) && is_eqp(g_interpreter->m_opts, opts)) {
+            dl_ev(DLI_EVAL, DL_HIT, 0);
             return f(*g_interpreter);
         } else {
+            dl_ev(DLI_EVAL, DL_MISS, 0); dl_reset(DLI_SYMBOL, 0, 0); dl_reset(DLI_CONST, 0, 0);
             // We changed threads or the closure was stored and called in a different context.
             time_task t("interpretation", opts, fn);
             scope_trace_env scope_trace(env, opts);
@@ -850,19 +853,25 @@ private:
     const symbol_cache_entry& lookup_symbol(name const & fn) {
         auto e = m_symbol_cache.find(fn);
         if (e != m_symbol_cache.end()) {
+            dl_ev(DLI_SYMBOL, DL_HIT, 0);
             return e->second;
         }
+        dl_ev(DLI_SYMBOL, DL_MISS, fn.hash() | (uint64_t(1) << 40));
+        dl_ev(DLI_SYMBOL, DL_INSERT, fn.hash() | (uint64_t(1) << 40));
         symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
         native_symbol_cache_shard & shard = native_symbol_cache_shard_for(fn);
         {
             std::shared_lock<std::shared_mutex> lock(shard.m_mutex);
             auto ne = shard.m_map.find(fn);
             if (ne != shard.m_map.end()) {
+                dl_ev(DLI_NATIVE, DL_HIT, 0);
                 e_new.m_native = ne->second;
                 lock.unlock();
                 return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
             }
         }
+        dl_ev(DLI_NATIVE, DL_MISS, fn.hash() | (uint64_t(1) << 40));
+        uint64_t dl_t0 = dl_tsc();
         // not cached yet: resolve without holding any lock (`dlsym` and the name mangling below are
         // the expensive part), then publish
         if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
@@ -885,6 +894,8 @@ private:
         }
         {
             std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
+            dl_cyc(DLI_NATIVE, 1, dl_tsc() - dl_t0);
+            dl_ev(DLI_NATIVE, DL_INSERT, fn.hash() | (uint64_t(1) << 40));
             auto r = shard.m_map.insert({ fn, e_new.m_native });
             if (!r.second) {
                 // another thread resolved the same name meanwhile; the results are identical
@@ -907,9 +918,11 @@ private:
     value load(name const & fn, type t) {
         auto cached_entry = m_constant_cache.find(fn);
         if (cached_entry != m_constant_cache.end()) {
+            dl_ev(DLI_CONST, DL_HIT, 0);
             auto cached = cached_entry->second;
             return cached.m_val;
         }
+        dl_ev(DLI_CONST, DL_MISS, fn.hash() | (uint64_t(1) << 40));
         auto o_entry = g_init_globals->find(fn);
         if (o_entry != g_init_globals->end()) {
             // persistent, so no `inc` needed
@@ -957,6 +970,7 @@ private:
         value r = eval_decl_body(e.m_decl);
         pop_frame(r, t);
         m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
+        dl_ev(DLI_CONST, DL_INSERT, fn.hash() | (uint64_t(1) << 40));
         return r;
     }
 

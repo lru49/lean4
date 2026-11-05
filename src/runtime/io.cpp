@@ -994,8 +994,10 @@ bool is_env_var_name(char const * name) {
     return strchr(name, '=') == nullptr;
 }
 
+extern "C" lean_object * lean_dl_on_obj();
 extern "C" LEAN_EXPORT obj_res lean_io_getenv(b_obj_arg env_var) {
     const char* env_var_str = string_cstr(env_var);
+    if (env_var_str[0] == 'L' && strcmp(env_var_str, "LEAN_DL_ON") == 0) return lean_dl_on_obj();   // lean-perf DL diagnostic
     if (strlen(env_var_str) != lean_string_size(env_var) - 1 || !is_env_var_name(env_var_str)) {
         return mk_option_none();
     }

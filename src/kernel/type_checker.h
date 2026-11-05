@@ -47,6 +47,7 @@ public:
         friend type_checker;
     public:
         state(environment const & env);
+        ~state();
         environment & env() { return m_env; }
         environment const & env() const { return m_env; }
         name_generator & ngen() { return m_ngen; }
@@ -141,6 +142,10 @@ private:
     bool is_def_eq_unit_like(expr const & t, expr const & s);
     bool failed_before(expr const & t, expr const & s) const;
     void cache_failure(expr const & t, expr const & s);
+    void cache_failure_core(expr const & t, expr const & s);
+    bool failed_before_core(expr const & t, expr const & s) const;
+    bool succeeded_before_core(expr const & t, expr const & s) const;
+    void cache_success_core(expr const & t, expr const & s);
     bool succeeded_before(expr const & t, expr const & s) const;
     void cache_success(expr const & t, expr const & s);
     reduction_status lazy_delta_reduction_step(expr & t_n, expr & s_n);

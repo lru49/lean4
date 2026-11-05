@@ -411,7 +411,7 @@ instance : MonadRef CoreM where
 
 instance : MonadEnv CoreM where
   getEnv := return (← get).env
-  modifyEnv f := modify fun s => { s with env := f s.env, cache := {} }
+  modifyEnv f := do DlStats.reset 20 2 0; DlStats.reset 21 2 0; modify fun s => { s with env := f s.env, cache := {} }
 
 instance : MonadOptions CoreM where
   getOptions := return checkedOptions (← read)
@@ -518,21 +518,31 @@ instance : Elab.MonadInfoTree CoreM where
   modifyCache fun ⟨c₁, c₂⟩ => ⟨c₁, f c₂⟩
 
 def instantiateTypeLevelParams (c : ConstantVal) (us : List Level) : CoreM Expr := do
+  let dlh := mixHash (hash c.name) (hash us)
   if let some (us', r) := (← get).cache.instLevelType.find? c.name then
     if us == us' then
+      DlStats.ev 20 0 0
       return r
+    DlStats.ev 20 3 0
+  DlStats.ev 20 1 dlh
   let r := c.instantiateTypeLevelParams us
   modifyInstLevelTypeCache fun s => s.insert c.name (us, r)
+  DlStats.ev 20 2 dlh
   return r
 
 def instantiateValueLevelParams (c : ConstantInfo) (us : List Level) (allowOpaque := false) : CoreM Expr := do
+  let dlh := mixHash (hash c.name) (hash us)
   if let some (us', r) := (← get).cache.instLevelValue.find? c.name then
     if us == us' then
+      DlStats.ev 21 0 0
       return r
+    DlStats.ev 21 3 0
+  DlStats.ev 21 1 dlh
   unless c.hasValue (allowOpaque := allowOpaque) do
     throwError "Not a definition or theorem: {.ofConstName c.name}"
   let r := c.instantiateValueLevelParams! us (allowOpaque := allowOpaque)
   modifyInstLevelValueCache fun s => s.insert c.name (us, r)
+  DlStats.ev 21 2 dlh
   return r
 
 @[inline] def liftIOCore (x : IO α) : CoreM α := do
