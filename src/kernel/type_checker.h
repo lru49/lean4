@@ -118,6 +118,8 @@ private:
     expr whnf_fvar(expr const & e, bool cheap_rec, bool cheap_proj);
     optional<constant_info> is_delta(expr const & e) const;
     optional<expr> unfold_definition_core(expr const & e);
+    expr unfold_constant(expr const & e, constant_info const & d);
+    expr unfold_definition_known(expr const & e, constant_info const & d);
 
     bool is_def_eq_binding(expr t, expr s);
     bool is_def_eq(level const & l1, level const & l2);

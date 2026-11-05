@@ -701,26 +701,44 @@ optional<constant_info> type_checker::is_delta(expr const & e) const {
     return none_constant_info();
 }
 
+/* Unfold the constant `e` whose declaration `d` was returned by `is_delta(e)`. */
+expr type_checker::unfold_constant(expr const & e, constant_info const & d) {
+    levels const & us = const_levels(e);
+    unsigned len = length(us);
+    if (m_diag) {
+        m_diag->record_unfold(d.get_name());
+    }
+    if (len > 0) {
+        if (lean_object * cached = m_st->m_unfold.find(e))
+            return expr(cached, true);
+        expr result = instantiate_value_lparams(d, us);
+        m_st->m_unfold.insert(e, result);
+        return result;
+    } else {
+        return instantiate_value_lparams(d, us);
+    }
+}
+
 optional<expr> type_checker::unfold_definition_core(expr const & e) {
     if (is_constant(e)) {
         if (auto d = is_delta(e)) {
-            levels const & us = const_levels(e);
-            unsigned len = length(us);
-            if (m_diag) {
-                m_diag->record_unfold(d->get_name());
-            }
-            if (len > 0) {
-                if (lean_object * cached = m_st->m_unfold.find(e))
-                    return some_expr(expr(cached, true));
-                expr result = instantiate_value_lparams(*d, us);
-                m_st->m_unfold.insert(e, result);
-                return some_expr(result);
-            } else {
-                return some_expr(instantiate_value_lparams(*d, us));
-            }
+            return some_expr(unfold_constant(e, *d));
         }
     }
     return none_expr();
+}
+
+/* `unfold_definition(e)` for an `e` whose head declaration `d` was already returned by `is_delta(e)`:
+   the same result without a second environment lookup of the head constant. */
+expr type_checker::unfold_definition_known(expr const & e, constant_info const & d) {
+    if (is_app(e)) {
+        expr f = unfold_constant(get_app_fn(e), d);
+        buffer<expr> args;
+        get_app_rev_args(e, args);
+        return mk_rev_app(f, args);
+    } else {
+        return unfold_constant(e, d);
+    }
 }
 
 /* Unfold head(e) if it is a constant */
@@ -1149,21 +1167,21 @@ auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n) -> reductio
         if (auto s_n_new = try_unfold_proj_app(s_n)) {
             s_n = *s_n_new;
         } else {
-            t_n = whnf_core(*unfold_definition(t_n), false, true);
+            t_n = whnf_core(unfold_definition_known(t_n, *d_t), false, true);
         }
     } else if (!d_t && d_s) {
         /* If `t_n` is a projection application, we try to unfold it instead. See comment above. */
         if (auto t_n_new = try_unfold_proj_app(t_n)) {
             t_n = *t_n_new;
         } else {
-            s_n = whnf_core(*unfold_definition(s_n), false, true);
+            s_n = whnf_core(unfold_definition_known(s_n, *d_s), false, true);
         }
     } else {
         int c = compare(d_t->get_hints(), d_s->get_hints());
         if (c < 0) {
-            t_n = whnf_core(*unfold_definition(t_n), false, true);
+            t_n = whnf_core(unfold_definition_known(t_n, *d_t), false, true);
         } else if (c > 0) {
-            s_n = whnf_core(*unfold_definition(s_n), false, true);
+            s_n = whnf_core(unfold_definition_known(s_n, *d_s), false, true);
         } else {
             if (is_app(t_n) && is_app(s_n) && is_eqp(*d_t, *d_s) && d_t->get_hints().is_regular()) {
                 // Optimization:
@@ -1179,8 +1197,8 @@ auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n) -> reductio
                     }
                 }
             }
-            t_n = whnf_core(*unfold_definition(t_n), false, true);
-            s_n = whnf_core(*unfold_definition(s_n), false, true);
+            t_n = whnf_core(unfold_definition_known(t_n, *d_t), false, true);
+            s_n = whnf_core(unfold_definition_known(s_n, *d_s), false, true);
         }
     }
     switch (quick_is_def_eq(t_n, s_n)) {
