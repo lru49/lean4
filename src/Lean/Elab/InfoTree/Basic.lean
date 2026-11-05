@@ -74,15 +74,30 @@ partial def InfoTree.findInfo? (p : Info → Bool) (t : InfoTree) : Option Info 
       ts.findSome? (findInfo? p)
   | _ => none
 
+/--
+Like `InfoTree.substitute`, but returns `none` when no hole of `tree` is assigned, so that unchanged
+subtrees are shared instead of being rebuilt node by node. Info trees are substituted once per
+enclosing `withSavedPartialInfoContext` (command, declaration, auto-bound implicits), and after the
+innermost one has filled the holes the outer ones would otherwise copy the whole tree again.
+-/
+private partial def InfoTree.substitute? (tree : InfoTree) (assignment : PersistentHashMap MVarId InfoTree) :
+    Option InfoTree :=
+  match tree with
+  | .node i c =>
+    let (_, c'?) := c.foldl (init := (0, (none : Option (PersistentArray InfoTree)))) fun (idx, c'?) t =>
+      match InfoTree.substitute? t assignment with
+      | none    => (idx + 1, c'?)
+      | some t' => (idx + 1, some ((c'?.getD c).set idx t'))
+    c'?.map (.node i)
+  | .context i t => (InfoTree.substitute? t assignment).map (.context i)
+  | .hole id  => match assignment.find? id with
+    | none      => none
+    | some tree => some <| (InfoTree.substitute? tree assignment).getD tree
+
 /-- Instantiate the holes on the given `tree` with the assignment table.
 (analogous to instantiating the metavariables in an expression) -/
-partial def InfoTree.substitute (tree : InfoTree) (assignment : PersistentHashMap MVarId InfoTree) : InfoTree :=
-  match tree with
-  | node i c => node i <| c.map (substitute · assignment)
-  | context i t => context i (substitute t assignment)
-  | hole id  => match assignment.find? id with
-    | none      => hole id
-    | some tree => substitute tree assignment
+def InfoTree.substitute (tree : InfoTree) (assignment : PersistentHashMap MVarId InfoTree) : InfoTree :=
+  if assignment.isEmpty then tree else (InfoTree.substitute? tree assignment).getD tree
 
 /-- Applies `s.lazyAssignment` to `s.trees`, asynchronously. -/
 def InfoState.substituteLazy (s : InfoState) : Task InfoState :=
