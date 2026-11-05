@@ -984,22 +984,31 @@ private def revivePersistentTier : MetaM Unit := do
     -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
     modifyThe Core.State fun s => { s with env := s.env.reviveSynthCache (synthCacheWitnesses s.env) }
 
-/-- Adds `entry` to the transient tier, and to the persistent tier if `persist` is set. -/
+/--
+Adds `entry` to the transient tier, and to the persistent tier if `persist` is set. `fresh?` is the
+number of fresh names the computation of `entry` consumed, if it was just computed; see
+`Environment.synthCacheFreshCount?`.
+-/
 private def insertCacheEntry (key : SynthInstanceCacheKey) (entry : SynthInstanceCacheEntry)
-    (persist : Bool) : MetaM Unit := do
+    (persist : Bool) (fresh? : Option Nat := none) : MetaM Unit := do
   if persist then
     revivePersistentTier
     -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
     modifyThe Core.State fun s =>
       let entries := s.env.synthCache.insertEntry key entry
-      { s with env := s.env.setSynthCacheWith entries (synthCacheWitnesses s.env) }
+      { s with env := s.env.setSynthCacheWith entries (synthCacheWitnesses s.env)
+                        (fresh?.map (key, ·)) }
   modifyCache fun c => { c with synthInstance := c.synthInstance.insertEntry key entry }
 
 /--
 Returns the entry for `key` whose recorded dependencies hold in the current context, if any, from the
-transient tier or else the persistent one.
+transient tier or else the persistent one. For an entry of a revived persistent tier that was not used
+since (see `Environment.reviveSynthCache`), the second component is the number of fresh names its
+computation consumed, which the caller must replay (see `Environment.synthCacheFreshCount?`); such an
+entry is only returned if that number is known.
 -/
-private def findCachedResult? (key : SynthInstanceCacheKey) : MetaM (Option SynthInstanceCacheEntry) := do
+private def findCachedResult? (key : SynthInstanceCacheKey) :
+    MetaM (Option (SynthInstanceCacheEntry × Option Nat)) := do
   -- unrestricted: compared against the recorded lookups
   let opts ← getOptionsUnrestricted
   let env ← getEnv
@@ -1013,6 +1022,12 @@ private def findCachedResult? (key : SynthInstanceCacheKey) : MetaM (Option Synt
         pure (entry, true)
       else
         return none
+  -- An entry of the current persistent tier was stamped while the tier was current, as a change of
+  -- `trackedGen` starts a new tier; one with an older stamp comes from a revived tier.
+  let replay? ← if persistent && entry.deps.baseTrackedGen != env.trackedGen then
+      let some n := (← getEnv).synthCacheFreshCount? key | return none
+      pure (some n)
+    else pure none
   if entry.deps.baseTrackedGen != env.trackedGen ||
       entry.deps.baseChangeLogPos != env.declChangeLog.size then
     -- Re-stamped, so that later lookups skip the environment checks just done.
@@ -1021,9 +1036,12 @@ private def findCachedResult? (key : SynthInstanceCacheKey) : MetaM (Option Synt
     if persistent then
       modifyThe Core.State fun s =>
         { s with env := s.env.setSynthCache (s.env.synthCache.insertEntry key entry) }
+      -- A recomputation would have stored the entry in both tiers.
+      if replay?.isSome then
+        modifyCache fun c => { c with synthInstance := c.synthInstance.insertEntry key entry }
     else
       modifyCache fun c => { c with synthInstance := c.synthInstance.insertEntry key entry }
-  return entry
+  return some (entry, replay?)
 
 /--
 Auxiliary function for converting a cached `AbstractMVarsResult` returned by `SynthInstance.main` into an `Expr`.
@@ -1185,7 +1203,7 @@ Helper function for caching synthesized type class instances. With a normalized 
 -/
 private def cacheResult (cacheKey rawKey : SynthInstanceCacheKey) (norm? : Option SynthNorm.Context)
     (log : RecordedDeps) (kind : PreprocessKind) (abstResult? : Option AbstractMVarsResult)
-    (result? : Option Expr) : MetaM Unit := do
+    (result? : Option Expr) (fresh? : Option Nat) : MetaM Unit := do
   let value? := cacheValue? kind abstResult? result?
   -- Stored with sorted names and `base` restricted to them, so that equal logs record the same
   -- lookups with the same answers and an entry does not keep the full options alive.
@@ -1211,11 +1229,11 @@ private def cacheResult (cacheKey rawKey : SynthInstanceCacheKey) (norm? : Optio
     -- free variables is not determined by the key and is not stored.
     let value? := value?.map fun r => { r with expr := r.expr.abstract c.idx2fvar }
     unless value?.any (·.expr.hasFVar) do
-      insertCacheEntry cacheKey { deps, result? := value? } (closed value?)
+      insertCacheEntry cacheKey { deps, result? := value? } (closed value?) fresh?
   else
     let persist := kind matches .noMVars && cacheKey.localInsts.isEmpty &&
       !cacheKey.type.hasFVar && closed value?
-    insertCacheEntry cacheKey { deps, result? := value? } persist
+    insertCacheEntry cacheKey { deps, result? := value? } persist fresh?
 
 /--
 Panics with `msg` without throwing, which a `panic!` of type `MetaM Unit` would do.
@@ -1344,13 +1362,15 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
     -- then stored under the raw key as well; see `cacheResult`.
     let entry? ← match norm? with
       | none   => pure rawEntry?
-      | some c => (← findCachedResult? cacheKey).mapM fun entry => do
+      | some c => (← findCachedResult? cacheKey).mapM fun (entry, replay?) => do
         let entry := { entry with result? := entry.result?.map fun r =>
           { r with expr := r.expr.instantiateRev c.idx2fvar } }
         insertCacheEntry rawKey entry (persist := false)
-        return entry
+        return (entry, replay?)
+    -- Fresh names consumed from here on are counted for `Environment.synthCacheFreshCount?`.
+    let ngen0 ← getNGen
     match entry? with
-    | some entry =>
+    | some (entry, replay?) =>
       trace[Meta.synthInstance.cache] "cached: {type}"
       -- The used entry's dependencies become dependencies of the enclosing query, if any.
       if parentRecording then
@@ -1358,13 +1378,23 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       checkHit entry.result?
       let result? ← applyCachedAbstractResult? type entry.result?
       trace[Meta.synthInstance] "result {result?} (cached)"
+      if let some n := replay? then
+        -- The use of a revived entry stands in for the recomputation that would otherwise have run
+        -- here; the name generator is left where that recomputation would have left it (never
+        -- moved back).
+        let ngen ← getNGen
+        if ngen.namePrefix == ngen0.namePrefix && ngen.idx < ngen0.idx + n then
+          setNGen { ngen with idx := ngen0.idx + n }
       return result?
     | none =>
       trace[Meta.synthInstance.cache] "new: {type}"
       let abstResult? ← runSearch
       let result? ← applyAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?}"
+      let ngen ← getNGen
+      let fresh? := if ngen.namePrefix == ngen0.namePrefix then some (ngen.idx - ngen0.idx) else none
       cacheResult cacheKey rawKey norm? ((← getThe Core.State).recordedDeps) kind abstResult? result?
+        fresh?
       return result?
   finally
     -- Restore the enclosing accumulator, merging this query's dependencies into it.

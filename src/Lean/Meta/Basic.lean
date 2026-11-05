@@ -440,37 +440,41 @@ as otherwise a stale entry can be revalidated.
 abbrev SynthInstanceCache :=
   PersistentHashMap SynthInstanceCacheKey (List SynthInstanceCacheEntry)
 
-/--
-A tier of the persistent type class resolution cache set aside when the instances in effect changed;
-see `Environment.reviveSynthCache`.
--/
-private structure ParkedSynthInstanceCache where
-  entries : SynthInstanceCache
-  /-- `Kernel.Environment.extGens` while `entries` were recorded. -/
-  extGens : Array Nat
-  /-- See `PersistentSynthInstanceCache.witnesses`. -/
-  witnesses : Array (Nat × NonScalar)
-
-/-- At most this many tiers are kept parked; see `Environment.reviveSynthCache`. -/
-private def maxParkedSynthCaches : Nat := 4
-
 /-- The value stored in `Environment.synthCacheRaw?`. -/
 private structure PersistentSynthInstanceCache where
   /-- `Environment.trackedGen` that `entries` were recorded at. -/
   gen     : Nat
   entries : SynthInstanceCache
-  /-- `Kernel.Environment.extGens` when the tier was started; constant while `gen` is current. -/
-  extGens : Array Nat := #[]
-  /--
-  For some generation-tracked extensions, by generation index, the state in effect when the tier was
-  started (`ScopedEnvExtension.getState`), held so that its address cannot be reused; see
-  `Environment.reviveSynthCache`.
-  -/
-  witnesses : Array (Nat × NonScalar) := #[]
-  /-- Earlier tiers, most recent first; see `Environment.reviveSynthCache`. -/
-  parked  : List ParkedSynthInstanceCache := []
+  deriving Inhabited
 
-private instance : Inhabited PersistentSynthInstanceCache := ⟨{ gen := 0, entries := {} }⟩
+/--
+For each key of a persistent tier, the number of fresh names consumed by the computation of its
+latest entry; see `Environment.synthCacheFreshCount?`.
+-/
+private abbrev SynthFreshCounts := PersistentHashMap SynthInstanceCacheKey Nat
+
+/--
+Bookkeeping of a persistent tier: `Kernel.Environment.extGens` when the tier was started (constant
+while it is current), the identity witnesses then in effect (see `Environment.reviveSynthCache`;
+held, so that their addresses cannot be reused), and the fresh-name counts.
+-/
+private abbrev SynthTierInfo := Array Nat × Array (Nat × NonScalar) × SynthFreshCounts
+
+/-- A tier set aside when the instances in effect changed; see `Environment.reviveSynthCache`. -/
+private abbrev ParkedSynthTier := SynthInstanceCache × SynthTierInfo
+
+/-- At most this many tiers are kept parked. -/
+private def maxParkedSynthTiers : Nat := 4
+
+/-- The stored tier, if any: the tier, its bookkeeping, and the parked tiers, most recent first. -/
+private def getStoredSynthTier? (env : Environment) :
+    Option (PersistentSynthInstanceCache × SynthTierInfo × List ParkedSynthTier) :=
+  -- safety: only `setStoredSynthTier` stores a value
+  env.synthCacheRaw?.map fun (v : NonScalar) => unsafe unsafeCast v
+
+private def setStoredSynthTier (env : Environment)
+    (t : PersistentSynthInstanceCache × SynthTierInfo × List ParkedSynthTier) : Environment :=
+  { env with synthCacheRaw? := some (unsafe unsafeCast t) }
 
 /--
 Persistent tier of the type class resolution cache, which survives the current command. It holds
@@ -482,62 +486,62 @@ remembers the `Environment.trackedGen` its entries were recorded at, and this fu
 empty cache once the environment's value differs. Such a change invalidates almost every entry
 anyway, as almost every search depends on the instances, and dropping them all avoids keeping the
 invalidated entries in the environment until their query recurs. A change that is later undone
-(e.g. a scope that activates a scoped instance, such as `open Classical in` or the `classical`
-tactic) can bring a dropped tier back; see `Environment.reviveSynthCache`.
+(a scope activating a scoped instance, such as `open Classical in`, the `classical` tactic or
+`by_cases`) can bring a dropped tier back; see `Environment.reviveSynthCache`.
 -/
 def _root_.Lean.Environment.synthCache (env : Environment) : SynthInstanceCache :=
-  match env.synthCacheRaw? with
-  | some v =>
-    -- safety: only `setSynthCache` stores a value
-    let c : PersistentSynthInstanceCache := unsafe unsafeCast v
-    if c.gen == env.trackedGen then c.entries else {}
-  | none   => {}
+  match getStoredSynthTier? env with
+  | some (c, _) => if c.gen == env.trackedGen then c.entries else {}
+  | none        => {}
 
 /-- Whether a persistent tier is stored but not current, so that `Environment.synthCache` is empty. -/
 def _root_.Lean.Environment.isSynthCacheStale (env : Environment) : Bool :=
-  match env.synthCacheRaw? with
-  | some v =>
-    let c : PersistentSynthInstanceCache := unsafe unsafeCast v
-    c.gen != env.trackedGen
-  | none   => false
-
-/-- The stored tier, if any. -/
-private def getPersistentSynthCache? (env : Environment) : Option PersistentSynthInstanceCache :=
-  -- safety: only `setSynthCacheWith` stores a value
-  env.synthCacheRaw?.map fun (v : NonScalar) => unsafe unsafeCast v
-
-private def setPersistentSynthCache (env : Environment) (c : PersistentSynthInstanceCache) :
-    Environment :=
-  { env with synthCacheRaw? := some (unsafe unsafeCast c) }
+  match getStoredSynthTier? env with
+  | some (c, _) => c.gen != env.trackedGen
+  | none        => false
 
 /--
 Replaces the persistent tier of the type class resolution cache; see `Environment.synthCache`.
-`witnesses` are the identity witnesses of the current environment (see
-`Environment.reviveSynthCache`); they are only used when this starts a new tier, which parks the
-stored one.
+`witnesses` are the current identity witnesses (see `Environment.reviveSynthCache`), used when this
+starts a new tier, which parks the stored one. `fresh?` is a key whose latest entry was just computed
+together with the number of fresh names the computation consumed; see `Environment.synthCacheFreshCount?`.
 -/
 def _root_.Lean.Environment.setSynthCacheWith (env : Environment) (c : SynthInstanceCache)
-    (witnesses : Array (Nat × NonScalar)) : Environment :=
-  match getPersistentSynthCache? env with
-  | some old =>
+    (witnesses : Array (Nat × NonScalar)) (fresh? : Option (SynthInstanceCacheKey × Nat) := none) :
+    Environment :=
+  let setFresh (counts : SynthFreshCounts) : SynthFreshCounts := match fresh? with
+    | some (key, n) => counts.insert key n
+    | none          => counts
+  match getStoredSynthTier? env with
+  | some (old, (gens, ws, counts), parked) =>
     if old.gen == env.trackedGen then
-      setPersistentSynthCache env { old with entries := c }
+      setStoredSynthTier env ({ old with entries := c }, (gens, ws, setFresh counts), parked)
     else
-      let parked := if old.witnesses.isEmpty || old.entries.isEmpty then old.parked else
-        { entries := old.entries, extGens := old.extGens, witnesses := old.witnesses } :: old.parked
-      let gens := env.base.private.extGens
-      setPersistentSynthCache env
-        { gen := env.trackedGen, entries := c, extGens := gens, witnesses := witnesses,
-          parked := parked.take maxParkedSynthCaches }
+      let parked := if ws.isEmpty || old.entries.isEmpty then parked else
+        (old.entries, (gens, ws, counts)) :: parked
+      setStoredSynthTier env ({ gen := env.trackedGen, entries := c },
+        (env.base.private.extGens, witnesses, setFresh {}), parked.take maxParkedSynthTiers)
   | none =>
-    let gens := env.base.private.extGens
-    setPersistentSynthCache env
-      { gen := env.trackedGen, entries := c, extGens := gens, witnesses := witnesses }
+    setStoredSynthTier env ({ gen := env.trackedGen, entries := c },
+      (env.base.private.extGens, witnesses, setFresh {}), [])
 
 /-- Replaces the persistent tier of the type class resolution cache; see `Environment.synthCache`. -/
 def _root_.Lean.Environment.setSynthCache (env : Environment) (c : SynthInstanceCache) :
     Environment :=
   env.setSynthCacheWith c #[]
+
+/--
+The number of fresh names (`NameGenerator.idx` steps) consumed by the computation that produced the
+latest entry for `key` in the current persistent tier, if known. A use of an entry brought back by
+`Environment.reviveSynthCache` stands in for a recomputation, and advances the name generator by
+this number so that later fresh names (which end up in compiled code) are the ones a recomputation
+would have left.
+-/
+def _root_.Lean.Environment.synthCacheFreshCount? (env : Environment) (key : SynthInstanceCacheKey) :
+    Option Nat :=
+  match getStoredSynthTier? env with
+  | some (c, (_, _, counts), _) => if c.gen == env.trackedGen then counts.find? key else none
+  | none                        => none
 
 /--
 Whether a parked tier recorded under the generations `gens` and witnesses `ws` describes the same
@@ -556,26 +560,27 @@ Brings back a parked tier of the persistent type class resolution cache whose re
 generation-tracked extensions is the current one (see `sameTrackedState`), when the stored tier is
 not current. The generations its entries recorded are translated to the current ones, which is sound
 as the extensions' states are the very objects the entries observed; the entries' other dependencies
-(options, the declaration change log) are validated as usual on lookup. `witnesses` are the current
-identity witnesses. Returns `env` unchanged if there is nothing to revive.
+(options, the declaration change log) are validated as usual on lookup. The entries keep their
+`baseTrackedGen` stamps, which tells a use of a revived entry from a use of one recorded in the
+current tier (see `Environment.synthCacheFreshCount?`). `witnesses` are the current identity
+witnesses. Returns `env` unchanged if there is nothing to revive.
 -/
 def _root_.Lean.Environment.reviveSynthCache (env : Environment)
     (witnesses : Array (Nat × NonScalar)) : Environment := Id.run do
-  let some c := getPersistentSynthCache? env | return env
+  let some (c, (gens, ws, counts), parked) := getStoredSynthTier? env | return env
   if c.gen == env.trackedGen || witnesses.isEmpty then return env
   let cur := env.base.private.extGens
-  let candidates := if c.witnesses.isEmpty || c.entries.isEmpty then c.parked else
-    { entries := c.entries, extGens := c.extGens, witnesses := c.witnesses } :: c.parked
-  let some i := candidates.findIdx? (fun p => sameTrackedState p.extGens cur p.witnesses witnesses)
+  let candidates : List ParkedSynthTier :=
+    if ws.isEmpty || c.entries.isEmpty then parked else (c.entries, (gens, ws, counts)) :: parked
+  let some i := candidates.findIdx? (fun (_, (gens, ws, _)) => sameTrackedState gens cur ws witnesses)
     | return env
-  let some p := candidates[i]? | return env
-  let translate (gens : Array (Nat × Nat)) : Array (Nat × Nat) := gens.map fun (idx, g) =>
-    if p.extGens[idx]? == some g then (idx, cur[idx]!) else (idx, g)
-  let entries := p.entries.foldl (init := p.entries) fun m key es =>
+  let some (entries, (pgens, _, pcounts)) := candidates[i]? | return env
+  let translate (deps : Array (Nat × Nat)) : Array (Nat × Nat) := deps.map fun (idx, g) =>
+    if pgens[idx]? == some g then (idx, cur[idx]!) else (idx, g)
+  let entries := entries.foldl (init := entries) fun m key es =>
     m.insert key (es.map fun e => { e with deps.extGens := translate e.deps.extGens })
-  setPersistentSynthCache env
-    { gen := env.trackedGen, entries := entries, extGens := cur, witnesses := witnesses,
-      parked := (candidates.eraseIdx i).take maxParkedSynthCaches }
+  setStoredSynthTier env ({ gen := env.trackedGen, entries := entries },
+    (cur, witnesses, pcounts), (candidates.eraseIdx i).take maxParkedSynthTiers)
 
 /--
 The free-variable normalization of a local instance context (see `Lean.Meta.SynthNorm`): every free
