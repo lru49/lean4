@@ -708,23 +708,6 @@ extern "C" LEAN_EXPORT void lean_deferred_free_drain() {
     g_defer_draining = false;
 }
 
-/* Barrier: wait until the release thread has finished every queued batch, then apply this thread's returned
-   decrements (with deferral off for this thread while doing so, so nothing new is queued). Called before memory that
-   objects may point into is released explicitly (`lean_compacted_region_free`: `Environment.freeRegions`,
-   `withImportModules`), where upstream's synchronous release had already finished every free. */
-extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {
-    if (g_defer_mutex == nullptr) return;
-    {
-        std::unique_lock<std::mutex> lock(*g_defer_mutex);
-        if (!g_defer_started) return;
-        while (!g_defer_queue->empty() || g_defer_busy) {
-            if (g_defer_stop.load(std::memory_order_relaxed)) return;
-            g_defer_idle_cv->wait(lock);
-        }
-    }
-    lean_deferred_free_drain();
-}
-
 /* Called by `lean_dec_ref_cold` after `g_defer_min` objects of one cascade. Returns false when the caller must
    continue inline with `todo` unchanged; on true, `todo` holds what the caller must still free itself (the
    owner-only objects of the worklist, usually none). */
@@ -774,7 +757,6 @@ static void initialize_deferred_free() {
 }
 #else
 extern "C" LEAN_EXPORT void lean_deferred_free_drain() {}
-extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {}
 static void initialize_deferred_free() {}
 #endif
 
