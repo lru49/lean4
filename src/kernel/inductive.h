@@ -105,6 +105,7 @@ inline optional<expr> inductive_reduce_rec(environment const & env, expr const &
     if (rec_val.is_k()) {
         major = to_cnstr_when_K(env, rec_val, major, whnf, infer_type, is_def_eq);
     }
+    if (is_nat_lit(major)) DD_INC(DD_MAJ_LIT); else if (is_constructor_app(env, major)) DD_INC(DD_MAJ_CTOR); else DD_INC(DD_MAJ_OTHER);
     if (!is_prop(infer_type(major)))
         major = whnf(major);
     if (is_nat_lit(major))

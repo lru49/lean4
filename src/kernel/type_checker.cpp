@@ -664,6 +664,14 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
             }
             lean_assert(m <= num_args);
             DD_INC(DD_BETA); DD_ADD(DD_BETA_REST, num_args - m);
+            for (unsigned i = 0; i < m; i++) {
+                expr const & a = args[num_args - m + i];
+                DD_INC(DD_SUBST);
+                if (!has_loose_bvar(binding_body(f), i)) {
+                    DD_INC(DD_DROP_ANY);
+                    if ((is_app(a) || is_lambda(a)) && lean_is_exclusive(a.raw())) DD_INC(DD_DROP_FRESH);
+                }
+            }
             {
                 expr const & body = binding_body(f);
                 expr const & h = get_app_fn(body);
