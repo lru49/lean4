@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include <utility>
+#include <algorithm>
 #include <vector>
 #include <limits>
 #include <climits>
@@ -494,8 +495,10 @@ bool type_checker::is_prop(expr const & e) {
 }
 
 /** \brief Apply normalizer extensions to \c e.
-    If `cheap == true`, then we don't perform delta-reduction when reducing major premise. */
-optional<expr> type_checker::reduce_recursor(expr const & e, bool cheap_rec, bool cheap_proj) {
+    If `cheap == true`, then we don't perform delta-reduction when reducing major premise.
+    The reduct is `mk_app(*result, args)`: an iota-reduct is returned as its head with the arguments APPENDED to `args`
+    (forward order), a quotient reduct whole (`args` untouched). */
+optional<expr> type_checker::reduce_recursor(expr const & e, bool cheap_rec, bool cheap_proj, buffer<expr> & args) {
     if (env().is_quot_initialized()) {
         if (optional<expr> r = quot_reduce_rec(e, [&](expr const & e) { return whnf(e); })) {
             return r;
@@ -508,7 +511,7 @@ optional<expr> type_checker::reduce_recursor(expr const & e, bool cheap_rec, boo
                                                 [&](expr const & e) { return is_prop(e); },
                                                 [&](expr const & rec_fn, expr const & rhs, names const & lps) {
                                                     return instantiate_rec_rhs(rec_fn, rhs, lps);
-                                                })) {
+                                                }, args)) {
         return r;
     }
     return none_expr();
@@ -590,6 +593,76 @@ static bool is_let_fvar(local_ctx const & lctx, expr const & e) {
     }
 }
 
+/* True unless no key of `m_whnf_core` has the hash of the application of `f` to `args` (forward order, or
+   reversed if `rev`), i.e. unless looking that application up, were it built, could find an entry or compare
+   anything structurally. The hash of an application node is `lean_uint32_mix_hash` of its function's and
+   argument's hashes (`lean_expr_mk_app_data`), so the spine's hash is computed without allocating it. */
+bool type_checker::fresh_app_may_be_cached(expr const & f, unsigned num_args, expr const * args, bool rev) const {
+    unsigned h = hash(f);
+    if (rev) {
+        for (unsigned i = num_args; i > 0; i--) h = lean_uint32_mix_hash(h, hash(args[i - 1]));
+    } else {
+        for (unsigned i = 0; i < num_args; i++) h = lean_uint32_mix_hash(h, hash(args[i]));
+    }
+    return m_st->m_whnf_core.may_contain_hash(h);
+}
+
+/* `whnf_core` of `mk_rev_app(f, rev_args)` for a lambda `f` (`rev_args` nonempty, consumed): beta-reduces, and while
+   the reduct `t = mk_rev_app(instantiate(body, m, s), rest)` has a substituted lambda `v` as its head
+   (`body = #i b1 ... bk`, the case of every recursor rule's right-hand side applied to its minor premise and of
+   most `match`/`fun` chains), continues with `v` and the instantiated arguments directly instead of building `t`
+   and having `whnf_core_impl(t, .., false)` take it apart again. That call would: hold one recursion-depth level
+   for the rest of the chain, count one heartbeat, look `t` up in `m_whnf_core`, then `whnf_core(v)` (one more
+   heartbeat and a transient depth level) and beta-reduce `v`; all of this is replayed here except the lookup,
+   which is replaced by the hash test `fresh_app_may_be_cached` (when it fails, `t` is built and handed to
+   `whnf_core_impl` as before). The arguments are instantiated through one traversal cache (`instantiate_each`),
+   so every term built is the one the unfused path builds, sharing included. */
+expr type_checker::whnf_core_beta(expr f, buffer<expr> & rev_args, bool cheap_rec, bool cheap_proj) {
+    scope_rec_depth_n depth;
+    buffer<expr> next;
+    while (true) {
+        lean_assert(is_lambda(f) && !rev_args.empty());
+        unsigned m = 1;
+        unsigned num_args = rev_args.size();
+        while (is_lambda(binding_body(f)) && m < num_args) {
+            f = binding_body(f);
+            m++;
+        }
+        expr const & body = binding_body(f);
+        expr const * s = rev_args.data() + (num_args - m);
+        unsigned rest = num_args - m;
+        expr const & h = get_app_fn(body);
+        if (is_bvar(h) && bvar_idx(h).is_small() && bvar_idx(h).get_small_value() < m &&
+            is_lambda(s[bvar_idx(h).get_small_value()])) {
+            expr v = s[bvar_idx(h).get_small_value()];   // = instantiate(h, m, s): offset 0, no lifting
+            buffer<expr> bargs;
+            get_app_args(body, bargs);
+            unsigned k = bargs.size();
+            next.clear();
+            next.append(rest, rev_args.data());            // the reversed remaining arguments come last ...
+            next.resize(rest + k);
+            instantiate_each(k, bargs.data(), m, s, next.data() + rest);
+            std::reverse(next.begin() + rest, next.end());  // ... preceded by the reversed instantiated ones
+            if (next.empty()) {
+                // `t = v` is a lambda: `whnf_core_impl(v, ..)` returns it after one depth level + heartbeat
+                depth.probe();
+                check_system("type checker: whnf", /* do_check_interrupted */ true);
+                return v;
+            }
+            if (fresh_app_may_be_cached(v, next.size(), next.data(), true))
+                return whnf_core_impl(mk_rev_app(v, next.size(), next.data()), cheap_rec, cheap_proj, false);
+            depth.push();                                   // `whnf_core_impl(t, ..)`
+            check_system("type checker: whnf", /* do_check_interrupted */ true);
+            depth.probe();                                  // its `whnf_core(v)`
+            check_system("type checker: whnf", /* do_check_interrupted */ true);
+            f = v;
+            std::swap(rev_args, next);
+            continue;
+        }
+        return whnf_core_impl(mk_rev_app(instantiate(body, m, s), rest, rev_args.data()), cheap_rec, cheap_proj, false);
+    }
+}
+
 /** \brief Weak head normal form core procedure. It does not perform delta reduction nor normalization extensions.
     If `cheap == true`, then we don't perform delta-reduction when reducing major premise of recursors and projections.
     We also do not cache results. */
@@ -652,24 +725,28 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
         expr f0 = get_app_rev_args(e, args);
         expr f = whnf_core(f0, cheap_rec, cheap_proj);
         if (is_lambda(f)) {
-            unsigned m = 1;
-            unsigned num_args = args.size();
-            while (is_lambda(binding_body(f)) && m < num_args) {
-                f = binding_body(f);
-                m++;
-            }
-            lean_assert(m <= num_args);
-            r = whnf_core_impl(mk_rev_app(instantiate(binding_body(f), m, args.data() + (num_args - m)), num_args - m, args.data()),
-                               cheap_rec, cheap_proj, false);
+            r = whnf_core_beta(f, args, cheap_rec, cheap_proj);
         } else if (f == f0) {
-            if (auto r = reduce_recursor(e, cheap_rec, cheap_proj)) {
+            buffer<expr> rargs;
+            if (auto h = reduce_recursor(e, cheap_rec, cheap_proj, rargs)) {
                 if (m_diag) {
                     auto f = get_app_fn(e);
                     if (is_constant(f))
                         m_diag->record_unfold(const_name(f));
                 }
-                /* iota-reduction and quotient reduction rules */
-                return whnf_core_impl(*r, cheap_rec, cheap_proj, false);
+                /* iota-reduction and quotient reduction rules: the reduct is `t = mk_app(*h, rargs)`, and
+                   `whnf_core_impl(t, .., false)` would look `t` up, then (`t`'s head being the rule's lambda) beta-reduce
+                   it. When no cached key can match `t`, that is done without building `t` (see `whnf_core_beta`). */
+                if (is_lambda(*h) && !rargs.empty() && !fresh_app_may_be_cached(*h, rargs.size(), rargs.data(), false)) {
+                    scope_rec_depth_n depth;
+                    depth.push();                                         // `whnf_core_impl(t, ..)`
+                    check_system("type checker: whnf", /* do_check_interrupted */ true);
+                    depth.probe();                                        // its `whnf_core(head)` on the lambda
+                    check_system("type checker: whnf", /* do_check_interrupted */ true);
+                    std::reverse(rargs.begin(), rargs.end());
+                    return whnf_core_beta(*h, rargs, cheap_rec, cheap_proj);
+                }
+                return whnf_core_impl(mk_app(*h, rargs.size(), rargs.data()), cheap_rec, cheap_proj, false);
             } else {
                 return e;
             }

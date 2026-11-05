@@ -50,6 +50,47 @@ expr instantiate(expr const & a, unsigned s, unsigned n, expr const * subst) {
 }
 
 expr instantiate(expr const & e, unsigned n, expr const * s) { return instantiate(e, 0, n, s); }
+
+/* The functors are those of `instantiate(a, 0, n, subst)` above; one `replace_rec_fn` (one cache) is applied to the
+   arguments in order, exactly the calls the traversal of the application spine `h es[0] ... es[num-1]` makes for its
+   argument positions (the spine nodes and the head are visited too there, but their cache entries can never be
+   consulted from inside an argument, which is a proper subterm of them). */
+void instantiate_each(unsigned num, expr const * es, unsigned n, expr const * subst, expr * out) {
+    auto f = [=](expr const & m, unsigned offset) -> optional<expr> {
+        if (is_bvar(m)) {
+            nat const & vidx = bvar_idx(m);
+            if (vidx >= offset) {
+                unsigned h = offset + n;
+                if (h < offset /* overflow, h is bigger than any vidx */ || vidx < h) {
+                    return some_expr(lift_loose_bvars(subst[vidx.get_small_value() - offset], offset));
+                } else {
+                    return some_expr(mk_bvar(vidx - nat(n)));
+                }
+            }
+        }
+        return none_expr();
+    };
+    auto skip = [=](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); };
+    auto pre = [=](expr const & m, unsigned offset) -> optional<expr> {
+        if (is_bvar(m)) {
+            nat const & vidx = bvar_idx(m);
+            unsigned h = offset + n;
+            if (vidx >= offset && (h < offset || vidx < h)) {
+                expr const & v = subst[vidx.get_small_value() - offset];
+                if (offset == 0 || !has_loose_bvars(v))
+                    return some_expr(v);
+            }
+        }
+        return none_expr();
+    };
+    if (n == 0) {
+        for (unsigned i = 0; i < num; i++) out[i] = es[i];
+        return;
+    }
+    replace_rec_fn<decltype(f), decltype(skip), decltype(pre)> fn(f, skip, true, pre);
+    for (unsigned i = 0; i < num; i++)
+        out[i] = fn(es[i]);
+}
 expr instantiate(expr const & e, unsigned i, expr const & s) { return instantiate(e, i, 1, &s); }
 expr instantiate(expr const & e, expr const & s) { return instantiate(e, 0, s); }
 
