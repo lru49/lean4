@@ -44,6 +44,14 @@ public:
            keyed by `mk_app(rec_fn, rule_rhs)` (`rec_fn` = the recursor constant with its universe levels). A pure
            function of the rule object and the levels, as `m_unfold` is for definitions (see `instantiate_rec_rhs`). */
         expr_flat_map<expr>       m_rec_rhs;
+        /* The checker configuration the entries of `m_infer_type[0]` were computed under: whether universe parameters were
+           checked and against which list (`check` vs `check_ignore_undefined_universes`), and the definition safety. The
+           check-mode entries are a function of the environment, of this state's fvars and of exactly this configuration
+           (see `retarget`), so they are kept across pooled declarations while it is the same and dropped when it changes. */
+        bool                      m_check_cfg_set = false;
+        bool                      m_check_has_lparams = false;
+        names                     m_check_lparams;
+        definition_safety         m_check_safety = definition_safety::safe;
         friend type_checker;
     public:
         state(environment const & env);
@@ -107,6 +115,7 @@ private:
     expr infer_proj(expr const & e, bool infer_only);
     expr infer_let(expr const & e, bool infer_only);
     expr infer_type_core(expr const & e, bool infer_only);
+    void use_check_config(names const * lps);
     expr infer_type(expr const & e);
 
     enum class reduction_status { Continue, DefUnknown, DefEqual, DefDiff };
