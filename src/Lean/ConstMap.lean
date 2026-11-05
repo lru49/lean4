@@ -74,7 +74,9 @@ public def find?' (m : ConstMap) (n : Name) : Option ConstantInfo :=
   m.map₁.findConstCached? n <|> m.map₂.find? n
 
 public def contains (m : ConstMap) (n : Name) : Bool :=
-  m.map₂.contains n || (m.map₁.findConstCached? n).isSome
+  -- the module-index variant of the cached lookup returns a scalar: a hit takes no reference and
+  -- allocates no `Option`
+  m.map₂.contains n || (m.map₁.findConstModIdxCached? n).isSome
 
 public def insert (m : ConstMap) (n : Name) (v : ConstantInfo) : ConstMap :=
   { m with map₂ := m.map₂.insert n v }
