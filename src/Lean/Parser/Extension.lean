@@ -51,7 +51,9 @@ private def addParserCategoryCore (categories : ParserCategories) (catName : Nam
 /-- All builtin parser categories are Pratt's parsers -/
 
 private def addBuiltinParserCategory (catName declName : Name) (behavior : LeadingIdentBehavior) : IO Unit := do
-  let categories ← builtinParserCategoriesRef.get
+  -- taken out of the ref, as in `updateBuiltinTokens`, so that the update below is not a copy of a
+  -- shared map (an error here aborts the builtin initialization anyway)
+  let categories ← builtinParserCategoriesRef.swap {}
   let categories ← IO.ofExcept $ addParserCategoryCore categories catName { declName, behavior }
   builtinParserCategoriesRef.set categories
 
@@ -479,7 +481,10 @@ def evalInsideQuot (declName : Name) : Parser → Parser := withFn fun f c s =>
 
 def addBuiltinParser (catName : Name) (declName : Name) (leading : Bool) (p : Parser) (prio : Nat) : IO Unit := do
   let p := evalInsideQuot declName p
-  let categories ← builtinParserCategoriesRef.get
+  -- taken out of the ref, as in `updateBuiltinTokens`, so that `addParser` updates the categories
+  -- map and the category's parsing tables in place instead of copying the paths of a shared map (an
+  -- error here aborts the builtin initialization anyway)
+  let categories ← builtinParserCategoriesRef.swap {}
   let categories ← IO.ofExcept $ addParser categories catName declName leading p prio
   builtinParserCategoriesRef.set categories
   builtinSyntaxNodeKindSetRef.modify p.info.collectKinds
