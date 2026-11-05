@@ -50,6 +50,10 @@ inline expr to_cnstr_when_K(environment const & env, recursor_val const & rval, 
 optional<recursor_rule> get_rec_rule_for(recursor_val const & rec_val, expr const & major);
 
 expr nat_lit_to_constructor(expr const & e);
+/* True iff `e` is an application of (or is) a constructor whose head is not `Nat.succ`: the kernel's `whnf` returns such a
+   term unchanged (`whnf_core` finds no beta/iota/projection redex at a constructor head, constructors have no value to
+   unfold, and `reduce_nat` only rewrites `Nat.succ _` among constructor applications). */
+bool is_whnf_constructor_app(environment const & env, expr const & e);
 expr string_lit_to_constructor(expr const & e);
 
 /* Auxiliary method for \c to_cnstr_when_structure, convert `e` into `mk e.1 ... e.n` */
@@ -105,7 +109,10 @@ inline optional<expr> inductive_reduce_rec(environment const & env, expr const &
     if (rec_val.is_k()) {
         major = to_cnstr_when_K(env, rec_val, major, whnf, infer_type, is_def_eq);
     }
-    if (!is_prop(infer_type(major)))
+    /* `whnf` is the identity on a constructor application (other than `Nat.succ _`), so neither the proof-irrelevance
+       test (an `infer_type` of a term that is usually fresh: a reduct of the previous step) nor the `whnf` call can
+       change `major` then. */
+    if (!is_whnf_constructor_app(env, major) && !is_prop(infer_type(major)))
         major = whnf(major);
     if (is_nat_lit(major))
         major = nat_lit_to_constructor(major);
