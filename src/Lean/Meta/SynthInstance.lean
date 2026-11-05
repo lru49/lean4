@@ -1334,8 +1334,9 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
         | none => "absent"
         | some es => String.intercalate "," <| es.map fun e =>
             s!"o{validOptionAccesses opts e.deps}x{e.deps.extGens.all (fun (idx, gen) => EnvExtension.getGenAt env idx == gen)}l{env.checkDeclChangeLog e.deps.baseChangeLogPos e.deps.baseConstGen}"
+      let fm ← getFileMap
       let line := match (← getRef).getPos? with
-        | some p => toString ((← getFileMap).toPosition p).line
+        | some p => toString (fm.toPosition p).line
         | none => "?"
       let kindS := match kind with | .noMVars => "nomv" | .mvarsNoOutputParams => "mvno" | .mvarsOutputParams => "mvout"
       let txc := (← get).cache.synthInstance
