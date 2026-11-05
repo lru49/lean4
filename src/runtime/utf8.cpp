@@ -5,6 +5,8 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include "runtime/optional.h"
 #include "runtime/utf8.h"
@@ -29,10 +31,25 @@ unsigned get_utf8_size(unsigned char c) {
         return 1; /* invalid */
 }
 
+/* True iff the 8 bytes at `p` are all ASCII (high bit clear). Unaligned load via memcpy. */
+static inline bool utf8_all_ascii8(char const * p) {
+    uint64_t w;
+    memcpy(&w, p, sizeof(w));
+    return (w & UINT64_C(0x8080808080808080)) == 0;
+}
+
 extern "C" LEAN_EXPORT size_t lean_utf8_n_strlen(char const * str, size_t sz) {
     size_t r = 0;
     size_t i = 0;
     while (i < sz) {
+        /* ASCII fast path: an all-ASCII 8-byte block is 8 one-byte characters, exactly what 8 steps of the
+           per-character loop below would count (`get_utf8_size` is 1 for every byte < 0x80), so the result is
+           unchanged for every input, valid UTF-8 or not. */
+        while (i + 8 <= sz && utf8_all_ascii8(str + i)) {
+            r += 8;
+            i += 8;
+        }
+        if (i >= sz) break;
         unsigned d = get_utf8_size(str[i]);
         r++;
         i += d;
