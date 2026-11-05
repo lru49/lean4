@@ -2479,6 +2479,14 @@ where
   start and after `setImportedEntries` has supplied the entries of extensions registered by
   `runInitAttrs` (which register their names at the same time). -/
   spawnTasks (env : Environment) (start : Nat) (tasks : Array (Option ExtTask)) : IO (Array (Option ExtTask)) := do
+    -- lean-perf (L02 crash fix v2 A3): the environment the tasks capture must already be persistent: the states
+    -- they compute may reference it (every interpreter stub closure created by an `evalConst` on a task captures
+    -- the environment it was evaluated against), and the tasks' `markPersistentSeq` of those states would
+    -- otherwise write `rc := 0` into a live-counted environment that the import thread and the other tasks are
+    -- reference-counting at that moment. The first batch's environment is persistent already ("markPersistent 1");
+    -- the batch spawned after `runInitAttrs` captures the environment built since, so it is marked here, on the
+    -- import thread, whose own objects are the only non-persistent ones it reaches.
+    let env ← unsafe Runtime.markPersistent env
     let pExtDescrs ← persistentEnvExtensionsRef.get
     let parExts ← parallelImportExtsRef.get
     let mut tasks := tasks
