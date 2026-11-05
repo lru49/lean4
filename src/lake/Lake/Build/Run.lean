@@ -363,6 +363,14 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  chainPool? := ← id do
+    -- lean-perf (chain batching): on by default (2 servers); `LAKE_CHAIN_SERVERS=0` disables
+    let n := (← IO.getEnv "LAKE_CHAIN_SERVERS").bind (·.toNat?) |>.getD 2
+    if n == 0 then return none
+    let dir := ws.root.buildDir / "chain-server"
+    match (← (ChainPool.start ws.lakeEnv.lean.lean ws.leanPath.toString n dir).toBaseIO) with
+    | .ok pool => return some pool
+    | .error _ => return none
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
