@@ -150,7 +150,14 @@ class replace_rec_fn {
             case expr_kind::Const: case expr_kind::Sort:
             case expr_kind::BVar:  case expr_kind::Lit:
             case expr_kind::MVar:  case expr_kind::FVar:
-                return save_result(e, offset, e, shared);
+                /* lean-perf (CV leafnocache): a leaf that `f` leaves alone is its own result, so it is not inserted
+                   into the cache: a later visit misses, calls `f` again (pure, so it again returns none) and returns
+                   the same object `e`, which is exactly what the cache would have returned. Typical case: bound
+                   variables below the substituted range (`#0` inside a lambda body) in `instantiate` / `lift` /
+                   `lower`, and free variables outside the abstracted set in `abstract`; persistent (.olean) terms
+                   have no reliable reference count, so all of their nodes count as shared and every such leaf
+                   used to cost an insertion, table growth and a reference-count release at teardown. */
+                return e;
             case expr_kind::MData: {
                 expr new_e = apply(mdata_expr(e), offset);
                 return save_result(e, offset, update_mdata(e, new_e), shared);
