@@ -332,12 +332,33 @@ static inline lean_object * pop_back(lean_object * & todo) {
     return r;
 }
 
+/* Prefetching in the deletion cascade (LEAN_DEL_PREFETCH: 0 off, 1 = the fields of the object being
+   deleted, 2 = also the fields of every object queued for deletion; default 2). Freeing a large
+   graph is bound by the cache misses on the children's reference counts: each `dec` loads a
+   child's header, and a mispredicted rc branch serializes the misses. Issuing the loads ahead
+   (for an object queued with rc 1, when its own header is already in cache) lets the misses of a
+   whole level overlap. Prefetches have no semantic effect. */
+static int g_del_prefetch = [] {
+    char const * s = std::getenv("LEAN_DEL_PREFETCH");
+    return s ? atoi(s) : 2;
+}();
+
+static inline void prefetch_fields(lean_object * o) {
+    if (lean_ptr_tag(o) <= LeanMaxCtorTag) {
+        lean_object ** it  = lean_ctor_obj_cptr(o);
+        lean_object ** end = it + lean_ctor_num_objs(o);
+        for (; it != end; ++it)
+            if (!lean_is_scalar(*it)) __builtin_prefetch(*it, 1, 3);
+    }
+}
+
 static inline void dec(lean_object * o, lean_object* & todo) {
     if (lean_is_scalar(o))
         return;
     if (LEAN_LIKELY(lean_internal_get_rc(o) > 1)) {
         lean_internal_sub_rc(o, 1);
     } else if (lean_internal_get_rc(o) == 1) {
+        if (g_del_prefetch >= 2) prefetch_fields(o);
         push_back(todo, o);
     } else if (lean_is_never_freed(o)) {
         return;
@@ -422,6 +443,9 @@ static object * lean_del_core(object * o, object * todo) {
     if (LEAN_LIKELY(tag <= LeanMaxCtorTag)) {
         object ** it  = lean_ctor_obj_cptr(o);
         object ** end = it + lean_ctor_num_objs(o);
+        if (g_del_prefetch >= 1)
+            for (object ** p = it; p != end; ++p)
+                if (!lean_is_scalar(*p)) __builtin_prefetch(*p, 1, 3);
         for (; it != end; ++it) dec(*it, todo);
         lean_free_small_object(o);
         return todo;
