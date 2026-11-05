@@ -13,6 +13,7 @@ Author: Leonardo de Moura
 #include <memory>
 #include <mutex>
 #include "runtime/interrupt.h"
+#include "runtime/alloc.h"
 #include "runtime/sstream.h"
 #include "runtime/flet.h"
 #include "util/lbool.h"
@@ -742,10 +743,24 @@ optional<expr> type_checker::unfold_definition(expr const & e) {
 expr mk_bool_true();
 expr mk_bool_false();
 
-static inline bool is_nat_lit_ext(expr const & e) { return e == *g_nat_zero || is_nat_lit(e); }
+/* `e == c` for a universe-free constant `c` (the `g_nat_*` / `g_string_mk` globals of this file), without
+   constructing an `expr_eq_fn` (whose pointer-pair cache zero-fills 256 bytes per comparison). Structural
+   equality of constants is name equality plus equality of the universe lists, and `c` has none, so this is
+   exactly `e == c`; the steps mirror `expr_eq_fn::apply` at the root (pointer equality, hash, kind, then one
+   heartbeat before comparing the constants' contents), so the heartbeat count is unchanged too.
+   `reduce_nat` runs these comparisons after every `whnf_core` step of `whnf` and of the lazy delta loop
+   (up to 15 per call), mostly on heads that are not `Nat` operations. */
+static inline bool is_const_eq(expr const & e, expr const & c) {
+    lean_assert(is_constant(c) && is_nil(const_levels(c)));
+    if (is_eqp(e, c)) return true;
+    if (hash(e) != hash(c) || !is_constant(e)) return false;
+    add_heartbeats(1);
+    return const_name(e) == const_name(c) && is_nil(const_levels(e));
+}
+static inline bool is_nat_lit_ext(expr const & e) { return is_nat_lit(e) || is_const_eq(e, *g_nat_zero); }
 static inline nat get_nat_val(expr const & e) {
     lean_assert(is_nat_lit_ext(e));
-    if (e == *g_nat_zero) return nat((unsigned)0);
+    if (!is_nat_lit(e)) return nat((unsigned)0);
     return lit_value(e).get_nat();
 }
 
@@ -811,7 +826,7 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
     unsigned nargs = get_app_num_args(e);
     if (nargs == 1) {
         expr const & f = app_fn(e);
-        if (f == *g_nat_succ) {
+        if (is_const_eq(f, *g_nat_succ)) {
             expr arg = whnf(app_arg(e));
             if (!is_nat_lit_ext(arg)) return none_expr();
             nat v = get_nat_val(arg);
@@ -822,20 +837,20 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
     } else if (nargs == 2) {
         expr const & f = app_fn(app_fn(e));
         if (!is_constant(f)) return none_expr();
-        if (f == *g_nat_add) return reduce_bin_nat_op(nat_add, e, /* check_size */ true);
-        if (f == *g_nat_sub) return reduce_bin_nat_op(nat_sub, e, /* check_size */ true);
-        if (f == *g_nat_mul) return reduce_bin_nat_op(nat_mul, e, /* check_size */ true);
-        if (f == *g_nat_pow) return reduce_pow(e);
-        if (f == *g_nat_gcd) return reduce_bin_nat_op(nat_gcd, e);
-        if (f == *g_nat_mod) return reduce_bin_nat_op(nat_mod, e);
-        if (f == *g_nat_div) return reduce_bin_nat_op(nat_div, e);
-        if (f == *g_nat_beq) return reduce_bin_nat_pred(nat_eq, e);
-        if (f == *g_nat_ble) return reduce_bin_nat_pred(nat_le, e);
-        if (f == *g_nat_land) return reduce_bin_nat_op(nat_land, e);
-        if (f == *g_nat_lor)  return reduce_bin_nat_op(nat_lor, e);
-        if (f == *g_nat_xor)  return reduce_bin_nat_op(nat_lxor, e);
-        if (f == *g_nat_shiftLeft) return reduce_shiftLeft(e);
-        if (f == *g_nat_shiftRight) return reduce_bin_nat_op(lean_nat_shiftr, e);
+        if (is_const_eq(f, *g_nat_add)) return reduce_bin_nat_op(nat_add, e, /* check_size */ true);
+        if (is_const_eq(f, *g_nat_sub)) return reduce_bin_nat_op(nat_sub, e, /* check_size */ true);
+        if (is_const_eq(f, *g_nat_mul)) return reduce_bin_nat_op(nat_mul, e, /* check_size */ true);
+        if (is_const_eq(f, *g_nat_pow)) return reduce_pow(e);
+        if (is_const_eq(f, *g_nat_gcd)) return reduce_bin_nat_op(nat_gcd, e);
+        if (is_const_eq(f, *g_nat_mod)) return reduce_bin_nat_op(nat_mod, e);
+        if (is_const_eq(f, *g_nat_div)) return reduce_bin_nat_op(nat_div, e);
+        if (is_const_eq(f, *g_nat_beq)) return reduce_bin_nat_pred(nat_eq, e);
+        if (is_const_eq(f, *g_nat_ble)) return reduce_bin_nat_pred(nat_le, e);
+        if (is_const_eq(f, *g_nat_land)) return reduce_bin_nat_op(nat_land, e);
+        if (is_const_eq(f, *g_nat_lor))  return reduce_bin_nat_op(nat_lor, e);
+        if (is_const_eq(f, *g_nat_xor))  return reduce_bin_nat_op(nat_lxor, e);
+        if (is_const_eq(f, *g_nat_shiftLeft)) return reduce_shiftLeft(e);
+        if (is_const_eq(f, *g_nat_shiftRight)) return reduce_bin_nat_op(lean_nat_shiftr, e);
     }
     return none_expr();
 }
@@ -1179,7 +1194,7 @@ auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n) -> reductio
 }
 
 inline bool is_nat_zero(expr const & t) {
-    return t == *g_nat_zero || (is_nat_lit(t) && lit_value(t).is_zero());
+    return is_nat_lit(t) ? lit_value(t).is_zero() : is_const_eq(t, *g_nat_zero);
 }
 
 inline optional<expr> is_nat_succ(expr const & t) {
@@ -1190,7 +1205,7 @@ inline optional<expr> is_nat_succ(expr const & t) {
         }
     }
 
-    if (get_app_fn(t) == *g_nat_succ && get_app_num_args(t) == 1) {
+    if (is_app(t) && is_const_eq(app_fn(t), *g_nat_succ)) {
         return some_expr(app_arg(t));
     }
     return none_expr();
@@ -1260,7 +1275,7 @@ bool type_checker::lazy_delta_proj_reduction(expr & t_n, expr & s_n, name const 
 static expr * g_string_mk = nullptr;
 
 lbool type_checker::try_string_lit_expansion_core(expr const & t, expr const & s) {
-    if (is_string_lit(t) && is_app(s) && app_fn(s) == *g_string_mk) {
+    if (is_string_lit(t) && is_app(s) && is_const_eq(app_fn(s), *g_string_mk)) {
         return to_lbool(is_def_eq_core(whnf(string_lit_to_constructor(t)), s));
     }
     return l_undef;
