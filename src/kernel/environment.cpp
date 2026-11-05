@@ -148,11 +148,22 @@ environment environment::add(constant_info const & info) const {
     return environment(lean_environment_add(to_obj_arg(), info.to_obj_arg()));
 }
 
+/* Checked `add_*` below borrow their checker state from the kernel state pool (type_checker::pooled_state) when no
+   kernel diagnostics are collected, and return it after the check succeeded, keyed by the environment checked against
+   and by the one produced. Unsafe declarations and mutual blocks keep fresh states: their checks run against
+   environments that already contain the block, and keeping the pooled states' contents to safe checks keeps the
+   soundness argument in type_checker.h short. */
 environment environment::add_axiom(declaration const & d, bool check) const {
     scoped_diagnostics diag(*this, check);
     axiom_val const & v = d.to_axiom_val();
-    if (check)
-        check_constant_val(*this, v.to_constant_val(), diag.get(), !d.is_unsafe());
+    if (check) {
+        type_checker::pooled_state st(*this, diag.get() == nullptr && !d.is_unsafe());
+        type_checker checker(st.get(), diag.get(), d.is_unsafe() ? definition_safety::unsafe : definition_safety::safe);
+        check_constant_val(*this, v.to_constant_val(), checker);
+        environment new_env = add(constant_info(d));
+        if (!d.is_unsafe()) st.commit(*this, new_env);
+        return diag.update(new_env);
+    }
     return diag.update(add(constant_info(d)));
 }
 
@@ -177,12 +188,16 @@ environment environment::add_definition(declaration const & d, bool check) const
         return diag.update(new_env);
     } else {
         if (check) {
-            type_checker checker(*this, diag.get());
+            type_checker::pooled_state st(*this, diag.get() == nullptr);
+            type_checker checker(st.get(), diag.get());
             check_constant_val(*this, v.to_constant_val(), checker);
             check_no_metavar_no_fvar(*this, v.get_name(), v.get_value());
             expr val_type = checker.check(v.get_value(), v.get_lparams());
             if (!checker.is_def_eq(val_type, v.get_type()))
                 throw definition_type_mismatch_exception(*this, d, val_type);
+            environment new_env = add(constant_info(d));
+            st.commit(*this, new_env);
+            return diag.update(new_env);
         }
         return diag.update(add(constant_info(d)));
     }
@@ -192,7 +207,8 @@ environment environment::add_theorem(declaration const & d, bool check) const {
     scoped_diagnostics diag(*this, check);
     theorem_val const & v = d.to_theorem_val();
     if (check) {
-        type_checker checker(*this, diag.get());
+        type_checker::pooled_state st(*this, diag.get() == nullptr);
+        type_checker checker(st.get(), diag.get());
         sharecommon_persistent_fn share;
         expr val(share(v.get_value().raw()));
         expr type(share(v.get_type().raw()));
@@ -203,6 +219,9 @@ environment environment::add_theorem(declaration const & d, bool check) const {
         expr val_type = checker.check(val, v.get_lparams());
         if (!checker.is_def_eq(val_type, type))
             throw definition_type_mismatch_exception(*this, d, val_type);
+        environment new_env = add(constant_info(d));
+        st.commit(*this, new_env);
+        return diag.update(new_env);
     }
     return diag.update(add(constant_info(d)));
 }
@@ -211,12 +230,16 @@ environment environment::add_opaque(declaration const & d, bool check) const {
     scoped_diagnostics diag(*this, check);
     opaque_val const & v = d.to_opaque_val();
     if (check) {
-        type_checker checker(*this, diag.get());
+        type_checker::pooled_state st(*this, diag.get() == nullptr);
+        type_checker checker(st.get(), diag.get());
         check_constant_val(*this, v.to_constant_val(), checker);
         check_no_metavar_no_fvar(*this, v.get_name(), v.get_value());
         expr val_type = checker.check(v.get_value(), v.get_lparams());
         if (!checker.is_def_eq(val_type, v.get_type()))
             throw definition_type_mismatch_exception(*this, d, val_type);
+        environment new_env = add(constant_info(d));
+        st.commit(*this, new_env);
+        return diag.update(new_env);
     }
     return diag.update(add(constant_info(d)));
 }
