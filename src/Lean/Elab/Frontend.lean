@@ -266,7 +266,42 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
-def runFrontend
+/-- The options `runFrontend` elaborates with, before the setup file's options are merged in. -/
+def frontendOpts (opts : Options) (fullSnapshots : Bool := false) : Options :=
+  -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
+  -- except when full-snapshotting so that enough information for resumption is available
+  let opts := Lean.internal.cmdlineSnapshots.setIfNotSet opts !fullSnapshots
+  -- default to async elaboration; see also `Elab.async` docs
+  Elab.async.setIfNotSet opts true
+
+/-- The `setupImports` result of `runFrontend` (without loading the setup's dynlibs). `opts` are
+the `frontendOpts`. -/
+def frontendSetupImports (stx : HeaderSyntax) (opts : Options) (mainModuleName : Name)
+    (trustLevel : UInt32) (plugins : Array Plugin) (setup? : Option ModuleSetup) :
+    Language.Lean.SetupImportsResult :=
+  if let some setup := setup? then {
+    trustLevel
+    package? := setup.package?
+    mainModuleName := setup.name
+    isModule := strictOr setup.isModule stx.isModule
+    imports := setup.imports?.getD stx.imports
+    plugins := plugins ++ setup.plugins
+    importArts := setup.importArts
+    -- override cmdline options with setup options
+    opts := opts.mergeBy (fun _ _ hOpt => hOpt) setup.options.toOptions
+  } else {
+    imports := stx.imports
+    isModule := stx.isModule
+    mainModuleName, opts, trustLevel, plugins
+  }
+
+/--
+`runFrontend` with an optional header environment: with `heldEnv? := some env`, `env` is used as
+the result of importing the file's header instead of importing it (lean-perf chain batching: `env`
+is what `Lean.importModulesExtend` computed in a `lean --chain-server` for exactly this header,
+setup and options; see `Language.Lean.processHeaderWithEnv`).
+-/
+def runFrontendCore
     (input : String)
     (opts : Options)
     (fileName : String)
@@ -282,35 +317,20 @@ def runFrontend
     (incrSaveFileName? : Option System.FilePath := none)
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
+    (heldEnv? : Option Environment := none)
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
   let inputCtx := Parser.mkInputContext input fileName
-  -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
-  -- except when full-snapshotting so that enough information for resumption is available
-  let opts := Lean.internal.cmdlineSnapshots.setIfNotSet opts incrSaveFileName?.isNone
-  -- default to async elaboration; see also `Elab.async` docs
-  let opts := Elab.async.setIfNotSet opts true
+  let opts := frontendOpts opts (fullSnapshots := incrSaveFileName?.isSome)
   let ctx := { inputCtx with }
   let setup stx := do
     if let some setup := setup? then
       liftM <| setup.dynlibs.forM Lean.loadDynlib
-      return .ok {
-        trustLevel
-        package? := setup.package?
-        mainModuleName := setup.name
-        isModule := strictOr setup.isModule stx.isModule
-        imports := setup.imports?.getD stx.imports
-        plugins := plugins ++ setup.plugins
-        importArts := setup.importArts
-        -- override cmdline options with setup options
-        opts := opts.mergeBy (fun _ _ hOpt => hOpt) setup.options.toOptions
-      }
-    else
-      return .ok {
-        imports := stx.imports
-        isModule := stx.isModule
-        mainModuleName, opts, trustLevel, plugins
-      }
+    let res := frontendSetupImports stx opts mainModuleName trustLevel plugins setup?
+    if let some env := heldEnv? then
+      let (origStx, parserState, _) ← Parser.parseHeader inputCtx
+      return .error (← Language.Lean.processHeaderWithEnv inputCtx stx origStx parserState res env)
+    return .ok res
   let old? ← incrLoadFileName?.mapM fun incrFile => do
     let incr ← unsafe loadIncrSnapshot incrFile
     -- A loaded snapshot may have been saved from a different file (e.g. via `--incr-header-save`
@@ -423,5 +443,26 @@ def runFrontend
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps
   return some env
+
+def runFrontend
+    (input : String)
+    (opts : Options)
+    (fileName : String)
+    (mainModuleName : Name)
+    (trustLevel : UInt32 := 0)
+    (oleanFileName? : Option System.FilePath := none)
+    (ileanFileName? : Option System.FilePath := none)
+    (jsonOutput : Bool := false)
+    (errorOnKinds : Array Name := #[])
+    (plugins : Array Plugin := #[])
+    (printStats : Bool := false)
+    (setup? : Option ModuleSetup := none)
+    (incrSaveFileName? : Option System.FilePath := none)
+    (incrLoadFileName? : Option System.FilePath := none)
+    (incrHeaderSaveFileName? : Option System.FilePath := none)
+    : IO (Option Environment) :=
+  runFrontendCore input opts fileName mainModuleName trustLevel oleanFileName? ileanFileName?
+    jsonOutput errorOnKinds plugins printStats setup? incrSaveFileName? incrLoadFileName?
+    incrHeaderSaveFileName?
 
 end Lean.Elab
