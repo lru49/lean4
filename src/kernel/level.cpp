@@ -242,16 +242,27 @@ level replace_level_fn::apply(level const & l) {
     lean_unreachable(); // LCOV_EXCL_LINE
 }
 
+/* Direct recursion instead of `for_each(l, lambda)` (a `std::function` per call): `type_checker::check_level`
+   runs this on every universe argument of every constant and sort the kernel checks. Same pre-order,
+   left-to-right search, so the same (first) undefined parameter is reported. */
 optional<name> get_undef_param(level const & l, names const & ps) {
-    optional<name> r;
-    for_each(l, [&](level const & l) {
-            if (!has_param(l) || r)
-                return false;
-            if (is_param(l) && std::find(ps.begin(), ps.end(), param_id(l)) == ps.end())
-                r = param_id(l);
-            return true;
-        });
-    return r;
+    if (!has_param(l))
+        return optional<name>();
+    switch (kind(l)) {
+    case level_kind::Param:
+        if (std::find(ps.begin(), ps.end(), param_id(l)) == ps.end())
+            return optional<name>(param_id(l));
+        return optional<name>();
+    case level_kind::Succ:
+        return get_undef_param(succ_of(l), ps);
+    case level_kind::Max: case level_kind::IMax:
+        if (optional<name> r = get_undef_param(level_lhs(l), ps))
+            return r;
+        return get_undef_param(level_rhs(l), ps);
+    case level_kind::Zero: case level_kind::MVar:
+        return optional<name>();
+    }
+    lean_unreachable(); // LCOV_EXCL_LINE
 }
 
 level update_succ(level const & l, level const & new_arg) {
