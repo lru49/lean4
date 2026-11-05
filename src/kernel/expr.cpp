@@ -156,7 +156,7 @@ unsigned long long g_dd_cnt[DD_N];
 thread_local int g_dd_in_wc = 0;
 static const char * g_dd_names[DD_N] = {"wc_app_work","lookup_fresh","hit_fresh","lookup_all","hit_all","beta","beta_rest_nodes",
   "beta_fusable","beta_fuse_saved_nodes","iota","iota_spine_nodes","iota_rhs_fusable","natlit_ctor","mkapp_in_wc","mkapp_all",
-  "upd_new_in_wc","upd_new_all","reapply_nodes","let","keq_ptr","keq_struct","keq_miss","iota_then_beta_head_lambda","whnf_calls","major_lit","major_ctor","major_other","beta_unused_subst","beta_unused_subst_fresh_app","beta_subst"};
+  "upd_new_in_wc","upd_new_all","reapply_nodes","let","keq_ptr","keq_struct","keq_miss","iota_then_beta_head_lambda","whnf_calls","major_lit","major_ctor","major_other","beta_unused_subst","beta_unused_subst_fresh_app","beta_subst","k_iota","k_major_ctor","k_major_replaced"};
 void dd_dump() {
     if (!getenv("LEAN_DD_STATS")) return;
     char fn[256]; snprintf(fn, sizeof(fn), "%s.%d", getenv("LEAN_DD_STATS"), (int)getpid());

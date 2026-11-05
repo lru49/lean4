@@ -103,7 +103,10 @@ inline optional<expr> inductive_reduce_rec(environment const & env, expr const &
     if (major_idx >= rec_args.size()) return none_expr(); // major premise is missing
     expr major     = rec_args[major_idx];
     if (rec_val.is_k()) {
+        DD_INC(DD_K); if (is_constructor_app(env, major)) DD_INC(DD_K_CTOR);
+        expr m0 = major;
         major = to_cnstr_when_K(env, rec_val, major, whnf, infer_type, is_def_eq);
+        if (!is_eqp(m0, major)) DD_INC(DD_K_CHANGED);
     }
     if (is_nat_lit(major)) DD_INC(DD_MAJ_LIT); else if (is_constructor_app(env, major)) DD_INC(DD_MAJ_CTOR); else DD_INC(DD_MAJ_OTHER);
     if (!is_prop(infer_type(major)))
