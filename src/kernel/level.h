@@ -116,10 +116,22 @@ unsigned get_depth(level const & l);
     1) l is zero OR
     2) l = succ(l') and l' is explicit */
 bool is_explicit(level const & l);
+/* lean-perf (CV levelinst): the computed `Level.data` field (`Level.mkData`: hash in bits 0-31, `hasMVar` bit 32,
+   `hasParam` bit 33, depth from bit 40) is read in place, as `get_data` does for `expr`, instead of calling the exported
+   Lean accessor with an owned argument (a reference-count increment and decrement per call, atomic for shared terms).
+   A boxed scalar (not produced by the computed-field constructors) takes the old path. */
+bool has_mvar_core(level const & l);
+bool has_param_core(level const & l);
 /** \brief Return true iff \c l contains placeholder (aka meta parameters). */
-bool has_mvar(level const & l);
+inline bool has_mvar(level const & l) {
+    if (lean_is_scalar(l.raw())) return has_mvar_core(l);
+    return ((lean_ctor_get_uint64(l.raw(), lean_ctor_num_objs(l.raw())*sizeof(object*)) >> 32) & 1) == 1;
+}
 /** \brief Return true iff \c l contains parameters */
-bool has_param(level const & l);
+inline bool has_param(level const & l) {
+    if (lean_is_scalar(l.raw())) return has_param_core(l);
+    return ((lean_ctor_get_uint64(l.raw(), lean_ctor_num_objs(l.raw())*sizeof(object*)) >> 33) & 1) == 1;
+}
 
 /** \brief Return a new level expression based on <tt>l == succ(arg)</tt>, where \c arg is replaced with
     \c new_arg.

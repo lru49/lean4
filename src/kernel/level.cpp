@@ -36,8 +36,8 @@ level mk_univ_param(name const & n) { return level(lean_level_mk_param(n.to_obj_
 
 unsigned level::hash() const { return lean_level_hash(to_obj_arg()); }
 unsigned get_depth(level const & l) { return lean_level_depth(l.to_obj_arg()); }
-bool has_param(level const & l) { return lean_level_has_param(l.to_obj_arg()); }
-bool has_mvar(level const & l) { return lean_level_has_mvar(l.to_obj_arg()); }
+bool has_param_core(level const & l) { return lean_level_has_param(l.to_obj_arg()); }
+bool has_mvar_core(level const & l) { return lean_level_has_mvar(l.to_obj_arg()); }
 
 extern "C" LEAN_EXPORT uint64_t lean_level_mk_data (uint64_t h, object * depth, uint8_t hasMVar, uint8_t hasParam) {
     if (!is_scalar(depth))
@@ -274,29 +274,46 @@ level update_max(level const & l, level const & new_lhs, level const & new_rhs) 
         return mk_imax(new_lhs, new_rhs);
 }
 
+/* lean-perf (CV levelinst): direct recursion instead of `replace(l, lambda)`. `replace_level_fn` stores its callback in a
+   `std::function`, and a lambda capturing the two lists by value is not trivially copyable, so every call heap-allocated
+   the callback and copied (reference-counted) `ps` and `ls`; this runs for every universe level of every constant that the
+   kernel's `instantiate_lparams` visits. Same traversal and same results (pointer-identical, `update_succ`/`update_max`
+   reuse unchanged nodes exactly as `replace_level_fn::apply` does). */
+static level instantiate_core(level const & l, names const & ps, levels const & ls) {
+    if (!has_param(l))
+        return l;
+    switch (l.kind()) {
+    case level_kind::Param: {
+        name const & id = param_id(l);
+        names const *it1  = &ps;
+        levels const *it2 = &ls;
+        /* The assertion in `instantiate` ensures that !is_nil(*it2) is unnecessay, but we
+           we keep it here to ensure the lean_instantiate_lparams does not crash
+           at runtime when misused. */
+        while (!is_nil(*it1) && !is_nil(*it2)) {
+            if (head(*it1) == id)
+                return head(*it2);
+            it1 = &tail(*it1);
+            it2 = &tail(*it2);
+        }
+        return l;
+    }
+    case level_kind::Succ:
+        return update_succ(l, instantiate_core(succ_of(l), ps, ls));
+    case level_kind::Max: case level_kind::IMax: {
+        level l1 = instantiate_core(level_lhs(l), ps, ls);
+        level l2 = instantiate_core(level_rhs(l), ps, ls);
+        return update_max(l, l1, l2);
+    }
+    case level_kind::Zero: case level_kind::MVar:
+        return l;
+    }
+    lean_unreachable(); // LCOV_EXCL_LINE
+}
+
 level instantiate(level const & l, names const & ps, levels const & ls) {
     lean_assert(length(ps) == length(ls));
-    return replace(l, [=](level const & l) {
-            if (!has_param(l)) {
-                return some_level(l);
-            } else if (is_param(l)) {
-                name const & id = param_id(l);
-                names const *it1  = &ps;
-                levels const *it2 = &ls;
-                /* The assertion above ensures that !is_nil(*it2) is unnecessay, but we
-                   we keep it here to ensure the lean_instantiate_lparams does not crash
-                   at runtime when misused. */
-                while (!is_nil(*it1) && !is_nil(*it2)) {
-                    if (head(*it1) == id)
-                        return some_level(head(*it2));
-                    it1 = &tail(*it1);
-                    it2 = &tail(*it2);
-                }
-                return some_level(l);
-            } else {
-                return none_level();
-            }
-        });
+    return instantiate_core(l, ps, ls);
 }
 
 static void print(std::ostream & out, level l);
