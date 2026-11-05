@@ -39,5 +39,5 @@ example (f : Nat → Nat) : f (slow 500) = f 124750 := by
 
 -- Goals that `congr` closes today are still closed (the budget is generous): defeq by unfolding.
 def g (n : Nat) : Nat := n + 1
-example (a : Nat) (h : a = 2) : Nat.succ (g a) = Nat.succ (a + 1) := by
+example (a : Nat) : Nat.succ (g a) = Nat.succ (a + 1) := by
   congr 1
