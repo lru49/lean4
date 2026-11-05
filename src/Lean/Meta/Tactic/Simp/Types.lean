@@ -770,13 +770,16 @@ Retrieve auto-generated congruence lemma for `f`.
 Remark: If all argument kinds are `fixed` or `eq`, it returns `none` because
 using simple congruence theorems `congr`, `congrArg`, and `congrFun` produces a more compact proof.
 -/
-def mkCongrSimp? (f : Expr) : SimpM (Option CongrTheorem) := do profileitM Exception "congr simp thm" (← getOptions) do
-  if f.isConst then if (← isMatcher f.constName!) then
-    -- We always use simple congruence theorems for auxiliary match applications
-    return none
-  match (← get).congrCache[f]? with
-  | some thm? => return thm?
-  | none =>
+def mkCongrSimp? (f : Expr) : SimpM (Option CongrTheorem) := do
+  -- lean-perf (cr): a cache hit returns before the profiler wrapper (one `profiler` option lookup and
+  -- a `monadMap` through the `SimpM` stack per visited application). Matchers are never inserted into
+  -- `congrCache`, so checking the cache before `isMatcher` returns the same answer.
+  if let some thm? := (← get).congrCache[f]? then
+    return thm?
+  profileitM Exception "congr simp thm" (← getOptions) do
+    if f.isConst then if (← isMatcher f.constName!) then
+      -- We always use simple congruence theorems for auxiliary match applications
+      return none
     let thm? ← go?
     modify fun s => { s with congrCache := s.congrCache.insert f thm? }
     return thm?
