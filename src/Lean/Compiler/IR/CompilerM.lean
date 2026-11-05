@@ -153,6 +153,30 @@ private def findInterpDecl (env : Environment) (declName : Name) : Option Decl :
     findAtSorted? (declMapExt.getModuleEntries env modIdx) declName
   | none => declMapExt.getState env |>.find? declName
 
+/--
+`findInterpDecl` together with whether its answer came from the imported part: `some (d, true)` iff
+`getModuleIdxFor?` maps `declName` to an imported module. That answer depends only on the import (module data and
+IR entries set once by `finalizeImport`) and on `env.isExporting` (which selects the constant map
+`getModuleIdxFor?` consults), so the interpreter caches it process-wide per `interpCacheKey` (`ir_interpreter.cpp`).
+The body is `findInterpDecl`'s, case by case.
+-/
+@[export lean_ir_find_interp_decl_tagged]
+private def findInterpDeclTagged (env : Environment) (declName : Name) : Option (Decl × Bool) :=
+  match env.getModuleIdxFor? declName with
+  | some modIdx =>
+    (findAtSorted? (declMapExt.getModuleIREntries env modIdx) declName <|>
+      findAtSorted? (declMapExt.getModuleEntries env modIdx) declName).map (·, true)
+  | none => (declMapExt.getState env |>.find? declName).map (·, false)
+
+/--
+Key of the interpreter's process-wide cache of imported IR declarations: the module data array of the import
+(created by `finalizeImport`, shared by every environment derived from that import; `setMainModule` keeps it) and
+`isExporting`. Two environments with the same key answer `findInterpDecl` identically for imported names.
+-/
+@[export lean_ir_interp_cache_key]
+private def interpCacheKey (env : Environment) : Array ModuleData × Bool :=
+  (env.header.moduleData, env.isExporting)
+
 /-- Like ``findInterpDecl env (declName ++ `_boxed)`` but with optimized negative lookup. -/
 @[export lean_ir_find_env_decl_boxed]
 private def findInterpDeclBoxed (env : Environment) (declName : Name) : Option Decl :=
