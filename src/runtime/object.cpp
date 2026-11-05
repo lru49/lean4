@@ -883,12 +883,30 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 #endif
     if (lean_is_scalar(o) || !is_unshared(o)) return;
 
+    /* lean-perf (perf-cd-mark-mt-prefetch): the walk is pointer chasing (every pop is a likely cache
+       miss on the popped object's header), so popped objects pass through a small FIFO: prefetched
+       on entry, examined on exit, keeping up to `MARK_MT_PREFETCH` misses in flight. Each object is
+       still rewritten exactly once (after its first visit it is no longer unshared) and the new rc is
+       a function of the old one only, so the result does not depend on the visiting order. */
+    constexpr unsigned MARK_MT_PREFETCH = 8;
+    object * fifo[MARK_MT_PREFETCH];
+    unsigned head = 0, cnt = 0;
     buffer<object*> todo;
     todo.push_back(o);
-    while (!todo.empty()) {
-        object * o = todo.back();
-        todo.pop_back();
-        if (!lean_is_scalar(o) && is_unshared(o)) {
+    while (true) {
+        while (cnt < MARK_MT_PREFETCH && !todo.empty()) {
+            object * c = todo.back();
+            todo.pop_back();
+            if (lean_is_scalar(c)) continue;
+            __builtin_prefetch(c);
+            fifo[(head + cnt) & (MARK_MT_PREFETCH - 1)] = c;
+            cnt++;
+        }
+        if (cnt == 0) break;
+        object * o = fifo[head];
+        head = (head + 1) & (MARK_MT_PREFETCH - 1);
+        cnt--;
+        if (is_unshared(o)) {
             // A count that overflowed, or is too large for the live thread-shared range, freezes at
             // `LEAN_RC_STICKY`, where no later `lean_mark_mt` takes it for an unshared one.
             // sync with tests/elab/rc_model.lean (`markMtRc`)
