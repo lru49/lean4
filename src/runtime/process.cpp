@@ -30,6 +30,11 @@ Author: Jared Roesch
 #ifdef __linux
 #include <sys/syscall.h>
 #endif
+#if defined(__linux__) && defined(__GLIBC__)
+#include <spawn.h>
+#include <vector>
+extern "C" char **environ;
+#endif
 
 #include "runtime/object.h"
 #include "runtime/io.h"
@@ -435,6 +440,67 @@ static optional<pipe> setup_stdio(stdio cfg) {
 extern "C" char **environ;
 #endif
 
+#if defined(__linux__) && defined(__GLIBC__)
+/* Child-side stdio setup of `spawn` as `posix_spawn` file actions. */
+static void add_stdio_actions(posix_spawn_file_actions_t * acts, optional<pipe> const & p, stdio mode, int fd, int nul_flags) {
+    if (p) {
+        int child_end = fd == STDIN_FILENO ? p->m_read_fd : p->m_write_fd;
+        int parent_end = fd == STDIN_FILENO ? p->m_write_fd : p->m_read_fd;
+        posix_spawn_file_actions_adddup2(acts, child_end, fd);
+        posix_spawn_file_actions_addclose(acts, parent_end);
+    } else if (mode == stdio::NUL) {
+        posix_spawn_file_actions_addopen(acts, fd, "/dev/null", nul_flags, 0);
+    }
+}
+
+/*
+Starts the child with `posix_spawn` (glibc: `clone(CLONE_VM | CLONE_VFORK)`) instead of `fork`, so
+the cost does not grow with the parent's address space (`fork` copies the page tables of the whole
+heap, e.g. ~25 ms for a multi-GB `lake`, and the parent then takes copy-on-write faults).
+Only used when it is observably equivalent to the `fork` path below: the program is given by a path
+(no `PATH` search, which the `fork` path performs with the child's modified environment) and no
+working directory is requested. Returns 0 if `posix_spawn` failed (e.g. the program does not exist);
+the caller then takes the `fork` path, which reports the failure exactly as before.
+*/
+static int try_posix_spawn(string_ref const & proc_name, char * const * pargs, optional<pipe> const & stdin_pipe,
+  optional<pipe> const & stdout_pipe, optional<pipe> const & stderr_pipe, stdio stdin_mode, stdio stdout_mode,
+  stdio stderr_mode, array_ref<pair_ref<string_ref, option_ref<string_ref>>> const & env, bool inherit_env, bool do_setsid) {
+    // Same environment as `clearenv` + `setenv`/`unsetenv` in the child.
+    std::vector<std::string> envs;
+    if (inherit_env && environ)
+        for (char ** e = environ; *e; e++) envs.emplace_back(*e);
+    for (auto & entry : env) {
+        std::string key = entry.fst().data();
+        for (auto it = envs.begin(); it != envs.end(); ++it) {
+            if (it->compare(0, key.size(), key) == 0 && it->size() > key.size() && (*it)[key.size()] == '=') {
+                envs.erase(it);
+                break;
+            }
+        }
+        if (entry.snd()) {
+            envs.push_back(key + "=" + entry.snd().get()->data());
+        }
+    }
+    std::vector<char *> envp;
+    for (auto & e : envs) envp.push_back(const_cast<char *>(e.c_str()));
+    envp.push_back(nullptr);
+
+    posix_spawn_file_actions_t acts;
+    if (posix_spawn_file_actions_init(&acts) != 0) return 0;
+    add_stdio_actions(&acts, stdin_pipe, stdin_mode, STDIN_FILENO, O_RDONLY);
+    add_stdio_actions(&acts, stdout_pipe, stdout_mode, STDOUT_FILENO, O_WRONLY);
+    add_stdio_actions(&acts, stderr_pipe, stderr_mode, STDERR_FILENO, O_WRONLY);
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) { posix_spawn_file_actions_destroy(&acts); return 0; }
+    if (do_setsid) posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    pid_t pid = 0;
+    int err = posix_spawn(&pid, proc_name.data(), &acts, &attr, pargs, envp.data());
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&acts);
+    return err == 0 ? pid : 0;
+}
+#endif
+
 static obj_res spawn(string_ref const & proc_name, array_ref<string_ref> const & args, stdio stdin_mode, stdio stdout_mode,
   stdio stderr_mode, option_ref<string_ref> const & cwd, array_ref<pair_ref<string_ref, option_ref<string_ref>>> const & env,
   bool inherit_env, bool do_setsid) {
@@ -450,7 +516,13 @@ static obj_res spawn(string_ref const & proc_name, array_ref<string_ref> const &
         pargs.push_back(strdup(arg.data()));
     pargs.push_back(NULL);
 
-    int pid = fork();
+    int pid = 0;
+#if defined(__linux__) && defined(__GLIBC__)
+    if (!cwd && strchr(proc_name.data(), '/') != nullptr && !getenv("LEAN_SPAWN_FORK"))
+        pid = try_posix_spawn(proc_name, pargs.data(), stdin_pipe, stdout_pipe, stderr_pipe, stdin_mode, stdout_mode,
+                              stderr_mode, env, inherit_env, do_setsid);
+#endif
+    if (pid == 0) pid = fork();
 
     if (pid == 0) {
         if (!inherit_env) {
