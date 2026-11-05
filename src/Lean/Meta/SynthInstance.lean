@@ -1210,6 +1210,12 @@ private def synthInstanceConfig : Config :=
     foApprox := true, ctxApprox := true, constApprox := false, univApprox := false }
 
 def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) := do
+  if (← (IO.getEnv "LEAN_CN_NG" : IO (Option String))).isSome then
+    let fm ← getFileMap
+    let line := match (← getRef).getPos? with
+      | some p => toString (fm.toPosition p).line
+      | none => "?"
+    IO.eprintln s!"CNG {(← getNGen).idx} {line} {(toString type).replace "\n" " "}"
   -- Inside an enclosing query, this lookup is recorded as its dependency.
   let maxResultSize ← match maxResultSize? with
     | some n => pure n
