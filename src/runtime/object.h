@@ -10,8 +10,6 @@ Author: Leonardo de Moura
 #include "runtime/mpz.h"
 
 /* lean-perf (CJ): see object.cpp (deferred release of large object graphs). */
-extern "C" LEAN_EXPORT bool lean_dec_refs_deferred(lean_object ** objs, size_t n, void (*free_fn)(void *), void * block);
-extern "C" LEAN_EXPORT void lean_deferred_free_drain();
 extern "C" LEAN_EXPORT void lean_deferred_free_barrier();
 namespace lean {
 
