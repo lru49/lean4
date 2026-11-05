@@ -3139,7 +3139,20 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   -- Merge the region-resident per-module prefix trees lazily; only name prefixes shared between
   -- modules get fresh nodes, on first access. Conflicts are checked separately up front, so entry
   -- resolution cannot fail.
-  checkImportConflicts s imports modules moduleData
+  -- lean-perf (L04): with several import threads the conflict sweep (`checkImportConflicts`: a
+  -- grouping of all modules' root-level trie children, then the uncovered subtrees) runs on a task
+  -- while the main thread assembles the environment (`setImportedEntries`, IR/server entries,
+  -- `markPersistent`), none of which looks a constant up; the task is joined before the extension
+  -- states, the first consumers of the merged tries. A real duplicate raises the same `IO.userError`
+  -- (nothing is printed in between). `-j 1` and `LEAN_IMPORT_PAR_CONFLICTS=0` keep the sequential
+  -- order.
+  let importThreads ← ParallelImport.numThreads
+  let conflicts? ←
+    if importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_CONFLICTS") then
+      some <$> IO.asTask (checkImportConflicts s imports modules moduleData)
+    else do
+      checkImportConflicts s imports modules moduleData
+      pure none
   let privTrees := moduleData.mapIdx fun modIdx data => (modIdx, data.constTrie?.get!)
   -- the first declaration of each name in module order, for resolving heads of declarations
   let privFind? := (ImportedConsts.mergeModuleTreesLazy privTrees).find?
@@ -3164,8 +3177,6 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     ImportedConsts.mergeModuleTreesLazy publicTrees (resolveImportedEntry publicFind?)
   ParallelImport.tick "import conflicts checked, constant tries set up (merged lazily)"
 
-  -- lean-perf: thread budget of the import phase (see `ParallelImport`)
-  let importThreads ← ParallelImport.numThreads
   let exts ← mkInitialExtensionStates
   let privateBase : Kernel.Environment := {
     constants := { map₁ := privImported }
@@ -3215,6 +3226,9 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
     ParallelImport.tick "markPersistent 1"
+  if let some t := conflicts? then
+    IO.ofExcept (← IO.wait t)
+    ParallelImport.tick "import conflicts checked (task joined)"
   if loadExts then
     -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
     -- already persistent then, so capturing it in task closures costs nothing)
