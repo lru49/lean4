@@ -1344,13 +1344,27 @@ static expr * g_list_cons_char = nullptr;
 static expr * g_list_nil_char  = nullptr;
 static expr * g_char_of_nat    = nullptr;
 
+/* The kernel's `Nat` literal evaluation (`reduce_nat` results, `Nat.succ` predecessors in `is_def_eq_offset`,
+   the `Nat.succ` view of a literal major premise in iota reduction, `Char.ofNat` code points of string
+   literals) mostly produces small numerals: a recursor or `decide` loop over a bound `n` builds `n-1`, `n-2`,
+   ... at every step, each a fresh literal object plus an `Expr.lit` node. Small values share one node
+   each. Structurally identical results; only pointer sharing changes. */
+static constexpr unsigned g_small_nat_lit_count = 1024;
+static expr * g_small_nat_lits = nullptr;
+
+expr mk_nat_lit(nat const & v) {
+    if (v.is_small() && v.get_small_value() < g_small_nat_lit_count)
+        return g_small_nat_lits[v.get_small_value()];
+    return mk_lit(literal(v));
+}
+
 expr nat_lit_to_constructor(expr const & e) {
     lean_assert(is_nat_lit(e));
     nat const & v = lit_value(e).get_nat();
     if (v == 0u)
         return *g_nat_zero;
     else
-        return mk_app(*g_nat_succ, mk_lit(literal(v - nat(1))));
+        return mk_app(*g_nat_succ, mk_nat_lit(v - nat(1)));
 }
 
 expr string_lit_to_constructor(expr const & e) {
@@ -1362,7 +1376,7 @@ expr string_lit_to_constructor(expr const & e) {
     unsigned i = cs.size();
     while (i > 0) {
         i--;
-        r = mk_app(*g_list_cons_char, mk_app(*g_char_of_nat, mk_lit(literal(cs[i]))), r);
+        r = mk_app(*g_list_cons_char, mk_app(*g_char_of_nat, mk_nat_lit(nat(cs[i]))), r);
     }
     return mk_app(*g_string_mk, r);
 }
@@ -1379,6 +1393,11 @@ void initialize_inductive() {
     mark_persistent(g_nat_zero->raw());
     g_nat_succ       = new expr(mk_constant(name{"Nat", "succ"}));
     mark_persistent(g_nat_succ->raw());
+    g_small_nat_lits = new expr[g_small_nat_lit_count];
+    for (unsigned i = 0; i < g_small_nat_lit_count; i++) {
+        g_small_nat_lits[i] = mk_lit(literal(i));
+        mark_persistent(g_small_nat_lits[i].raw());
+    }
     g_string_mk      = new expr(mk_constant(name{"String", "ofList"}));
     mark_persistent(g_string_mk->raw());
     expr char_type   = mk_constant(name{"Char"});
@@ -1397,6 +1416,7 @@ void finalize_inductive() {
     delete g_ind_fresh;
     delete g_nested_fresh;
     delete g_nat_succ;
+    delete[] g_small_nat_lits;
     delete g_nat_zero;
     delete g_string_mk;
     delete g_list_cons_char;

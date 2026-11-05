@@ -50,6 +50,9 @@ inline expr to_cnstr_when_K(environment const & env, recursor_val const & rval, 
 optional<recursor_rule> get_rec_rule_for(recursor_val const & rec_val, expr const & major);
 
 expr nat_lit_to_constructor(expr const & e);
+/* `mk_lit(literal(v))`; values below 1024 return a shared persistent node built at initialization
+   (no allocation, no reference counting). */
+expr mk_nat_lit(nat const & v);
 expr string_lit_to_constructor(expr const & e);
 
 /* Auxiliary method for \c to_cnstr_when_structure, convert `e` into `mk e.1 ... e.n` */
