@@ -411,7 +411,11 @@ instance : MonadRef CoreM where
 
 instance : MonadEnv CoreM where
   getEnv := return (← get).env
-  modifyEnv f := modify fun s => { s with env := f s.env, cache := {} }
+  modifyEnv f := modify fun s =>
+    let env := f s.env
+    -- the cache of instantiated constant types and values survives modifications that cannot change
+    -- any constant (`Environment.cachesSurvive`), e.g. adding a doc string
+    { s with env, cache := if s.env.cachesSurvive env then s.cache else {} }
 
 instance : MonadOptions CoreM where
   getOptions := return checkedOptions (← read)
