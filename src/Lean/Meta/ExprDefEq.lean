@@ -2518,11 +2518,21 @@ private def cacheResult (keyInfo : DefEqCacheKeyInfo) (result : Bool) : MetaM Un
     let key ← mkDefEqCacheKey (← instantiateMVars key.lhs) (← instantiateMVars key.rhs)
     modifyDefEqTransientCache fun c => c.insert key result
 
-private def whnfCoreAtDefEq (e : Expr) : MetaM Expr := do
+/--
+`whnfCore` of both sides of a constraint (first `t`, then `s`), with `proj := .yesWithDeltaI` when
+`backward.isDefEq.lazyWhnfCore` is set. Both calls share one configuration change: `withConfig` builds a new
+`Meta.Context` and `Config` and recomputes the configuration key, and this runs on every `isDefEq` step.
+-/
+private def whnfCoreBothAtDefEq (t s : Expr) : MetaM (Expr × Expr) := do
   if (← getOptionFlags).lazyWhnfCore then
-    withConfig (fun ctx => { ctx with proj := .yesWithDeltaI }) <| whnfCore e
+    withConfig (fun ctx => { ctx with proj := .yesWithDeltaI }) do
+      let t' ← whnfCore t
+      let s' ← whnfCore s
+      return (t', s')
   else
-    whnfCore e
+    let t' ← whnfCore t
+    let s' ← whnfCore s
+    return (t', s')
 
 set_option compiler.ignoreBorrowAnnotation true in
 @[export lean_is_expr_def_eq]
@@ -2571,8 +2581,7 @@ partial def isExprDefEqAuxImpl (t : Expr) (s : Expr) : MetaM Bool := withIncRecD
     `whnfCore t (config := { proj := .yes })` which more conservative than `.yesWithDeltaI`,
     and it only created performance issues when handling TC unification problems.
   -/
-  let t' ← whnfCoreAtDefEq t
-  let s' ← whnfCoreAtDefEq s
+  let (t', s') ← whnfCoreBothAtDefEq t s
   if t != t' || s != s' then
     isExprDefEqAuxImpl t' s'
   else
