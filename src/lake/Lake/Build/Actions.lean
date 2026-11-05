@@ -64,10 +64,7 @@ public def compileLeanModule
     createParentDirs bcFile
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
-  -- compact JSON: the setup lists every transitive import (MBs for large
-  -- dependency trees) and is only read by `lean --setup`; `Json.pretty` costs
-  -- ~5x the time of `Json.compress` on the critical path before each spawn
-  IO.FS.writeFile setupFile (toJson setup).compress
+  IO.FS.writeFile setupFile (toJson setup).pretty
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do

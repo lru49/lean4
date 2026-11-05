@@ -45,7 +45,7 @@ echo "# TEST: mixed postponement"
 
 # A library can opt back out of postponement, so that its elaboration generates code as usual
 test_run build Plain.P
-match_text '"compiler.postponeCompile":false' .lake/build/ir/Plain/P.setup.json
+match_text '"compiler.postponeCompile": false' .lake/build/ir/Plain/P.setup.json
 test_exp -f .lake/build/ir/Plain/P.c
 
 # A postponed module can import a non-postponed one from the same package

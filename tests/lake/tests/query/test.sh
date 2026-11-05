@@ -26,10 +26,8 @@ test_eq "B" query +A:imports
 test_eq '["C","B"]' query +A:transImports --json
 
 # Test querying a module's setup JSON
-# (the setup file is written as compact JSON, so compare both pretty-printed)
-$LAKE query +A:setup --json | $LAKE env lean --run pretty.lean > .lake/query-setup.json
-$LAKE env lean --run pretty.lean < .lake/build/ir/A.setup.json |
-  diff -u --strip-trailing-cr .lake/query-setup.json -
+$LAKE query +A:setup --json | $LAKE env lean --run pretty.lean |
+  diff -u --strip-trailing-cr .lake/build/ir/A.setup.json -
 
 # Test querying a module's dependency hash
 match_text $($LAKE query +A:depHash) .lake/build/lib/lean/A.trace
