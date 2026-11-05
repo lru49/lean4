@@ -145,7 +145,14 @@ private:
     void cache_failure(expr const & t, expr const & s);
     bool succeeded_before(expr const & t, expr const & s) const;
     void cache_success(expr const & t, expr const & s);
-    reduction_status lazy_delta_reduction_step(expr & t_n, expr & s_n);
+    /* `is_delta` answers of the previous step of one lazy delta loop, reused while a side is still the same object
+       (only the side that was unfolded changes from one step to the next). */
+    struct lazy_delta_memo {
+        expr                    m_t, m_s;
+        optional<constant_info> m_d_t, m_d_s;
+        bool                    m_has_t = false, m_has_s = false;
+    };
+    reduction_status lazy_delta_reduction_step(expr & t_n, expr & s_n, lazy_delta_memo & memo);
     lbool lazy_delta_reduction(expr & t_n, expr & s_n);
     bool lazy_delta_proj_reduction(expr & t_n, expr & s_n, name const & sname, nat const & idx);
     bool is_def_eq_core(expr const & t, expr const & s);
