@@ -38,6 +38,30 @@ Author: Leonardo de Moura
 #endif
 
 namespace lean {
+#if defined(LEAN_MULTI_THREAD)
+unsigned hardware_concurrency() {
+#if defined(__linux__)
+    /* lean-perf (affinity-aware default pool): the default task-manager size (`lean` without `-j`,
+       LEAN_NUM_THREADS unset) is one worker per CPU we may actually use; under `taskset -c 0-31` on a 64-thread host
+       that is 32 workers, not 64 that time-share 32 CPUs. `LEAN_HW_CONCURRENCY_IGNORE_AFFINITY=1` restores the old count. */
+    static unsigned const g_n = []() {
+        unsigned n = 0;
+        char const * e = std::getenv("LEAN_HW_CONCURRENCY_IGNORE_AFFINITY");
+        if (!(e && e[0] == '1')) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+                n = CPU_COUNT(&set);
+        }
+        if (n == 0) n = std::thread::hardware_concurrency();
+        return n == 0 ? 1u : n;
+    }();
+    return g_n;
+#else
+    return std::thread::hardware_concurrency();
+#endif
+}
+#endif
 using runnable = std::function<void()>;
 
 extern "C" LEAN_EXPORT void lean_initialize_thread() {
