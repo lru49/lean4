@@ -452,6 +452,314 @@ extern "C" LEAN_EXPORT void lean_inc_ref_huge_n(lean_object * o, size_t n) {
     }
 }
 
+/* lean-perf (CJ): deferred release of large object graphs.
+
+   When one `lean_dec_ref_cold` call frees more than `LEAN_DEFER_FREE_MIN` objects (default 16384), the rest of
+   the deletion worklist is handed to one background "release" thread and the calling thread returns at once.
+   Typical case: an elaboration state, a cache or a whole environment version dropped when a command's result is
+   committed (`modifyEnv` resetting the Core/Meta caches, `setEnv`, kernel and elaborator states): the caller
+   used to walk and free the whole graph on the critical thread.
+
+   Soundness. Every object on the handed-over worklist is owned by the cascade (its count reached zero, or it is
+   a single-threaded object whose last reference was a field of an object being freed), so no other thread can
+   reach it. The release thread then frees the graph below it and must decide for every child `c`:
+   - thread-shared (count < 0): atomic decrement, as `dec` does on any thread; freed when it was the last one;
+   - persistent / frozen counts: skipped, as `dec` does;
+   - single-threaded (count > 0): `c` belongs to the owner thread, whose non-atomic count updates the release
+     thread must never race with. The release thread only READS the count (relaxed) and tallies how many
+     references to `c` it has dropped so far (k, per batch, in a pointer-keyed table). If the count equals k,
+     every reference to `c` is a field of an object in the dying graph: no live object and no thread holds `c`
+     (a thread cannot hold even a borrowed pointer to it, since borrowing requires an owned reference
+     somewhere), so the count cannot change any more and `c` is owned by the release thread (freed). Otherwise
+     the owner may hold references; the k pending decrements are returned to the owner thread, which applies
+     them with ordinary `lean_dec_ref`s at its next drain point (its next large cascade, the end of each task it
+     runs on a task-manager worker, thread exit). A pending decrement only keeps a count higher than the true
+     number of live references for a while: the object is treated as shared (copied instead of updated in
+     place) and freed at the drain, never earlier. Counts read concurrently with an owner's non-atomic update
+     see either the old or the new value (aligned 32-bit word); both cases are covered above (the count can
+     only reach k after the owner dropped its last reference, and a count above k is returned to the owner).
+     An owner's `mark_mt` turning `c` thread-shared mid-batch is also covered: the release thread then
+     decrements atomically, the pending ones are applied by the owner through `lean_dec_ref` (which handles
+     both kinds).
+   Observable differences: memory of a deferred graph is returned a little later (bounded queue: at most
+   `LEAN_DEFER_FREE_QUEUE` batches, default 64; above that the caller frees inline as before); finalizers of
+   external objects / tasks inside a deferred graph run on the release thread (as for any thread-shared object
+   today). At process exit the release thread stops at its next check (every 4096 objects) and the rest is left
+   to the OS. `LEAN_DEFER_FREE=0` disables the mechanism; `LEAN_DEFER_FREE_STATS=1` prints counters at exit. */
+extern "C" LEAN_EXPORT void lean_deferred_free_drain();
+#if defined(LEAN_MULTI_THREAD)
+/* Objects whose deletion runs foreign code (external finalizers) or touches the task manager: when they are
+   single-threaded they are always released on their owner thread. */
+static inline bool defer_owner_only(lean_object * o) {
+    uint8 tag = lean_ptr_tag(o);
+    return tag == LeanExternal || tag == LeanTask || tag == LeanPromise;
+}
+
+struct deferred_owner_slot {
+    std::mutex                                    m_mutex;
+    std::vector<std::pair<lean_object *, size_t>> m_pending;  // (object, number of decrements owed)
+    std::atomic<bool>                             m_has_pending{false};
+    bool                                          m_closed = false;
+};
+
+struct deferred_batch {
+    lean_object *                        m_todo;
+    std::shared_ptr<deferred_owner_slot> m_owner;
+};
+
+static size_t                         g_defer_min = SIZE_MAX;  // SIZE_MAX = disabled
+static size_t                         g_defer_queue_max = 64;
+static bool                           g_defer_stats = false;
+static std::mutex *                   g_defer_mutex = nullptr;
+static std::condition_variable *      g_defer_cv = nullptr;
+static std::condition_variable *      g_defer_idle_cv = nullptr;
+static std::deque<deferred_batch> *   g_defer_queue = nullptr;
+static bool                           g_defer_started = false;
+static bool                           g_defer_busy = false;
+static std::atomic<bool>              g_defer_stop{false};
+static std::atomic<uint64_t>          g_defer_n_batches{0}, g_defer_n_freed{0}, g_defer_n_owned_st{0},
+                                      g_defer_n_returned{0}, g_defer_n_refused{0}, g_defer_n_drained{0};
+static thread_local std::shared_ptr<deferred_owner_slot> * g_defer_slot = nullptr;
+static thread_local bool              g_defer_draining = false;
+
+/* Small open-addressing table (pointer -> tally) used by the release thread per batch. */
+struct defer_tally {
+    struct entry { lean_object * m_key; size_t m_count; };
+    std::vector<entry> m_table;
+    size_t m_size = 0;
+    defer_tally() : m_table(1024, entry{nullptr, 0}) {}
+    static size_t hash(lean_object * o) { return (size_t)(((uintptr_t)o >> 4) * 0x9E3779B97F4A7C15ull); }
+    void grow() {
+        std::vector<entry> old; old.swap(m_table);
+        m_table.assign(old.size() * 2, entry{nullptr, 0}); m_size = 0;
+        for (entry const & e : old) if (e.m_key) *slot(e.m_key) = e, m_size++;
+    }
+    entry * slot(lean_object * o) {
+        size_t mask = m_table.size() - 1, i = hash(o) & mask;
+        while (m_table[i].m_key != nullptr && m_table[i].m_key != o) i = (i + 1) & mask;
+        return &m_table[i];
+    }
+    /* add one reference; returns the tally */
+    size_t add(lean_object * o) {
+        if (2 * (m_size + 1) > m_table.size()) grow();
+        entry * e = slot(o);
+        if (e->m_key == nullptr) { e->m_key = o; e->m_count = 0; m_size++; }
+        return ++e->m_count;
+    }
+    /* mark an owned entry as consumed (count 0 = no decrement owed; kept as a tombstone-free zero entry) */
+    void consume(lean_object * o) { slot(o)->m_count = 0; }
+    template<class F> void for_each_and_clear(F && f) {
+        for (entry & e : m_table) { if (e.m_key && e.m_count) f(e.m_key, e.m_count); e.m_key = nullptr; e.m_count = 0; }
+        m_size = 0;
+        if (m_table.size() > (1u << 20)) { std::vector<entry> t(1024, entry{nullptr, 0}); m_table.swap(t); }
+    }
+};
+
+static inline int defer_load_rc(lean_object * o) {
+    return std::atomic_load_explicit(lean_get_rc_mt_addr(o), std::memory_order_relaxed);
+}
+
+static inline void defer_dec(lean_object * o, lean_object * & todo, defer_tally & tally, uint64_t & owned_st) {
+    if (lean_is_scalar(o))
+        return;
+    int rc = defer_load_rc(o);
+    if (rc == 1) {
+        if (LEAN_UNLIKELY(defer_owner_only(o))) tally.add(o);
+        else push_back(todo, o);
+    } else if (rc > 1) {
+        size_t k = tally.add(o);
+        if ((size_t)defer_load_rc(o) == k && !defer_owner_only(o)) {
+            // every reference to `o` was a field of a dying object: it is ours
+            tally.consume(o);
+            owned_st++;
+            push_back(todo, o);
+        }
+    } else if (rc == 0 || (unsigned)rc <= (unsigned)LEAN_RC_STICKY_DROP) {
+        return;
+    } else if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) == -1) {
+        push_back(todo, o);
+    }
+}
+
+static object * defer_del_core(object * o, object * todo, defer_tally & tally, uint64_t & owned_st) {
+    uint8 tag = lean_ptr_tag(o);
+    if (LEAN_LIKELY(tag <= LeanMaxCtorTag)) {
+        object ** it  = lean_ctor_obj_cptr(o);
+        object ** end = it + lean_ctor_num_objs(o);
+        for (; it != end; ++it) defer_dec(*it, todo, tally, owned_st);
+        lean_free_small_object(o);
+        return todo;
+    }
+    switch (tag) {
+    case LeanClosure: {
+        object ** it  = lean_closure_arg_cptr(o);
+        object ** end = it + lean_closure_num_fixed(o);
+        for (; it != end; ++it) defer_dec(*it, todo, tally, owned_st);
+        lean_dealloc(o, lean_closure_byte_size(o));
+        break;
+    }
+    case LeanArray: {
+        object ** it  = lean_array_cptr(o);
+        object ** end = it + lean_array_size(o);
+        for (; it != end; ++it) defer_dec(*it, todo, tally, owned_st);
+        lean_dealloc(o, lean_array_byte_size(o));
+        break;
+    }
+    case LeanThunk:
+        if (object * c = lean_to_thunk(o)->m_closure) defer_dec(c, todo, tally, owned_st);
+        if (object * v = lean_to_thunk(o)->m_value) defer_dec(v, todo, tally, owned_st);
+        lean_free_small_object(o);
+        break;
+    case LeanRef:
+        if (object * v = lean_to_ref(o)->m_value) defer_dec(v, todo, tally, owned_st);
+        lean_free_small_object(o);
+        break;
+    default:
+        // scalar arrays, strings, mpz, tasks, promises, externals: no Lean children to visit here
+        todo = lean_del_core_other(o, tag, todo);
+        break;
+    }
+    return todo;
+}
+
+static void defer_return_to_owner(std::shared_ptr<deferred_owner_slot> const & owner, defer_tally & tally) {
+    std::vector<std::pair<lean_object *, size_t>> items;
+    tally.for_each_and_clear([&](lean_object * o, size_t k) { items.emplace_back(o, k); });
+    if (items.empty()) return;
+    g_defer_n_returned.fetch_add(items.size(), std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(owner->m_mutex);
+    if (owner->m_closed) return;  // the owner thread has exited: its objects stay alive (leak, never a premature free)
+    if (owner->m_pending.empty()) owner->m_pending.swap(items);
+    else owner->m_pending.insert(owner->m_pending.end(), items.begin(), items.end());
+    owner->m_has_pending.store(true, std::memory_order_release);
+}
+
+static void defer_worker_main() {
+    lean_initialize_thread();
+    defer_tally tally;
+    std::unique_lock<std::mutex> lock(*g_defer_mutex);
+    while (true) {
+        while (g_defer_queue->empty() && !g_defer_stop.load(std::memory_order_relaxed)) g_defer_cv->wait(lock);
+        if (g_defer_stop.load(std::memory_order_relaxed)) { g_defer_busy = false; g_defer_idle_cv->notify_all(); return; }
+        deferred_batch b = std::move(g_defer_queue->front());
+        g_defer_queue->pop_front();
+        g_defer_busy = true;
+        lock.unlock();
+        object * todo = b.m_todo;
+        uint64_t n = 0, owned_st = 0;
+        bool stopped = false;
+        while (todo != nullptr) {
+            object * o = pop_back(todo);
+            todo = defer_del_core(o, todo, tally, owned_st);
+            if ((++n & 4095) == 0 && g_defer_stop.load(std::memory_order_relaxed)) { stopped = true; break; }
+        }
+        if (!stopped) defer_return_to_owner(b.m_owner, tally);
+        else tally.for_each_and_clear([](lean_object *, size_t) {});
+        b.m_owner.reset();
+        g_defer_n_batches.fetch_add(1, std::memory_order_relaxed);
+        g_defer_n_freed.fetch_add(n, std::memory_order_relaxed);
+        g_defer_n_owned_st.fetch_add(owned_st, std::memory_order_relaxed);
+        lock.lock();
+        g_defer_busy = false;
+        g_defer_idle_cv->notify_all();
+        if (stopped) return;
+    }
+}
+
+static void defer_atexit() {
+    if (g_defer_stats)
+        fprintf(stderr, "[defer-free] batches=%llu objects_freed_on_release_thread=%llu st_owned_by_tally=%llu "
+                "st_decrements_returned=%llu refused_queue_full=%llu drained_entries=%llu threshold=%zu\n",
+                (unsigned long long)g_defer_n_batches.load(), (unsigned long long)g_defer_n_freed.load(),
+                (unsigned long long)g_defer_n_owned_st.load(), (unsigned long long)g_defer_n_returned.load(),
+                (unsigned long long)g_defer_n_refused.load(), (unsigned long long)g_defer_n_drained.load(), g_defer_min);
+    // stop the release thread at its next check so that it does not run concurrently with static destructors
+    std::unique_lock<std::mutex> lock(*g_defer_mutex);
+    g_defer_stop.store(true, std::memory_order_relaxed);
+    g_defer_cv->notify_all();
+    while (g_defer_busy) g_defer_idle_cv->wait(lock);
+}
+
+static void defer_slot_finalizer(void * p) {
+    auto * sp = static_cast<std::shared_ptr<deferred_owner_slot> *>(p);
+    lean_deferred_free_drain();
+    { std::lock_guard<std::mutex> lock((*sp)->m_mutex); (*sp)->m_closed = true; }
+    if (g_defer_slot == sp) g_defer_slot = nullptr;
+    delete sp;
+}
+
+/* Apply the decrements the release thread returned to this thread. */
+extern "C" LEAN_EXPORT void lean_deferred_free_drain() {
+    if (g_defer_slot == nullptr || g_defer_draining) return;
+    deferred_owner_slot & s = **g_defer_slot;
+    if (!s.m_has_pending.load(std::memory_order_acquire)) return;
+    g_defer_draining = true;
+    while (s.m_has_pending.load(std::memory_order_acquire)) {
+        std::vector<std::pair<lean_object *, size_t>> items;
+        {
+            std::lock_guard<std::mutex> lock(s.m_mutex);
+            items.swap(s.m_pending);
+            s.m_has_pending.store(false, std::memory_order_relaxed);
+        }
+        g_defer_n_drained.fetch_add(items.size(), std::memory_order_relaxed);
+        for (auto const & it : items)
+            for (size_t i = 0; i < it.second; i++) lean_dec_ref(it.first);
+    }
+    g_defer_draining = false;
+}
+
+/* Called by `lean_dec_ref_cold` after `g_defer_min` objects of one cascade. Returns false when the caller must
+   continue inline with `todo` unchanged; on true, `todo` holds what the caller must still free itself (the
+   owner-only objects of the worklist, usually none). */
+__attribute__((noinline)) static bool defer_handoff(object * & todo) {
+    if (g_defer_draining) return false;
+    lean_deferred_free_drain();
+    if (g_defer_slot == nullptr) {
+        g_defer_slot = new std::shared_ptr<deferred_owner_slot>(std::make_shared<deferred_owner_slot>());
+        register_thread_finalizer(defer_slot_finalizer, g_defer_slot);
+    }
+    std::unique_lock<std::mutex> lock(*g_defer_mutex);
+    if (g_defer_stop.load(std::memory_order_relaxed) || g_defer_queue->size() >= g_defer_queue_max) {
+        g_defer_n_refused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!g_defer_started) {
+        g_defer_started = true;
+        // a plain std::thread, detached: it never touches the task manager, and is stopped by `defer_atexit`
+        std::thread(defer_worker_main).detach();
+        std::atexit(defer_atexit);
+    }
+    // split the worklist: owner-only objects stay with the caller
+    object * give = nullptr; object * keep = nullptr;
+    while (todo != nullptr) {
+        object * o = pop_back(todo);
+        if (defer_owner_only(o)) push_back(keep, o); else push_back(give, o);
+    }
+    todo = keep;
+    if (give != nullptr) {
+        g_defer_queue->push_back(deferred_batch{give, *g_defer_slot});
+        g_defer_cv->notify_one();
+    }
+    return true;
+}
+
+static void initialize_deferred_free() {
+    g_defer_mutex = new std::mutex();
+    g_defer_cv = new std::condition_variable();
+    g_defer_idle_cv = new std::condition_variable();
+    g_defer_queue = new std::deque<deferred_batch>();
+    char const * on = std::getenv("LEAN_DEFER_FREE");
+    if (on && strcmp(on, "0") == 0) return;
+    g_defer_min = 16384;
+    if (char const * s = std::getenv("LEAN_DEFER_FREE_MIN")) { long v = atol(s); if (v > 0) g_defer_min = (size_t)v; }
+    if (char const * s = std::getenv("LEAN_DEFER_FREE_QUEUE")) { long v = atol(s); if (v > 0) g_defer_queue_max = (size_t)v; }
+    if (char const * s = std::getenv("LEAN_DEFER_FREE_STATS")) g_defer_stats = strcmp(s, "0") != 0;
+}
+#else
+extern "C" LEAN_EXPORT void lean_deferred_free_drain() {}
+static void initialize_deferred_free() {}
+#endif
+
 // sync with tests/elab/rc_model.lean (`decRefCold`)
 extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
     // `rc == 1` is the hot single-threaded free path and can never be sticky, so the sticky check
@@ -463,10 +771,18 @@ extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
             return;
     }
     object * todo = nullptr;
+#if defined(LEAN_MULTI_THREAD)
+    size_t n = 0;
+#endif
     while (true) {
         todo = lean_del_core(o, todo);
         if (todo == nullptr)
             return;
+#if defined(LEAN_MULTI_THREAD)
+        // lean-perf (CJ): a large cascade continues on the release thread (see `defer_handoff`)
+        if (LEAN_UNLIKELY(++n == g_defer_min) && defer_handoff(todo) && todo == nullptr)
+            return;
+#endif
         o = pop_back(todo);
     }
 }
@@ -1154,6 +1470,8 @@ class task_manager {
             imp->m_closure = nullptr;
             lock.unlock();
             v = lean_apply_1(c, box(0));
+            // lean-perf (CJ): apply reference-count decrements the release thread returned to this thread
+            lean_deferred_free_drain();
             // If deactivation was delayed by `m_keep_alive`, deactivate after the final execution (`v != nulltpr`)
             if (v != nullptr && imp->m_keep_alive) {
                 lean_dec_ref((lean_object*)t);
@@ -3234,6 +3552,7 @@ void initialize_object() {
     g_ext_classes_mutex = new mutex();
     g_array_empty       = lean_alloc_array(0, 0);
     mark_persistent(g_array_empty);
+    initialize_deferred_free();
 }
 
 void finalize_object() {
