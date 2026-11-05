@@ -13,6 +13,7 @@ Author: Leonardo de Moura
 #include "runtime/interrupt.h"
 #include "kernel/expr.h"
 #include "kernel/expr_maps.h"
+#include "util/alloc.h"
 
 namespace lean {
 
@@ -59,7 +60,7 @@ class replace_cache {
         // Leaving the inline table means the traversal has many shared sub-terms: jump to 4x so that most such
         // traversals grow once (`grow` was 1.3-1.8 % of cycles with 32 inline slots and 2x steps).
         size_t new_cap  = (m_mask + 1) * (m_tab == m_inline ? 4 : 2);
-        entry * new_tab = static_cast<entry *>(std::calloc(new_cap, sizeof(entry)));
+        entry * new_tab = static_cast<entry *>(alloc_zeroed_block(new_cap, sizeof(entry)));
         if (new_tab == nullptr) lean_internal_panic_out_of_memory();
         size_t new_mask = new_cap - 1;
         for (size_t i = 0; i <= m_mask; i++) {
@@ -69,7 +70,7 @@ class replace_cache {
             while (new_tab[j].m_val != nullptr) j = (j + 1) & new_mask;
             new_tab[j] = e;
         }
-        if (m_tab != m_inline) std::free(m_tab);
+        if (m_tab != m_inline) free_block(m_tab);
         m_tab  = new_tab;
         m_mask = new_mask;
     }
@@ -82,7 +83,7 @@ public:
         if (m_tab == nullptr) return;
         for (size_t i = 0; i <= m_mask; i++)
             if (m_tab[i].m_val != nullptr) lean_dec(m_tab[i].m_val);
-        if (m_tab != m_inline) std::free(m_tab);
+        if (m_tab != m_inline) free_block(m_tab);
     }
 
     /** \brief Borrowed reference to the stored result for `(k, offset)`, or nullptr. */

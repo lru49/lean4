@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Authors: Sebastian Ullrich
 */
 #pragma once
+#include <cstdlib>
 #include <lean/config.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,4 +42,23 @@ template<
     class KeyEqual = std::equal_to<Key>,
     class Allocator = lean::allocator<Key>
 > using unordered_set = std::unordered_set<Key, Hash, KeyEqual, Allocator>;
+
+/* Zero-initialized raw blocks from the same allocator as the containers above (the open-addressing tables of
+   `replace_fn.h`, `expr_eq_fn.cpp` and `expr_maps.h` grow through these). With mimalloc the blocks come from the
+   calling thread's heap and are released to it like the hash-map nodes they replaced; glibc's per-thread arenas
+   instead retained the freed tables of concurrent kernel checks (+4-6 % peak RSS at -j 8 on a large `decide` module). */
+inline void * alloc_zeroed_block(size_t n, size_t size) {
+#ifdef LEAN_MIMALLOC
+    return mi_calloc(n, size);
+#else
+    return std::calloc(n, size);
+#endif
+}
+inline void free_block(void * p) {
+#ifdef LEAN_MIMALLOC
+    mi_free(p);
+#else
+    std::free(p);
+#endif
+}
 };
