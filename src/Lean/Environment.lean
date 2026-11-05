@@ -2114,7 +2114,10 @@ structure PersistentEnvExtensionDescr (α β σ : Type) extends PersistentEnvExt
 
 unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ] (descr : PersistentEnvExtensionDescr α β σ) : IO (PersistentEnvExtension α β σ) := do
   let pExts ← persistentEnvExtensionsRef.get
-  if pExts.any (fun ext => ext.name == descr.name) then throw (IO.userError s!"invalid environment extension, '{descr.name}' has already been used")
+  -- This scan runs once per registered extension, i.e. quadratically in the extension count at
+  -- every process start; the cached name hash rejects other names without a call to `Name.beq`.
+  let h := descr.name.hash
+  if pExts.any (fun ext => ext.name.hash == h && ext.name == descr.name) then throw (IO.userError s!"invalid environment extension, '{descr.name}' has already been used")
   let replay? := descr.replay?.map fun replay =>
     fun oldState newState newConsts s => { s with state := replay oldState.state newState.state newConsts s.state }
   let ext ← registerEnvExtension (asyncMode := descr.asyncMode) (replay? := replay?)
