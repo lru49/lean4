@@ -258,6 +258,13 @@ because it overrides unrelated configurations.
     else
       withConfig (fun cfg => { cfg with beta := true, iota := true, zeta := true, zetaHave := true, zetaDelta := true, proj := .yesWithDelta, etaStruct := .all }) x
 
+/-- The recursion-depth check of `withIncRecDepth`, without entering the deeper context. -/
+@[inline] private def checkInferTypeLeafDepth : MetaM Unit := do
+  let curr ← MonadRecDepth.getRecDepth
+  let max  ← MonadRecDepth.getMaxRecDepth
+  if max != 0 && curr == max then
+    throwMaxRecDepthAt (← getRef)
+
 set_option compiler.ignoreBorrowAnnotation true in
 @[export lean_infer_type]
 def inferTypeImp (e : Expr) : MetaM Expr :=
@@ -276,7 +283,17 @@ def inferTypeImp (e : Expr) : MetaM Expr :=
     | .forallE ..    => checkInferTypeCache e (inferForallType e)
     | .lam ..        => checkInferTypeCache e (inferLambdaType e)
     | .letE ..       => checkInferTypeCache e (inferLambdaType e)
-  withIncRecDepth <| withInferTypeConfig (infer e)
+  -- Leaves whose type does not depend on the `MetaM` configuration or transparency (local and
+  -- metavariable declarations, literals, sorts, constants without universe arguments) skip the
+  -- reader-context updates of `withIncRecDepth` and `withInferTypeConfig`: only the recursion-depth
+  -- limit check is kept, so the result and the error behaviour are unchanged.
+  match e with
+  | .fvar fvarId   => do checkInferTypeLeafDepth; inferFVarType fvarId
+  | .mvar mvarId   => do checkInferTypeLeafDepth; inferMVarType mvarId
+  | .const c []    => do checkInferTypeLeafDepth; inferConstType c []
+  | .lit v         => do checkInferTypeLeafDepth; return v.type
+  | .sort lvl      => do checkInferTypeLeafDepth; return mkSort (mkLevelSucc lvl)
+  | _              => withIncRecDepth <| withInferTypeConfig (infer e)
 
 /--
 Return `LBool.true` if given level is always equivalent to universe level zero.
