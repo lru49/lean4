@@ -7,7 +7,6 @@ Author: Leonardo de Moura
 #pragma once
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <new>
 #include "util/alloc.h" // lean-perf (step g): tables from the same allocator as the hash-map nodes they replaced
 
@@ -22,12 +21,8 @@ class ptr_pair_set {
     };
     static constexpr size_t initial_capacity = 16;
     // Most traversals insert only a few elements, so the first slots need no allocation.
-    /* lean-perf (CE eqlazy): the inline table is zeroed on the first insertion, not at construction.
-       Most `expr_eq_fn` instances (every `Expr.eqv`/`Expr.equal`/`==` on `Expr`, e.g. each hit of a
-       Meta cache keyed by expressions) return at the root (pointer equality, hash or kind mismatch,
-       atoms) without inserting anything, and must not pay for clearing 256 bytes. */
-    slot   m_initial[initial_capacity];
-    slot * m_slots = nullptr; // `m_initial` after the first insertion
+    slot   m_initial[initial_capacity] = {};
+    slot * m_slots = m_initial;
     size_t m_mask  = initial_capacity - 1;
     size_t m_size  = 0;
 
@@ -60,15 +55,11 @@ public:
     ptr_pair_set() {}
     ptr_pair_set(ptr_pair_set const &) = delete;
     ~ptr_pair_set() {
-        if (m_slots && m_slots != m_initial)
+        if (m_slots != m_initial)
             free_block(m_slots);
     }
     /* Inserts `(p, w)`, returning whether it was absent. */
     bool insert(void const * p, uintptr_t w) {
-        if (!m_slots) {
-            std::memset(m_initial, 0, sizeof(m_initial));
-            m_slots = m_initial;
-        }
         if (2 * (m_size + 1) > m_mask + 1)
             grow();
         size_t i = hash_of(p, w) & m_mask;

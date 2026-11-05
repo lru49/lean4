@@ -108,33 +108,15 @@ public:
     bool operator()(expr const & a, expr const & b) { return apply(a, b, true); }
 };
 
-/* lean-perf (CE eqlazy): the root-level early exits of `expr_eq_fn::apply` and `budgeted_expr_eq_fn::apply`
-   (pointer equality, hash mismatch, kind mismatch), decided before a comparison object is constructed.
-   Returns 1 (equal), 0 (different) or -1 (undecided: run the full comparison). Both comparison objects
-   would return the same answer on these paths without counting heartbeats or consuming budget, so the
-   results are identical. */
-static inline int expr_eq_root_quick(expr const & a, expr const & b) {
-    if (is_eqp(a, b))          return 1;
-    if (hash(a) != hash(b))    return 0;
-    if (a.kind() != b.kind())  return 0;
-    return -1;
-}
-
 bool is_equal(expr const & a, expr const & b) {
-    int q = expr_eq_root_quick(a, b);
-    if (q >= 0) return q;
     return expr_eq_fn<false>()(a, b);
 }
 
 extern "C" LEAN_EXPORT uint8 lean_expr_eqv(b_obj_arg a, b_obj_arg b) {
-    int q = expr_eq_root_quick(TO_REF(expr, a), TO_REF(expr, b));
-    if (q >= 0) return q;
     return expr_eq_fn<false>()(TO_REF(expr, a), TO_REF(expr, b));
 }
 
 extern "C" LEAN_EXPORT uint8 lean_expr_equal(b_obj_arg a, b_obj_arg b) {
-    int q = expr_eq_root_quick(TO_REF(expr, a), TO_REF(expr, b));
-    if (q >= 0) return q;
     return expr_eq_fn<true>()(TO_REF(expr, a), TO_REF(expr, b));
 }
 
@@ -317,14 +299,10 @@ public:
 };
 
 extern "C" LEAN_EXPORT uint8 lean_expr_eqv_budgeted(b_obj_arg a, b_obj_arg b, size_t budget) {
-    int q = expr_eq_root_quick(TO_REF(expr, a), TO_REF(expr, b));
-    if (q >= 0) return static_cast<uint8>(q ? budgeted_eq_result::True : budgeted_eq_result::False);
     return static_cast<uint8>(budgeted_expr_eq_fn<false>(budget)(TO_REF(expr, a), TO_REF(expr, b)));
 }
 
 extern "C" LEAN_EXPORT uint8 lean_expr_equal_budgeted(b_obj_arg a, b_obj_arg b, size_t budget) {
-    int q = expr_eq_root_quick(TO_REF(expr, a), TO_REF(expr, b));
-    if (q >= 0) return static_cast<uint8>(q ? budgeted_eq_result::True : budgeted_eq_result::False);
     return static_cast<uint8>(budgeted_expr_eq_fn<true>(budget)(TO_REF(expr, a), TO_REF(expr, b)));
 }
 }
