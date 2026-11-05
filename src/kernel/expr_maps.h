@@ -16,7 +16,7 @@ template<typename T>
 using expr_map = typename lean::unordered_map<expr, T, expr_hash, std::equal_to<expr>>;
 
 /** \brief Cache from expressions to `T` keyed by structural equality (`std::equal_to<expr>`, i.e. `is_equal`), as
-    `expr_map<T>`, but as an open-addressing table (linear probing, power-of-two capacity, load factor <= 1/2) that
+    `expr_map<T>`, but as an open-addressing table (linear probing, power-of-two capacity, load factor <= 2/3) that
     stores the key's structural hash next to the entry, so a probe compares hashes before it compares expressions and no
     node is allocated per entry. Owns one reference to every key and value. Used for the kernel type checker's
     per-declaration caches (`infer_type`, `whnf_core`, `whnf`, `unfold`), where the `std::unordered_map` node
@@ -80,7 +80,10 @@ public:
     }
     /** \brief Store `v` for `k` unless a structurally equal key is present. */
     void insert(expr const & k, T const & v) {
-        if (m_tab == nullptr || (m_size + 1) * 2 > m_mask + 1) grow();
+        // Load factor 2/3 (linear probing with stored hashes stays at ~2 probes per hit): 36-72 B per entry over a
+        // doubling cycle, i.e. the memory of the std::unordered_map nodes it replaces (~48 B); at 1/2 the kernel's
+        // caches for a large `decide` re-check were 0.6 GB larger than the node maps at their peak.
+        if (m_tab == nullptr || (m_size + 1) * 3 > (m_mask + 1) * 2) grow();
         unsigned h = hash(k);
         size_t i = slot(h, m_mask);
         while (true) {
