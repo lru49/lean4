@@ -27,6 +27,7 @@ import Init.Data.Slice
 import Init.Data.String.TakeDrop
 import Init.Data.Range.Polymorphic.Iterators
 import Init.While
+import Std.Sync.Mutex -- lean-perf (L01c): the region-prefetch map
 
 public section
 
@@ -2427,6 +2428,23 @@ def numThreads (cap : Nat := 8) : BaseIO Nat := do
     | none => n
   return max 1 (min n cap)
 
+/-- lean-perf: start time (`IO.monoNanosNow`) of the current `importModules`, for the
+`LEAN_IMPORT_DEBUG=1` timeline. -/
+builtin_initialize timelineStartRef : IO.Ref Nat ← IO.mkRef 0
+
+def timelineStart : IO Unit := do
+  if (← debugEnabled) then
+    timelineStartRef.set (← IO.monoNanosNow)
+
+/-- `+<ms since the import started>` of the time stamp `t`. -/
+def sinceStart (t : Nat) : BaseIO String := do
+  return s!"+{elapsedMs (← timelineStartRef.get) t}"
+
+/-- `LEAN_IMPORT_DEBUG=1`: prints `[timeline] +<ms> <what>` to stderr. -/
+def tick (what : String) : IO Unit := do
+  if (← debugEnabled) then
+    IO.eprintln s!"[timeline] {← sinceStart (← IO.monoNanosNow)} {what}"
+
 end ParallelImport
 
 private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
@@ -2473,12 +2491,14 @@ where
       if let some (some t) := tasks[i]? then
         -- lean-perf: state computed on a task; a `parallelImport` extension registers no extensions
         -- or attributes, so the growth check below is not needed here.
+        let tw0 ← IO.monoNanosNow
         let (newState, ta, tb) ← IO.ofExcept t.get
+        let tw1 ← IO.monoNanosNow
         let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
         let env := extDescr.toEnvExtension.setState (asyncMode := .sync) (log := .unlogged) env
           { s with state := newState }
-        if (← ParallelImport.debugEnabled) && tb - ta ≥ 2000000 then
-          IO.eprintln s!"[par-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs ta tb} (task)"
+        if (← ParallelImport.debugEnabled) && (tb - ta ≥ 1000000 || tw1 - tw0 ≥ 1000000) then
+          IO.eprintln s!"[par-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs ta tb} on a task ({← ParallelImport.sinceStart ta}..{← ParallelImport.sinceStart tb}); main waited {ParallelImport.elapsedMs tw0 tw1} ({← ParallelImport.sinceStart tw0}..{← ParallelImport.sinceStart tw1})"
         return (← loop (i + 1) env tasks)
       -- Use `sync` to avoid `async` checks; there is only one environment branch at this point
       -- anyway.
@@ -2487,10 +2507,10 @@ where
       let prevAttrSize ← getNumBuiltinAttributes
       let t0 ← IO.monoNanosNow
       let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
-      if par && (← ParallelImport.debugEnabled) then
+      if (← ParallelImport.debugEnabled) then
         let t1 ← IO.monoNanosNow
-        if t1 - t0 ≥ 2000000 then
-          IO.eprintln s!"[seq-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs t0 t1}"
+        if t1 - t0 ≥ 1000000 then
+          IO.eprintln s!"[seq-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs t0 t1} ({← ParallelImport.sinceStart t0}..{← ParallelImport.sinceStart t1})"
       -- unlogged: nothing has been recorded against this environment yet
       let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) (log := .unlogged) env
         { s with state := newState }
@@ -2498,7 +2518,10 @@ where
         -- Run `[init]` attributes now. We do this after `setState` so `runInitAttrs` can access
         -- `getModule(IR)Entries` but we should also do it before attempting to run user-defined
         -- extensions further down in `pExtDescrs` so they can access initialized declarations.
+        let ti0 ← IO.monoNanosNow
         runInitAttrs env opts
+        if (← ParallelImport.debugEnabled) then
+          IO.eprintln s!"[seq-ext] {i} runInitAttrs: {ParallelImport.elapsedMs ti0 (← IO.monoNanosNow)} ({← ParallelImport.sinceStart ti0}..{← ParallelImport.sinceStart (← IO.monoNanosNow)})"
       env ← ensureExtensionsArraySize env
       let mut tasks := tasks
       if (← persistentEnvExtensionsRef.get).size > prevSize || (← getNumBuiltinAttributes) > prevAttrSize then
@@ -2615,6 +2638,97 @@ private def readIRPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRe
   let ir ← unsafe CompactedRegion.read (α := ModuleData) irFile #[irSig.2]
   return #[irSig, ir]
 
+/-!
+lean-perf (L01c, perf/parallel-import-2): module parts loaded ahead of the import DFS.
+
+`importModulesCore` discovers the import graph depth first, mapping each module's parts
+(`CompactedRegion.read`: open, fstat, header read, mmap, first page faults) when it reaches the module,
+and `moduleNames` is that DFS post-order. With the plain import level (`globalLevel = .private`, the
+case of every non-`module` root) every reachable module is loaded with ALL its parts (`importAll`,
+`needsIR`), so the set of files to map is fixed in advance and loading can run on tasks: a module's
+task maps its parts and then prefetches the module's own imports (the same `imports` array the DFS
+recurses into), so the graph is discovered on all worker threads while the DFS consumes the tasks in
+upstream order. The DFS logic, `moduleNames`, the `ImportedModule` records and `header.regions` are
+unchanged; only *when* and *on which thread* a file is mapped differs. Errors surface where upstream
+would throw them (the DFS rethrows the task's error when it reaches the module). `-j 1`, `module`
+roots (`globalLevel < .private`) and `LEAN_IMPORT_PREFETCH=0` keep the upstream code path.
+-/
+
+/-- `.olean` parts and IR parts of one module. -/
+private abbrev PrefetchedParts := Array (ModuleData × CompactedRegion) × Array (ModuleData × CompactedRegion)
+private abbrev PrefetchTask := Task (Except IO.Error PrefetchedParts)
+/-- A persistent map: a `set` marks the stored value MT, which walks every object not yet MT; with a
+`Std.HashMap` that is the whole (copied, since shared) bucket array on every update, i.e. O(modules x
+buckets) in total (measured: 4.5 s of import at `-j 8`), with an RB map it is the O(log n) copied path. -/
+private abbrev PrefetchMap := NameMap PrefetchTask
+
+/-- `importModulesCore.loadData` as a standalone function. -/
+private def loadModuleData (arts : NameMap ImportArtifacts) (globalLevel : OLeanLevel) (i : Import) :
+    IO (Array (ModuleData × CompactedRegion)) := do
+  if let some arts := arts.find? i.module then
+    -- Opportunistically load all available parts.
+    -- Producer (e.g., Lake) should limit parts to the proper import level.
+    readModuleDataParts (arts.oleanParts (inServer := globalLevel ≥ .server))
+  else
+    readModuleDataPartsOfMod i.module
+
+/-- `importModulesCore.loadIR` as a standalone function. -/
+private def loadModuleIR (arts : NameMap ImportArtifacts) (i : Import) :
+    IO (Array (ModuleData × CompactedRegion)) := do
+  if let some arts := arts.find? i.module then
+    readModuleDataParts arts.irParts
+  else
+    readIRPartsOfMod i.module
+
+/-- The prefetch map behind a blocking mutex. An `IO.Ref` used as a spin lock (`take`/`put`) was the first
+version: with as many worker threads as cores the spinning takers starve the holder (import 1.2 -> 2.5 s at
+`-j 8` on 8 cores); `Std.BaseMutex` blocks instead. -/
+private structure PrefetchState where
+  mutex : Std.BaseMutex
+  map   : IO.Ref PrefetchMap
+
+/-- Under the lock: the tasks of `imports`, spawning the missing ones with `spawn` (one lock round per
+module, not per import). -/
+private def prefetchModules (st : PrefetchState) (imports : Array Import)
+    (spawn : Import → BaseIO PrefetchTask) : BaseIO (Array PrefetchTask) := do
+  st.mutex.lock
+  let mut m ← st.map.get
+  let mut ts : Array PrefetchTask := #[]
+  for i in imports do
+    match m.find? i.module with
+    | some t => ts := ts.push t
+    | none =>
+      let t ← spawn i
+      m := m.insert i.module t
+      ts := ts.push t
+  st.map.set m
+  st.mutex.unlock
+  return ts
+
+/--
+Spawns the task loading the parts of `i`. Once its parts are mapped, the task prefetches the module's
+imports (those of the part `ImportedModule.mainModule?` selects under `importAll`: the private part of
+a `module`, else the only part), so the import graph is discovered on all worker threads.
+-/
+private partial def spawnLoad (st : PrefetchState) (arts : NameMap ImportArtifacts)
+    (globalLevel : OLeanLevel) (i : Import) : BaseIO PrefetchTask :=
+  IO.asTask (prio := .default) do
+    let parts ← loadModuleData arts globalLevel i
+    let irParts ← loadModuleIR arts i
+    let data? : Option ModuleData := match parts[0]? with
+      | some (d0, _) =>
+        (if d0.isModule then parts[(OLeanLevel.«private»).ctorIdx]? else parts[0]?).map (·.1)
+      | none => none
+    if let some data := data? then
+      discard <| prefetchModules st data.imports (spawnLoad st arts globalLevel)
+    return (parts, irParts)
+
+/-- The task loading the parts of `i` (started now unless one exists). -/
+private def prefetchModule (st : PrefetchState) (arts : NameMap ImportArtifacts)
+    (globalLevel : OLeanLevel) (i : Import) : BaseIO PrefetchTask := do
+  let ts ← prefetchModules st #[i] (spawnLoad st arts globalLevel)
+  return ts[0]!
+
 partial def importModulesCore
     (imports : Array Import) (globalLevel : OLeanLevel := .private)
     (arts : NameMap ImportArtifacts := {}) (isExported : Bool := globalLevel < .private)
@@ -2622,7 +2736,16 @@ partial def importModulesCore
     -- on imports
     (loadIRSig : Bool := false) :
     ImportStateM Unit := do
-  go imports (importAll := true) (isExported := isExported) (needsData := true) (needsIRTrans := false)
+  -- lean-perf (L01c): with several import threads and the plain import level every reachable module
+  -- is loaded with all its parts, so the parts are loaded ahead of the DFS on tasks (see above)
+  let pref? ← if globalLevel == .private && (← ParallelImport.numThreads) > 1 &&
+      (← ParallelImport.envEnabled "LEAN_IMPORT_PREFETCH") then do
+    let pref : PrefetchState := { mutex := ← Std.BaseMutex.new, map := ← IO.mkRef ({} : PrefetchMap) }
+    discard <| prefetchModules pref imports (spawnLoad pref arts globalLevel)
+    pure (some pref)
+  else
+    pure none
+  go pref? imports (importAll := true) (isExported := isExported) (needsData := true) (needsIRTrans := false)
   if globalLevel < .private then
     for i in imports do
       if let some mod := (← get).moduleNameMap[i.module]?.bind (·.mainModule?) then
@@ -2685,7 +2808,7 @@ When neither `needsIR(A)` nor `A != none` is true, the module is not visited at 
 the module map.
 -/
 where
-  go (imports : Array Import) (importAll isExported needsData needsIRTrans : Bool) := do
+  go (pref? : Option PrefetchState) (imports : Array Import) (importAll isExported needsData needsIRTrans : Bool) := do
     for i in imports do
       -- `B > none`?
       let needsData := needsData && (i.isExported || importAll)
@@ -2709,7 +2832,7 @@ where
 
       let goRec mod := do
         if let some mod := mod.mainModule? then
-          go (importAll := importAll) (isExported := isExported) (needsData := needsData) (needsIRTrans := needsIRTrans) mod.imports
+          go pref? (importAll := importAll) (isExported := isExported) (needsData := needsData) (needsIRTrans := needsIRTrans) mod.imports
 
       if let some mod := (← get).moduleNameMap[i.module]? then
         -- when module is already imported, bump flags
@@ -2730,8 +2853,19 @@ where
         continue
 
       -- newly discovered module
-      let parts ← if needsData then loadData i else pure #[]
-      let irParts ← if needsIR then loadIR i else pure #[]
+      let (parts, irParts) ← match pref? with
+        | some pref => do
+          -- lean-perf (L01c): parts loaded ahead on a task; `needsData` and `needsIR` both hold at
+          -- the plain import level, the task's error is rethrown here, where upstream would throw it
+          let t ← prefetchModule pref arts globalLevel i
+          let (parts, irParts) ← match t.get with
+            | .ok r => pure r
+            | .error e => throw e
+          pure (if needsData then parts else #[], if needsIR then irParts else #[])
+        | none => do
+          let parts ← if needsData then loadData i else pure #[]
+          let irParts ← if needsIR then loadIR i else pure #[]
+          pure (parts, irParts)
       let mod := { i with importAll, isExported, irPhases, parts, irParts, needsIRTrans, hasData := needsData }
       goRec mod
       modify fun s => { s with
@@ -2739,22 +2873,9 @@ where
         moduleNames := s.moduleNames.push i.module
       }
   -- .olean + .olean.server (optional) + .olean.private (optional)
-  loadData i := do
-    if let some arts := arts.find? i.module then
-      -- Opportunistically load all available parts.
-      -- Producer (e.g., Lake) should limit parts to the proper import level.
-      let fnames := arts.oleanParts (inServer := globalLevel ≥ .server)
-      readModuleDataParts fnames
-    else
-      readModuleDataPartsOfMod i.module
+  loadData i := loadModuleData arts globalLevel i
   -- .ir.sig + .ir (optional)
-  loadIR i := do
-    if let some arts := arts.find? i.module then
-      -- Opportunistically load all available parts.
-      -- Producer (e.g., Lake) should limit parts to the proper import level.
-      readModuleDataParts arts.irParts
-    else
-      readIRPartsOfMod i.module
+  loadIR i := loadModuleIR arts i
 
 /--
 Returns `true` if `cinfo₁` and `cinfo₂` represent the same theorem/axiom, with `cinfo₁` potentially
@@ -2943,6 +3064,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   let publicFind? := (ImportedConsts.mergeModuleTreesLazy publicTrees).find?
   let publicImported ← withCache <|
     ImportedConsts.mergeModuleTreesLazy publicTrees (resolveImportedEntry publicFind?)
+  ParallelImport.tick "import conflicts checked, constant tries set up (merged lazily)"
 
   -- lean-perf: thread budget of the import phase (see `ParallelImport`)
   let importThreads ← ParallelImport.numThreads
@@ -2962,6 +3084,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   }
   let publicBase := { privateBase with constants := { map₁ := publicImported }, header.regions := #[] }
   let extensions ← setImportedEntries privateBase.extensions moduleData
+  ParallelImport.tick "setImportedEntries"
   -- fall back to basic data when not in server
   let serverData := modules.mapIdx (fun idx mod => mod.serverData? level |>.getD moduleData[idx]!)
   -- `serverData?` selects a different part than `mainModule?` only at `.server`: at `.private`,
@@ -2972,6 +3095,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   let serverBaseExts ←
     if serverIsMain then pure extensions else setImportedEntries privateBase.extensions serverData
   let privateBase := { privateBase with extensions, irBaseExts }
+  ParallelImport.tick "IR/server entries, env assembled"
   let mut env : Environment := {
     base.private := privateBase
     base.public  := publicBase
@@ -2992,11 +3116,13 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
 
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
+    ParallelImport.tick "markPersistent 1"
   if loadExts then
     -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
     -- already persistent then, so capturing it in task closures costs nothing)
     let parExts := leakEnv && importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_EXTS")
     env ← finalizePersistentExtensions env moduleData opts (par := parExts)
+    ParallelImport.tick "extension states"
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.
@@ -3004,6 +3130,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
         Safety: There are no concurrent accesses to `env` at this point, assuming
         extensions' `addImportFn`s did not spawn any unbound tasks. -/
       env ← unsafe Runtime.markPersistent env
+      ParallelImport.tick "markPersistent 2"
   return { env with importRealizationCtx? := some {
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast env
@@ -3038,10 +3165,14 @@ def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32
     if imp.module matches .anonymous then
       throw <| IO.userError "import failed, trying to import module with anonymous name"
   withImporting do
+    ParallelImport.timelineStart
     plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
     let (_, s) ← importModulesCore (globalLevel := level) imports arts |>.run
-    finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
+    ParallelImport.tick "importModulesCore (regions mapped)"
+    let env ← finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
       s imports opts trustLevel
+    ParallelImport.tick "finalizeImport done"
+    return env
 
 /--
 Creates environment object from imports and frees compacted regions after calling `act`. No live
