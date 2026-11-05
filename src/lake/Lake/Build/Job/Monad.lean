@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Build.Fetch
+public import Init.Task
 
 open System Lean
 
@@ -279,6 +280,27 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
   | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
   | ra, rb => .error 0 (ra.state.merge rb.state)
 
+/--
+`init.zipWithAll f jobs` produces the same job as
+`jobs.foldl (·.zipWith (sync := true) f ·) init`, but combines the results in a single
+pass once all jobs have finished.
+
+In the chain of `zipWith`s, every step reads its accumulator (the value, its log and its
+trace, whose `inputs` grow by one per step) out of the previous step's task result, where it
+is shared, so each step copies it and marks the copy multi-threaded: quadratic in the number
+of jobs (e.g. ~7,000 imports of `Mathlib`). Here the accumulator stays unshared and is
+extended in place. Results, logs and traces are identical, in the same order.
+-/
+public def zipWithAll
+  [OptDataKind α] (f : α → β → α) (init : Job α) (jobs : Array (Job β))
+: Job α :=
+  if jobs.isEmpty then init else
+  Job.ofTask <| init.task.bind (sync := true) fun r0 =>
+    Task.mapList (sync := true) (tasks := jobs.toList.map (·.task)) fun rs =>
+      rs.foldl (init := r0) fun
+        | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
+        | ra, rb => .error 0 (ra.state.merge rb.state)
+
 /-- Merges this job with another, discarding its output and trace. -/
 public def add (self : Job α) (other : Job β) : Job α :=
   have : OptDataKind α := self.kind
@@ -296,7 +318,7 @@ public def mixList (jobs : List (Job α)) (traceCaption := "<collection>")  : Jo
 
 /-- Merge an `Array` of jobs into one, discarding their outputs. -/
 public def mixArray (jobs : Array (Job α)) (traceCaption := "<collection>")  : Job Unit :=
-  jobs.foldl (·.mix ·) (traceRoot () traceCaption)
+  (traceRoot () traceCaption).zipWithAll (fun _ _ => ()) jobs
 
 /-- Merge a `List` of jobs into one, collecting their outputs into a `List`. -/
 public def collectList (jobs : List (Job α)) (traceCaption := "<collection>") : Job (List α) :=
@@ -304,7 +326,7 @@ public def collectList (jobs : List (Job α)) (traceCaption := "<collection>") :
 
 /-- Merge an `Array` of jobs into one, collecting their outputs into an `Array`. -/
 public def collectArray (jobs : Array (Job α)) (traceCaption := "<collection>") : Job (Array α) :=
-  jobs.foldl (zipWith (sync := true) Array.push) (traceRoot (Array.mkEmpty jobs.size) traceCaption)
+  (traceRoot (Array.mkEmpty jobs.size) traceCaption).zipWithAll Array.push jobs
 
 instance : Nonempty ({α : Type u} → [Nonempty α] → α) := ⟨Classical.ofNonempty⟩
 
