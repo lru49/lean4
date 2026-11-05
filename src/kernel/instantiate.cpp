@@ -135,7 +135,7 @@ expr instantiate_rev(expr const & a, unsigned n, expr const * subst) {
                 }
             }
             return none_expr();
-        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); ,
+        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); },
         [=](expr const & m, unsigned offset) -> optional<expr> {
             /* lean-perf (CE instbvar): see `instantiate` above. */
             if (is_bvar(m)) {
@@ -171,7 +171,7 @@ static object * lean_expr_instantiate_rev_core(object * a0, size_t n, object ** 
                 }
             }
             return none_expr();
-        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); ,
+        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); },
         [=](expr const & m, unsigned offset) -> optional<expr> {
             /* lean-perf (CE instbvar): see `instantiate` above. */
             if (is_bvar(m)) {
