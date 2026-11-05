@@ -8,6 +8,8 @@ Author: Leonardo de Moura
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdint>
+#include <new>
 #include <lean/lean.h>
 #include "runtime/hash.h"
 #include "runtime/compact.h"
@@ -30,41 +32,122 @@ Author: Leonardo de Moura
 #endif
 
 #define LEAN_COMPACTOR_INIT_SZ 1024*1024
-#define LEAN_MAX_SHARING_TABLE_INITIAL_SIZE 1024*1024
+#define LEAN_MAX_SHARING_TABLE_INITIAL_SIZE (64*1024)
+#define LEAN_OBJ_TABLE_INITIAL_SIZE (64*1024)
 
 // uncomment to track the number of each kind of object in an .olean file
 // #define LEAN_TAG_COUNTERS
 
 namespace lean {
 
-struct max_sharing_key {
-    size_t m_offset;
-    size_t m_size;
-    max_sharing_key(size_t offset, size_t sz):m_offset(offset), m_size(sz) {}
-};
+/*
+  Both tables of the compactor are open-addressing (linear probing, power-of-two capacity, load
+  factor <= 1/2) instead of node-based `std::unordered_*` containers: every compacted object used to
+  cost two node allocations, two pointer-table probes and two byte-hash computations (`find` then
+  `insert` in the sharing set). The contents and lookup semantics are unchanged (a pointer maps to
+  the offset it was first saved at; a byte sequence maps to the first object with those bytes), so
+  the produced buffer is byte-identical; only the cost of each lookup changes.
+*/
+static inline size_t compactor_table_capacity(size_t n) {
+    size_t c = 1;
+    while (c < n) c <<= 1;
+    return c;
+}
 
-struct max_sharing_hash {
-    object_compactor * m;
-    max_sharing_hash(object_compactor * manager):m(manager) {}
-    unsigned operator()(max_sharing_key const & k) const {
-        return hash_str(k.m_size, reinterpret_cast<unsigned char const *>(m->m_begin) + k.m_offset, 17);
+/* `object *` -> `object_offset`. Keys are never `nullptr` (scalars are not stored), so a null key
+   marks an empty slot. */
+struct object_compactor::obj_table {
+    struct slot { object * m_key; object_offset m_val; };
+    slot *   m_slots;
+    size_t   m_mask;
+    unsigned m_shift;
+    size_t   m_size = 0;
+    explicit obj_table(size_t cap) { init(compactor_table_capacity(cap)); }
+    ~obj_table() { free(m_slots); }
+    void init(size_t cap) {
+        m_slots = static_cast<slot *>(calloc(cap, sizeof(slot)));
+        if (!m_slots) throw std::bad_alloc();
+        m_mask  = cap - 1;
+        m_shift = 64 - __builtin_ctzll(cap);
+    }
+    size_t index(object * k) const {
+        // Fibonacci hashing: the high bits of the product mix all address bits (objects are
+        // 8-aligned, so the low bits of the address alone would collide).
+        uint64_t h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k)) * 0x9E3779B97F4A7C15ull;
+        return m_shift >= 64 ? 0 : static_cast<size_t>(h >> m_shift);
+    }
+    object_offset const * find(object * k) const {
+        for (size_t i = index(k);; i = (i + 1) & m_mask) {
+            slot const & s = m_slots[i];
+            if (s.m_key == k) return &s.m_val;
+            if (s.m_key == nullptr) return nullptr;
+        }
+    }
+    void grow() {
+        slot * old = m_slots;
+        size_t old_cap = m_mask + 1;
+        init(old_cap * 2);
+        for (size_t j = 0; j < old_cap; j++) {
+            if (old[j].m_key == nullptr) continue;
+            size_t i = index(old[j].m_key);
+            while (m_slots[i].m_key != nullptr) i = (i + 1) & m_mask;
+            m_slots[i] = old[j];
+        }
+        free(old);
+    }
+    /* Like `std::unordered_map::insert`: keeps the existing value if `k` is present. */
+    void insert(object * k, object_offset v) {
+        if (2 * (m_size + 1) > m_mask + 1) grow();
+        for (size_t i = index(k);; i = (i + 1) & m_mask) {
+            slot & s = m_slots[i];
+            if (s.m_key == k) return;
+            if (s.m_key == nullptr) { s.m_key = k; s.m_val = v; m_size++; return; }
+        }
     }
 };
 
-struct max_sharing_eq {
-    object_compactor * m;
-    max_sharing_eq(object_compactor * manager):m(manager) {}
-    bool operator()(max_sharing_key const & k1, max_sharing_key const & k2) const {
-        if (k1.m_size != k2.m_size) return false;
-        return memcmp(reinterpret_cast<char*>(m->m_begin) + k1.m_offset, reinterpret_cast<char*>(m->m_begin) + k2.m_offset, k1.m_size) == 0;
-    }
-};
-
-
+/* Set of byte ranges `[offset, offset + size)` of the compactor buffer, keyed by their contents.
+   Sizes are never 0, so `m_size == 0` marks an empty slot. The full 64-bit hash is kept in the slot:
+   it is computed once per lookup and filters almost every `memcmp`. */
 struct object_compactor::max_sharing_table {
-    lean::unordered_set<max_sharing_key, max_sharing_hash, max_sharing_eq> m_table;
-    max_sharing_table(object_compactor * manager):
-        m_table(LEAN_MAX_SHARING_TABLE_INITIAL_SIZE, max_sharing_hash(manager), max_sharing_eq(manager)) {
+    struct slot { uint64_t m_hash; size_t m_offset; size_t m_size; };
+    slot * m_slots;
+    size_t m_mask;
+    size_t m_count = 0;
+    explicit max_sharing_table(size_t cap) { init(compactor_table_capacity(cap)); }
+    ~max_sharing_table() { free(m_slots); }
+    void init(size_t cap) {
+        m_slots = static_cast<slot *>(calloc(cap, sizeof(slot)));
+        if (!m_slots) throw std::bad_alloc();
+        m_mask = cap - 1;
+    }
+    void grow() {
+        slot * old = m_slots;
+        size_t old_cap = m_mask + 1;
+        init(old_cap * 2);
+        for (size_t j = 0; j < old_cap; j++) {
+            if (old[j].m_size == 0) continue;
+            size_t i = old[j].m_hash & m_mask;
+            while (m_slots[i].m_size != 0) i = (i + 1) & m_mask;
+            m_slots[i] = old[j];
+        }
+        free(old);
+    }
+    /* Returns the offset of an existing range with the same bytes as `[offset, offset + sz)`, or
+       inserts that range and returns `offset`. */
+    size_t find_or_insert(char const * buffer, size_t offset, size_t sz) {
+        if (2 * (m_count + 1) > m_mask + 1) grow();
+        char const * bytes = buffer + offset;
+        uint64_t h = hash_str(sz, reinterpret_cast<unsigned char const *>(bytes), 17);
+        for (size_t i = h & m_mask;; i = (i + 1) & m_mask) {
+            slot & s = m_slots[i];
+            if (s.m_size == 0) {
+                s.m_hash = h; s.m_offset = offset; s.m_size = sz; m_count++;
+                return offset;
+            }
+            if (s.m_hash == h && s.m_size == sz && memcmp(buffer + s.m_offset, bytes, sz) == 0)
+                return s.m_offset;
+        }
     }
 };
 
@@ -136,7 +219,8 @@ std::vector<lib_info> object_compactor::used_libs() const {
 
 object_compactor::object_compactor(void * base_addr, std::vector<region_view> dep_regions,
                                    bool allow_closures):
-    m_max_sharing_table(new max_sharing_table(this)),
+    m_obj_table(new obj_table(LEAN_OBJ_TABLE_INITIAL_SIZE)),
+    m_max_sharing_table(new max_sharing_table(LEAN_MAX_SHARING_TABLE_INITIAL_SIZE)),
     m_dep_regions(std::move(dep_regions)),
     m_libs(get_loaded_libs()),
     m_allow_closures(allow_closures),
@@ -166,11 +250,12 @@ void * object_compactor::alloc(size_t sz) {
         sz = sz + sizeof(void*) - rem;
     while (static_cast<char*>(m_end) + sz > m_capacity) {
         size_t new_capacity = capacity()*2;
-        void * new_begin = malloc(new_capacity);
-        memcpy(new_begin, m_begin, size());
-        m_end      = static_cast<char*>(new_begin) + size();
+        size_t used = size();
+        // `realloc` may grow in place (or remap the pages of a large block) instead of copying.
+        void * new_begin = realloc(m_begin, new_capacity);
+        if (!new_begin) throw std::bad_alloc();
+        m_end      = static_cast<char*>(new_begin) + used;
         m_capacity = static_cast<char*>(new_begin) + new_capacity;
-        free(m_begin);
         m_begin    = new_begin;
     }
     void * r = m_end;
@@ -183,18 +268,16 @@ void * object_compactor::alloc(size_t sz) {
 object_offset object_compactor::save(object * o, object * new_o) {
     lean_assert(m_begin <= new_o && new_o < m_end);
     object_offset off = reinterpret_cast<object_offset>(reinterpret_cast<char*>(new_o) - reinterpret_cast<char*>(m_begin) + reinterpret_cast<size_t>(m_base_addr));
-    m_obj_table.insert(std::make_pair(o, off));
+    m_obj_table->insert(o, off);
     return off;
 }
 
 object_offset object_compactor::save_max_sharing(object * o, object * new_o, size_t new_o_sz) {
-    max_sharing_key k(reinterpret_cast<char*>(new_o) - reinterpret_cast<char*>(m_begin), new_o_sz);
-    auto it = m_max_sharing_table->m_table.find(k);
-    if (it != m_max_sharing_table->m_table.end()) {
+    size_t offset = reinterpret_cast<char*>(new_o) - reinterpret_cast<char*>(m_begin);
+    size_t found  = m_max_sharing_table->find_or_insert(static_cast<char*>(m_begin), offset, new_o_sz);
+    if (found != offset) {
         m_end = new_o;
-        new_o = reinterpret_cast<lean_object*>(reinterpret_cast<char*>(m_begin) + it->m_offset);
-    } else {
-        m_max_sharing_table->m_table.insert(k);
+        new_o = reinterpret_cast<lean_object*>(reinterpret_cast<char*>(m_begin) + found);
     }
     return save(o, new_o);
 }
@@ -203,9 +286,8 @@ object_offset object_compactor::to_offset(object * o) {
     if (lean_is_scalar(o)) {
         return o;
     } else {
-        auto it = m_obj_table.find(o);
-        if (it != m_obj_table.end()) {
-            return it->second;
+        if (object_offset const * v = m_obj_table->find(o)) {
+            return *v;
         }
         // Only check dep regions for non-heap objects
         if (!m_dep_regions.empty() && !lean_has_rc(o)) {
@@ -222,7 +304,7 @@ object_offset object_compactor::to_offset(object * o) {
                     // Object is in this dep region, compute its base_addr-relative pointer
                     object_offset off = reinterpret_cast<object_offset>(
                         reinterpret_cast<size_t>(region.base_addr) + (addr - static_cast<char *>(region.begin)));
-                    m_obj_table.insert(std::make_pair(o, off));
+                    m_obj_table->insert(o, off);
                     return off;
                 }
             }
