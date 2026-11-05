@@ -18,7 +18,7 @@ namespace Lean
 
 builtin_initialize builtinDeclRanges : IO.Ref (NameMap DeclarationRanges) ← IO.mkRef {}
 builtin_initialize declRangeExt : MapDeclarationExtension DeclarationRanges ←
-  mkMapDeclarationExtension (exportEntriesFn := fun _ s =>
+  mkMapDeclarationExtension (metaCacheSafe := true) (exportEntriesFn := fun _ s =>
     let ents := s.toArray
     { exported := #[], server := ents, «private» := ents })
 

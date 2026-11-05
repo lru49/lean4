@@ -255,6 +255,7 @@ deriving Inhabited
 def mkMapDeclarationExtension (name : Name := by exact decl_name%)
     (asyncMode : EnvExtension.AsyncMode := .async .mainEnv)
     (logWrites : Bool := false)
+    (metaCacheSafe : Bool := false)
     (exportEntriesFn : Environment → NameMap α → OLeanEntries (Array (Name × α)) :=
       fun env s =>
         let all := s.toArray.filter (fun (n, _) => env.contains (skipRealize := false) n)
@@ -266,6 +267,7 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
   .mk <$> registerPersistentEnvExtension {
     name            := name,
     logWrites       := logWrites,
+    metaCacheSafe   := metaCacheSafe,
     mkInitial       := pure {}
     addImportedFn   := fun _ => pure {}
     addEntryFn      := fun s (n, v) => s.insert n v

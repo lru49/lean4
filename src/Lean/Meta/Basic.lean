@@ -766,7 +766,16 @@ instance : MonadMCtx MetaM where
 
 instance : MonadEnv MetaM where
   getEnv      := return (← getThe Core.State).env
-  modifyEnv f := do modifyThe Core.State fun s => { s with env := f s.env, cache := {} }; modify fun s => { s with cache := {} }
+  modifyEnv f := do
+    -- Caches of `whnf`/`inferType`/`isDefEq`/type class results are kept across a modification that
+    -- cannot change their results (`Environment.cachesSurvive`: same constants, no write to an
+    -- extension elaboration consults), e.g. adding a doc string or a declaration range, and dropped
+    -- otherwise, as before. Dropping is the expensive part for files whose caches hold large terms.
+    let keep ← modifyGetThe Core.State fun s =>
+      let env := f s.env
+      let keep := s.env.cachesSurvive env
+      (keep, { s with env, cache := if keep then s.cache else {} })
+    unless keep do modify fun s => { s with cache := {} }
 
 instance : AddMessageContext MetaM where
   addMessageContext := addMessageContextFull

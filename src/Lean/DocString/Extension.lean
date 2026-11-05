@@ -127,11 +127,12 @@ private builtin_initialize builtinDocStrings : IO.Ref (NameMap String) ← IO.mk
 builtin_initialize docStringExt : MapDeclarationExtension String ←
   mkMapDeclarationExtension
     (asyncMode := .async .asyncEnv)
+    (metaCacheSafe := true)
     (exportEntriesFn := fun _ s =>
       let ents := s.toArray
       { exported := #[], server := ents, «private» := ents })
 private builtin_initialize inheritDocStringExt : MapDeclarationExtension Name ←
-  mkMapDeclarationExtension (exportEntriesFn := fun _ s =>
+  mkMapDeclarationExtension (metaCacheSafe := true) (exportEntriesFn := fun _ s =>
     let ents := s.toArray
     { exported := #[], server := ents, «private» := ents })
 
@@ -139,6 +140,7 @@ private builtin_initialize builtinVersoDocStrings : IO.Ref (NameMap VersoDocStri
 builtin_initialize versoDocStringExt : MapDeclarationExtension VersoDocString ←
   mkMapDeclarationExtension
     (asyncMode := .async .asyncEnv)
+    (metaCacheSafe := true)
     (exportEntriesFn := fun _ s =>
       let ents := s.toArray
       { exported := #[], server := ents, «private» := ents })
