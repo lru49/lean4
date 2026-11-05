@@ -264,6 +264,160 @@ unsigned get_shell_num_threads(object_ref const & shell_opts) {
 extern "C" object * lean_enable_initializer_execution();
 extern "C" void lean_enable_exit_detach();
 
+#if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN) && !defined(_MSC_VER)
+#define LEAN_CHAIN_SERVER 1
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <fcntl.h>
+#include <chrono>
+#include <cstring>
+
+/* lean-perf (chain batching, lane DP): `lean --chain-server`, see `Lean.chainServerPrepare` in
+   `Shell.lean` for the protocol and the exactness conditions. One request per stdin line, TAB-separated:
+   `<cwd> <stdout file> <stderr file> <LEAN_PATH> <lean args...>`; one answer line per request:
+   `<exit code> served|fallback <seconds>`. The server imports (never elaborates); each request runs
+   in a forked child, either the ordinary driver with the held header environment or, if the request
+   cannot be served, an `exec` of a plain `lean` with the same arguments. */
+extern "C" obj_res lean_chain_server_initial(obj_arg);
+extern "C" obj_res lean_chain_server_prepare(obj_arg st, obj_arg args, obj_arg shell_opts);
+extern "C" obj_res lean_chain_server_run(obj_arg args, obj_arg shell_opts, obj_arg env);
+extern "C" void lean_reinit_task_manager_after_fork(unsigned num_workers);
+
+namespace lean {
+static std::vector<std::string> split_tabs(std::string const & line) {
+    std::vector<std::string> r;
+    size_t start = 0;
+    while (true) {
+        size_t p = line.find('\t', start);
+        if (p == std::string::npos) { r.push_back(line.substr(start)); break; }
+        r.push_back(line.substr(start, p - start));
+        start = p + 1;
+    }
+    return r;
+}
+
+static void redirect_fd(int fd, char const * path, int flags) {
+    int f = open(path, flags, 0644);
+    if (f >= 0) { dup2(f, fd); close(f); }
+}
+
+static size_t rss_kb() {
+    std::ifstream in("/proc/self/statm");
+    size_t pages = 0, resident = 0;
+    in >> pages >> resident;
+    return resident * (sysconf(_SC_PAGESIZE) / 1024);
+}
+
+static int chain_server_main(char * argv0) {
+    object_ref st(lean_chain_server_initial(box(0)));
+    char const * env_lp = getenv("LEAN_PATH");
+    std::string server_lean_path = env_lp ? env_lp : "";
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::string> f = split_tabs(line);
+        if (f.size() < 5) {
+            std::cout << "2 error 0" << std::endl;
+            continue;
+        }
+        std::string const & cwd = f[0];
+        std::string const & out = f[1];
+        std::string const & err = f[2];
+        std::string const & lean_path = f[3];
+        std::vector<char *> av;
+        av.push_back(argv0);
+        for (size_t i = 4; i < f.size(); i++) av.push_back(const_cast<char *>(f[i].c_str()));
+        av.push_back(nullptr);
+        int argc = static_cast<int>(av.size()) - 1;
+        bool served = chdir(cwd.c_str()) == 0 && lean_path == server_lean_path;
+        object_ref shell_opts;
+        object_ref env;
+        list_ref<string_ref> args;
+        if (served) {
+            // option processing as in `lean_main`; options with process-wide side effects
+            // (plugins, dynlibs) or another component are not served
+            shell_opts = mk_shell_options();
+            optind = 0;  // (glibc: full re-initialization of `getopt`)
+            opterr = 0;
+            for (;;) {
+                int c = getopt_long(argc, av.data(), g_opt_str, g_long_options, NULL);
+                if (c == -1) break;
+                if (c == '?' || c == ':' || strchr("plrSWBIdONvhgVxLYZHM", c)) { served = false; break; }
+                int rc;
+                if (process_shell_option(shell_opts, c, optarg, rc)) { served = false; break; }
+            }
+            if (served) {
+                for (int i = argc - 1; i >= optind; i--)
+                    args = list_ref<string_ref>(string_ref(av[i]), args);
+                object * r = lean_chain_server_prepare(st.steal(), args.to_obj_arg(), shell_opts.to_obj_arg());
+                // `chainServerPrepare` does not throw
+                object * pair = lean_io_result_get_value(r);
+                lean_inc(pair);
+                lean_dec(r);
+                st = object_ref(lean_ctor_get(pair, 0), true);
+                object * envo = lean_ctor_get(pair, 1);
+                if (lean_is_scalar(envo)) {
+                    served = false;
+                } else {
+                    env = object_ref(lean_ctor_get(envo, 0), true);
+                }
+                lean_dec(pair);
+            }
+        }
+        std::cout.flush();
+        std::cerr.flush();
+        fflush(stdout);
+        fflush(stderr);
+        auto t1 = std::chrono::steady_clock::now();
+        pid_t pid = fork();
+        if (pid == 0) {
+            redirect_fd(0, "/dev/null", O_RDONLY);
+            redirect_fd(1, out.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+            redirect_fd(2, err.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+            if (!served) {
+                if (chdir(cwd.c_str()) != 0) _exit(126);
+                setenv("LEAN_PATH", lean_path.c_str(), 1);
+                av[0] = const_cast<char *>("lean");
+                execv("/proc/self/exe", av.data());
+                _exit(127);
+            }
+            // threads do not survive `fork`: give the child a task manager of its own
+            lean_reinit_task_manager_after_fork(get_shell_num_threads(shell_opts));
+            uint32 rc = 1;
+            try {
+                rc = get_io_scalar_result<uint32>(lean_chain_server_run(args.to_obj_arg(), shell_opts.to_obj_arg(), env.to_obj_arg()));
+            } catch (lean::throwable & ex) {
+                std::cerr << ex.what() << "\n";
+            } catch (std::bad_alloc & ex) {
+                std::cerr << "out of memory" << std::endl;
+            }
+            std::cout.flush();
+            std::cerr.flush();
+            fflush(stdout);
+            fflush(stderr);
+            _exit(static_cast<int>(rc));
+        }
+        int status = 0;
+        int rc = 128;
+        struct rusage ru;
+        memset(&ru, 0, sizeof(ru));
+        if (pid > 0 && wait4(pid, &status, 0, &ru) == pid)
+            rc = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        auto t2 = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(t2 - t0).count();
+        double child_secs = std::chrono::duration<double>(t2 - t1).count();
+        std::cout << rc << (served ? " served " : " fallback ") << secs << " child=" << child_secs
+                  << " child_user=" << (ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6)
+                  << " child_sys=" << (ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6)
+                  << " child_minflt=" << ru.ru_minflt << " child_maxrss_kb=" << ru.ru_maxrss
+                  << " server_rss_kb=" << rss_kb() << std::endl;
+    }
+    return 0;
+}
+}
+#endif
+
 namespace lean {
 extern void (*g_lean_report_task_get_blocked_time)(std::chrono::nanoseconds);
 }
@@ -326,6 +480,23 @@ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
     // Default the configured thread stack size from the environment as in `lean_run_main`;
     // `--tstack` below overrides it.
     set_thread_stack_size_from_env();
+
+#ifdef LEAN_CHAIN_SERVER
+    if (argc == 2 && strcmp(argv[1], "--chain-server") == 0) {
+        lean::io_mark_end_initialization();
+        char const * nt = getenv("LEAN_NUM_THREADS");
+        scoped_task_manager scope_task_man(nt ? static_cast<unsigned>(atoi(nt)) : hardware_concurrency());
+        int server_rc = 1;
+        run_with_thread_stack([&]() {
+            try {
+                server_rc = lean::chain_server_main(argv[0]);
+            } catch (lean::throwable & ex) {
+                std::cerr << ex.what() << "\n";
+            }
+        });
+        return server_rc;
+    }
+#endif
 
     int rc;
     object_ref shell_opts;
