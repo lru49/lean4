@@ -34,7 +34,7 @@ class replace_cache {
         unsigned      m_offset;
         lean_object * m_val;  // nullptr = empty slot
     };
-    static constexpr size_t INLINE_CAP = 32;  // 32 * 24 B = 768 B inside the object
+    static constexpr size_t INLINE_CAP = 64;  // 64 * 24 B = 1.5 KB inside the object (zeroed only on first insertion)
     entry   m_inline[INLINE_CAP];
     entry * m_tab;   // nullptr until the first insertion
     size_t  m_mask;  // capacity - 1
@@ -56,7 +56,9 @@ class replace_cache {
     }
 
     void grow() {
-        size_t new_cap  = (m_mask + 1) * 2;
+        // Leaving the inline table means the traversal has many shared sub-terms: jump to 4x so that most such
+        // traversals grow once (`grow` was 1.3-1.8 % of cycles with 32 inline slots and 2x steps).
+        size_t new_cap  = (m_mask + 1) * (m_tab == m_inline ? 4 : 2);
         entry * new_tab = static_cast<entry *>(std::calloc(new_cap, sizeof(entry)));
         if (new_tab == nullptr) lean_internal_panic_out_of_memory();
         size_t new_mask = new_cap - 1;
