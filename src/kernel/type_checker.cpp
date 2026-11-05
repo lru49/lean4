@@ -1150,9 +1150,17 @@ optional<expr> type_checker::try_unfold_proj_app(expr const & e) {
      - l_undef it the step did not manage to establish whether they are definitionally equal or not.
 
      \remark t_n, s_n and cs are updated. */
-auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n) -> reduction_status {
-    auto d_t = is_delta(t_n);
-    auto d_s = is_delta(s_n);
+auto type_checker::lazy_delta_reduction_step(expr & t_n, expr & s_n, lazy_delta_memo & memo) -> reduction_status {
+    /* `is_delta` is a function of the term (the environment is fixed during the loop): recompute it only for a side
+       that is not the object it was computed for in the previous step. */
+    if (!memo.m_has_t || !is_eqp(memo.m_t, t_n)) {
+        memo.m_d_t = is_delta(t_n); memo.m_t = t_n; memo.m_has_t = true;
+    }
+    if (!memo.m_has_s || !is_eqp(memo.m_s, s_n)) {
+        memo.m_d_s = is_delta(s_n); memo.m_s = s_n; memo.m_has_s = true;
+    }
+    optional<constant_info> const d_t = memo.m_d_t;
+    optional<constant_info> const d_s = memo.m_d_s;
     if (!d_t && !d_s) {
         return reduction_status::DefUnknown;
     } else if (d_t && !d_s) {
@@ -1249,6 +1257,7 @@ lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
 
 /** \remark t_n, s_n are updated. */
 lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
+    lazy_delta_memo memo;
     while (true) {
         lbool r = is_def_eq_offset(t_n, s_n);
         if (r != l_undef) return r;
@@ -1261,7 +1270,7 @@ lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
             }
         }
 
-        switch (lazy_delta_reduction_step(t_n, s_n)) {
+        switch (lazy_delta_reduction_step(t_n, s_n, memo)) {
         case reduction_status::Continue:   break;
         case reduction_status::DefUnknown: return l_undef;
         case reduction_status::DefEqual:   return l_true;
@@ -1278,8 +1287,9 @@ kernel since it does not have access to reducibility annotations.
 The approach used here is more complicated, but it is also more powerful.
 */
 bool type_checker::lazy_delta_proj_reduction(expr & t_n, expr & s_n, name const & sname, nat const & idx) {
+    lazy_delta_memo memo;
     while (true) {
-        switch (lazy_delta_reduction_step(t_n, s_n)) {
+        switch (lazy_delta_reduction_step(t_n, s_n, memo)) {
         case reduction_status::Continue:   break;
         case reduction_status::DefEqual:   return true;
         case reduction_status::DefUnknown:
