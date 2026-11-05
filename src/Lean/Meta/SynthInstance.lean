@@ -991,8 +991,8 @@ private def insertCacheEntry (key : SynthInstanceCacheKey) (entry : SynthInstanc
     revivePersistentTier
     -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
     modifyThe Core.State fun s =>
-      { s with env := s.env.setSynthCacheWith (s.env.synthCache.insertEntry key entry)
-          (synthCacheWitnesses s.env) }
+      let entries := s.env.synthCache.insertEntry key entry
+      { s with env := s.env.setSynthCacheWith entries (synthCacheWitnesses s.env) }
   modifyCache fun c => { c with synthInstance := c.synthInstance.insertEntry key entry }
 
 /--
