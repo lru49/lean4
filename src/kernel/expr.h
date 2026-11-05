@@ -90,15 +90,6 @@ class expr : public object_ref {
     friend expr mk_fvar(name const & n);
     friend expr mk_const(name const & n, levels const & ls);
     friend expr mk_app(expr const & f, expr const & a);
-/* dd lane STATS build only */
-enum { DD_WC_APP, DD_LK_FRESH, DD_HIT_FRESH, DD_LK_ALL, DD_HIT_ALL, DD_BETA, DD_BETA_REST, DD_BETA_FUSE, DD_BETA_FUSE_SAVED,
-       DD_IOTA, DD_IOTA_NODES, DD_IOTA_FUSE, DD_NATLIT, DD_MKAPP_WC, DD_MKAPP_ALL, DD_UPD_WC, DD_UPD_ALL, DD_REAPPLY_NODES,
-       DD_LET, DD_KEQ_PTR, DD_KEQ_STRUCT, DD_KEQ_MISS, DD_IOTA_FUSE_BETA2, DD_WHNF_CALLS, DD_N };
-extern unsigned long long g_dd_cnt[DD_N];
-extern thread_local int g_dd_in_wc;
-#define DD_INC(i) __atomic_fetch_add(&::lean::g_dd_cnt[i], 1, __ATOMIC_RELAXED)
-#define DD_ADD(i, n) __atomic_fetch_add(&::lean::g_dd_cnt[i], (unsigned long long)(n), __ATOMIC_RELAXED)
-void dd_dump();
     friend expr mk_sort(level const & l);
     friend expr mk_lambda(name const & n, expr const & t, expr const & e, binder_info bi);
     friend expr mk_pi(name const & n, expr const & t, expr const & e, binder_info bi);
@@ -217,6 +208,15 @@ inline expr mk_bvar(unsigned idx) { return mk_bvar(nat(idx)); }
 expr mk_fvar(name const & n);
 expr mk_const(name const & n, levels const & ls);
 inline expr mk_const(name const & n) { return mk_const(n, levels()); }
+/* dd lane STATS build only */
+enum { DD_WC_APP, DD_LK_FRESH, DD_HIT_FRESH, DD_LK_ALL, DD_HIT_ALL, DD_BETA, DD_BETA_REST, DD_BETA_FUSE, DD_BETA_FUSE_SAVED,
+       DD_IOTA, DD_IOTA_NODES, DD_IOTA_FUSE, DD_NATLIT, DD_MKAPP_WC, DD_MKAPP_ALL, DD_UPD_WC, DD_UPD_ALL, DD_REAPPLY_NODES,
+       DD_LET, DD_KEQ_PTR, DD_KEQ_STRUCT, DD_KEQ_MISS, DD_IOTA_FUSE_BETA2, DD_WHNF_CALLS, DD_N };
+extern unsigned long long g_dd_cnt[DD_N];
+extern thread_local int g_dd_in_wc;
+#define DD_INC(i) __atomic_fetch_add(&::lean::g_dd_cnt[i], 1, __ATOMIC_RELAXED)
+#define DD_ADD(i, n) __atomic_fetch_add(&::lean::g_dd_cnt[i], (unsigned long long)(n), __ATOMIC_RELAXED)
+void dd_dump();
 expr mk_app(expr const & f, expr const & a);
 expr mk_app(expr const & f, unsigned num_args, expr const * args);
 expr mk_app(unsigned num_args, expr const * args);
