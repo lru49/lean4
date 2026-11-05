@@ -1015,6 +1015,20 @@ static bool task_spin_until_finished(lean_task_object * t) {
    Typical case: `Task.map` / `bind` chains such as the kernel-check chain of a module. */
 LEAN_THREAD_VALUE(bool, g_worker_skip_one_notify, false);
 
+/* lean-perf: how long an idle pool worker polls the queue before it parks on the condition variable:
+   `LEAN_TASK_WORKER_SPIN_US` microseconds (default 50, 0 = park at once). Bursts of short tasks (the import's
+   per-extension conversions, `Task.map` chains) otherwise pay a futex sleep plus a futex wake by the
+   enqueuing thread and a scheduler round trip per task. */
+static int64_t task_worker_spin_ns() {
+    static int64_t g_ns = -1;
+    if (g_ns < 0) {
+        char const * s = std::getenv("LEAN_TASK_WORKER_SPIN_US");
+        int64_t us = s ? std::max(0, atoi(s)) : 50;
+        g_ns = us * 1000;
+    }
+    return g_ns;
+}
+
 struct scoped_current_task_object : flet<lean_task_object *> {
     scoped_current_task_object(lean_task_object * t):flet(g_current_task_object, t) {}
 };
@@ -1040,6 +1054,7 @@ class task_manager {
     unsigned                                      m_num_dedicated_workers{0};
     std::deque<lean_task_object *>                m_queues[LEAN_MAX_PRIO+1];
     unsigned                                      m_queues_size{0};
+    std::atomic<unsigned>                         m_queues_size_hint{0};  // lean-perf: m_queues_size, readable without the lock
     unsigned                                      m_max_prio{0};
     condition_variable                            m_queue_cv;
     task_waiter *                                 m_waiters{nullptr};  // blocked `wait_for`/`wait_any` callers
@@ -1053,6 +1068,7 @@ class task_manager {
         lean_task_object * result      = q.front();
         q.pop_front();
         m_queues_size--;
+        m_queues_size_hint.store(m_queues_size, std::memory_order_relaxed);
         if (q.empty()) {
             while (m_max_prio > 0) {
                 --m_max_prio;
@@ -1083,6 +1099,7 @@ class task_manager {
             m_max_prio = prio;
         m_queues[prio].push_back(t);
         m_queues_size++;
+        m_queues_size_hint.store(m_queues_size, std::memory_order_relaxed);
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
             spawn_worker();
         else if (g_worker_skip_one_notify)
@@ -1127,6 +1144,22 @@ class task_manager {
                     if (m_shutting_down) {
                         // We're done
                         break;
+                    }
+                    // lean-perf: poll briefly without the lock before parking
+                    if (int64_t ns = task_worker_spin_ns()) {
+                        lock.unlock();
+                        auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+                        bool seen = false;
+                        while (!seen) {
+                            for (unsigned i = 0; i < 32; i++) {
+                                if (m_queues_size_hint.load(std::memory_order_relaxed) != 0) { seen = true; break; }
+                                task_cpu_relax();
+                            }
+                            if (!seen && std::chrono::steady_clock::now() >= deadline) break;
+                        }
+                        lock.lock();
+                        if (m_queues_size != 0 || m_shutting_down)
+                            continue;
                     }
                     // Wait for new tasks
                     m_queue_cv.wait(lock);
