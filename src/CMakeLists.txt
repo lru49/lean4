@@ -209,6 +209,33 @@ string(APPEND LEANC_EXTRA_CC_FLAGS " -fstack-clash-protection")
 string(APPEND LEANC_EXTRA_CC_FLAGS " -ffp-contract=off")
 string(APPEND LEAN_EXTRA_CXX_FLAGS " -ffp-contract=off")
 
+# Profile-guided optimization (clang only): the C++ runtime/kernel and the C code of the core library are compiled
+# with an LLVM IR instrumentation profile (`-fprofile-use`). The flags reach the core library through Lake's
+# `moreLeancArgs` only, never `leanc`, so user code compiled with `leanc` is unaffected. `LEAN_PGO_PROFILE` is an
+# indexed `.profdata` file or a `.tar.xz` holding one; it defaults to `src/pgo/lean.profdata.tar.xz` when that file
+# exists. Functions changed since the profile was recorded are detected by their control-flow hash and compiled
+# without profile data, so a stale profile only loses benefit. Regenerate with `-fprofile-generate` (see
+# `src/pgo/README.txt`). Set `-DLEAN_PGO_PROFILE=` (empty) to build without it.
+set(LEAN_PGO_PROFILE_DEFAULT "")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+  set(LEAN_PGO_PROFILE_DEFAULT "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+endif()
+set(LEAN_PGO_PROFILE "${LEAN_PGO_PROFILE_DEFAULT}" CACHE STRING "LLVM .profdata (or .tar.xz of one) for profile-guided optimization")
+set(LEAN_CORE_LEANC_FLAGS "")
+if(LEAN_PGO_PROFILE AND NOT STAGE EQUAL 0)
+  if(LEAN_PGO_PROFILE MATCHES "\\.tar\\.xz$")
+    file(REMOVE_RECURSE "${CMAKE_BINARY_DIR}/pgo")
+    file(ARCHIVE_EXTRACT INPUT "${LEAN_PGO_PROFILE}" DESTINATION "${CMAKE_BINARY_DIR}/pgo")
+    file(GLOB LEAN_PGO_PROFDATA "${CMAKE_BINARY_DIR}/pgo/*.profdata")
+  else()
+    set(LEAN_PGO_PROFDATA "${LEAN_PGO_PROFILE}")
+  endif()
+  message(STATUS "Profile-guided optimization with ${LEAN_PGO_PROFDATA}")
+  set(LEAN_PGO_FLAGS "-fprofile-use=${LEAN_PGO_PROFDATA} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin")
+  string(APPEND LEAN_EXTRA_CXX_FLAGS " ${LEAN_PGO_FLAGS}")
+  set(LEAN_CORE_LEANC_FLAGS "${LEAN_PGO_FLAGS}")
+endif()
+
 # On Windows we want to disable writing COFF object file time stamps.
 # LLVM 23 seems to have a regression in this regard.
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
@@ -1312,7 +1339,7 @@ string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}" LEANC_CC "${LEANC_CC}")
 string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}" LEANC_INTERNAL_FLAGS "${LEANC_INTERNAL_FLAGS}")
 
 toml_escape("${LEAN_EXTRA_OPTS}" LEAN_EXTRA_OPTS_TOML)
-toml_escape("${LEANC_EXTRA_CC_FLAGS}" LEAN_MORE_LEANC_ARGS_TOML)
+toml_escape("${LEANC_EXTRA_CC_FLAGS} ${LEAN_CORE_LEANC_FLAGS}" LEAN_MORE_LEANC_ARGS_TOML)
 # These are passed as untraced arguments because they include the sysroot path.
 # However, as they are untraced, Lake will not invalidate build artifacts if the sysroot changes.
 # As such, care must be taken when changing sysroots. Locally, artifacts can be manually cleaned via
