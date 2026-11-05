@@ -606,6 +606,13 @@ static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** beg
    the other workers (the environment's constant map is a single array of ~2M buckets). */
 #define MARK_PERSISTENT_SPLIT 4096
 #define MARK_PERSISTENT_CHUNK 256
+/* A shared array range is cut into about this many work items per walker (but never smaller than
+   `MARK_PERSISTENT_CHUNK` entries). With fixed 256-entry items, the constant map's ~2-3 M buckets
+   became ~11 k items, and taking each one (pool mutex lock, pop, unlock, the `active` bookkeeping
+   under the mutex again) cost the four walkers of a `-j 4` import ~40 % of their wall time on the
+   contended mutex (7 of 16.5 ms per walker in `markPersistent 1`). 16 items per walker keep the load
+   balanced (the last item is ~1/64 of the array) at a few dozen lock round trips. */
+#define MARK_PERSISTENT_ITEMS_PER_THREAD 16
 
 template<bool Par>
 static inline void mark_persistent_expand(object * o, std::vector<object*> & todo, mark_persistent_pool * pool) {
@@ -692,11 +699,14 @@ struct mark_persistent_pool {
 };
 
 static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** begin, object ** end) {
+    size_t n = end - begin;
+    size_t chunk = std::max<size_t>(MARK_PERSISTENT_CHUNK,
+                                    n / ((size_t)pool->num_threads * MARK_PERSISTENT_ITEMS_PER_THREAD));
     unique_lock<mutex> lock(pool->m);
-    for (; begin < end; begin += MARK_PERSISTENT_CHUNK) {
+    for (size_t i = 0; i < n; i += chunk) {
         mark_persistent_work w;
-        w.begin = begin;
-        w.end = std::min(begin + MARK_PERSISTENT_CHUNK, end);
+        w.begin = begin + i;
+        w.end = begin + std::min(i + chunk, n);
         pool->items.push_back(std::move(w));
     }
 }
@@ -836,7 +846,19 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
                     pool.items.pop_back();
                     pool.active++;
                     lock.unlock();
-                    if (w.begin) todo.assign(w.begin, w.end); else todo.swap(w.owned);
+                    if (w.begin) {
+                        /* a range of a shared array: walk it in `MARK_PERSISTENT_CHUNK`-entry batches
+                           instead of copying the whole (now larger) range onto the stack first */
+                        for (object ** p = w.begin; p < w.end;) {
+                            object ** q = p + std::min<ptrdiff_t>(MARK_PERSISTENT_CHUNK, w.end - p);
+                            todo.assign(p, q);
+                            mark_persistent_core<true>(todo, &pool);
+                            p = q;
+                        }
+                        todo.clear();
+                    } else {
+                        todo.swap(w.owned);
+                    }
                 } else if (pool.active == 0) {
                     break;
                 } else {
