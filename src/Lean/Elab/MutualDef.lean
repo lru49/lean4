@@ -1242,6 +1242,14 @@ where
           -- holes in theorem types is not a fatal error, but it does make parallelism impossible
           !headers[0]!.type.hasMVar then
         elabAsync headers[0]! view declId
+      else if Elab.async.get (← getOptions) && view.kind.isExample && !Elab.inServer.get (← getOptions) &&
+          !deprecated.oldSectionVars.get (← getOptions) && view.modifiers.attrs.isEmpty &&
+          !headers[0]!.type.hasMVar && (← isProp headers[0]!.type) then
+        -- A `Prop`-typed `example` cannot be referenced by anything after it (its environment
+        -- changes are discarded by `withoutModifyingEnv`), so like a theorem body its value can be
+        -- elaborated off the command thread. Only in the cmdline frontend: the language server keeps
+        -- its incremental reporting of examples unchanged.
+        elabExampleAsync headers[0]!
       else elabSync headers
     else elabSync headers
 
@@ -1266,6 +1274,32 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
   elabSync headers := do
     finishElab headers
     processDeriving headers
+  elabExampleAsync header := do
+    -- insert a hole for the example's info trees in the main info tree
+    let infoHole ← mkFreshMVarId
+    let infoPromise ← IO.Promise.new
+    modifyInfoState fun s => { s with
+      trees := s.trees.push <| .hole infoHole
+      lazyAssignment := s.lazyAssignment.insert infoHole <| infoPromise.resultD default
+    }
+    let cancelTk ← IO.CancelToken.new
+    let act ←
+      withDeclName header.declName do
+      -- nothing else on this branch creates auxiliary declarations for the example, so the task
+      -- continues the parent's generator instead of a child one: auxiliary names (e.g.
+      -- `_example._proof_1`) stay those of the synchronous elaboration
+      let declNGen ← getDeclNGen
+      wrapAsyncAsSnapshot (desc := s!"elaborating example") (cancelTk? := cancelTk) fun _ => do
+        setDeclNGen declNGen
+        profileitM Exception "elaboration" (← getOptions) do
+        try
+          finishElab #[header]
+        finally
+          reportDiag
+          let info := .ofCustomInfo { stx := header.value, value := .mk (α := AsyncBodyInfo) {} }
+          let ctx ← CommandContextInfo.save
+          infoPromise.resolve <| .context (.commandCtx ctx) <| .node info (← getInfoTrees)
+    Core.logSnapshotTask { stx? := none, task := (← BaseIO.asTask (act ())), cancelTk? := cancelTk }
   elabAsync header view declId := do
     assert! view.kind.isTheorem
     let env ← getEnv
