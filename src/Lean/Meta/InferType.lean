@@ -100,6 +100,21 @@ where
 
 namespace Meta
 
+/--
+`whnf type` (`whnfD type` when `d := true`) for the types computed here: a sort or a `forallE` is
+already in weak head normal form, and `whnf` returns it unchanged after its recursion-depth check,
+so it is answered directly (same depth check, same result, no `whnf` call and no context update).
+-/
+@[inline] private def whnfInferred (type : Expr) (d : Bool := false) : MetaM Expr := do
+  match type with
+  | .sort .. | .forallE .. =>
+    let curr ← MonadRecDepth.getRecDepth
+    let max  ← MonadRecDepth.getMaxRecDepth
+    if max != 0 && curr == max then
+      throwMaxRecDepthAt (← getRef)
+    return type
+  | _ => if d then whnfD type else whnf type
+
 def throwFunctionExpected {α} (f : Expr) : MetaM α :=
   throwError "function expected{indentExpr f}"
 
@@ -164,7 +179,7 @@ private def inferProjType (structName : Name) (idx : Nat) (e : Expr) : MetaM Exp
     else do
       let mut ctorType ← inferAppType (mkConst ctorVal.name structLvls) structTypeArgs[*...<structVal.numParams]
       for i in *...idx do
-        ctorType ← whnf ctorType
+        ctorType ← whnfInferred ctorType
         match ctorType with
         | .forallE _ _ body _ =>
           if body.hasLooseBVars then
@@ -172,7 +187,7 @@ private def inferProjType (structName : Name) (idx : Nat) (e : Expr) : MetaM Exp
           else
             ctorType := body
         | _ => failed ()
-      ctorType ← whnf ctorType
+      ctorType ← whnfInferred ctorType
       match ctorType with
       | .forallE _ d _ _ => return d.consumeTypeAnnotations
       | _                => failed ()
@@ -188,7 +203,7 @@ assigns the MVar to `Sort ?u` and returns `?u`.
 -/
 def getLevel (type : Expr) : MetaM Level := do
   let typeType ← inferType type
-  let typeType ← whnfD typeType
+  let typeType ← whnfInferred typeType (d := true)
   match typeType with
   | Expr.sort lvl     => return lvl
   | Expr.mvar mvarId  =>
@@ -375,7 +390,7 @@ def isProp (e : Expr) : MetaM Bool := do
   | .false => return false
   | .undef =>
     let type ← inferType e
-    let type ← whnfD type
+    let type ← whnfInferred type (d := true)
     match type with
     | Expr.sort u => return isAlwaysZero (← instantiateLevelMVars u)
     | _           => return false
@@ -573,7 +588,7 @@ def isType (e : Expr) : MetaM Bool := do
   | .false => return false
   | .undef =>
     let type ← inferType e
-    let type ← whnfD type
+    let type ← whnfInferred type (d := true)
     match type with
     | .sort .. => return true
     | _        => return false
