@@ -46,6 +46,35 @@ public:
         environment & env() { return m_env; }
         environment const & env() const { return m_env; }
         name_generator & ngen() { return m_ngen; }
+        /** Total number of cached entries over all caches (used to bound pooled states). */
+        size_t num_entries() const;
+        /** Re-target a pooled state at `env` (a descendant of the environment it was built under) and drop the
+            caches whose entries are not functions of the environment alone (see `pooled_state`). */
+        void retarget(environment const & env);
+    };
+    /** \brief A `state` borrowed from the process-wide pool of kernel states (see `kernel_state_pool` in
+        type_checker.cpp). `environment::add_*` acquires one for the environment it checks against, so the
+        `whnf`/`infer_type`/`unfold`/`is_def_eq` memo tables survive from one declaration to the next, and returns it
+        with `commit` after a SUCCESSFUL check, keyed by the environment checked against and by the environment that
+        results from adding the declaration. If the lease is destroyed without `commit` (the check threw), the state is
+        destroyed as before. Why reuse across declarations is sound: all caches memoise functions of the kernel
+        environment and of the fvars the checker itself creates (every state has its own `name_generator` that keeps
+        counting, so an fvar name is never reused within one state); a successful check only ever caches terms whose
+        constants were validated against the environment, and a checked `add` never replaces a constant, so every
+        cached result is still correct in any environment derived from the one it was computed in by checked `add`s;
+        entries that do depend on the checker's flags (`m_infer_type[0]`: level-parameter and safety checks; `m_failure`:
+        incomplete negative answers) are cleared by `retarget`. */
+    class pooled_state {
+        std::shared_ptr<state> m_st;
+        bool                   m_fresh;
+    public:
+        /** Acquire a state for checking against `env`. `enabled = false` always gives a fresh state that is never
+            pooled (used when kernel diagnostics are collected, so unfold counts stay per declaration). */
+        pooled_state(environment const & env, bool enabled);
+        ~pooled_state();
+        state & get() { return *m_st; }
+        /** The check succeeded and produced `out_env` from `in_env`: return the state to the pool under both keys. */
+        void commit(environment const & in_env, environment const & out_env);
     };
 private:
     bool                      m_st_owner;
@@ -124,6 +153,8 @@ private:
 public:
     type_checker(environment const & env, local_ctx const & lctx, diagnostics * diag = nullptr, definition_safety ds = definition_safety::safe);
     type_checker(environment const & env, diagnostics * diag = nullptr, definition_safety ds = definition_safety::safe):type_checker(env, local_ctx(), diag, ds) {}
+    /** Type checker over a borrowed (pooled) state; the state must outlive the checker. */
+    type_checker(state & st, diagnostics * diag = nullptr, definition_safety ds = definition_safety::safe);
     type_checker(type_checker const &) = delete;
     ~type_checker();
 
