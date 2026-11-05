@@ -438,6 +438,23 @@ def Package.discriminant (self : Package) :=
   else
     s!"{self.prettyName}@{self.version}"
 
+/--
+Starts reading and parsing the source files of a module's direct imports
+(their memoized `input` jobs) before the depth-first import traversal reaches them.
+
+The traversal awaits each module's parsed header before it can descend into
+that module's imports, so without this the headers of a large import graph are
+read and parsed one at a time on the traversal's thread. Fetching the `input`
+facets of all direct imports as soon as the importer's header is known lets
+those reads and parses run concurrently on the task pool while the traversal
+descends into the first import. The jobs are the same memoized ones the
+traversal fetches later, so the build result and logs are unchanged.
+-/
+def prefetchImportInputs (header : ModuleHeader) : FetchM Unit := do
+  for imp in header.imports do
+    for mod in (← findModules imp.module) do
+      discard <| mod.input.fetch
+
 set_option linter.unusedVariables.funArgs false in
 def fetchImportInfo
   (fileName : String) (pkgName modName : Name) (header : ModuleHeader)
@@ -524,6 +541,7 @@ def fetchImportInfo
 public def Module.importInfoFacetConfig : ModuleFacetConfig importInfoFacet :=
   mkFacetJobConfig fun mod => do
     let header ← (← mod.header.fetch).await
+    prefetchImportInputs header
     fetchImportInfo mod.relLeanFile.toString mod.pkg.keyName mod.name header
       (allowNonModules := mod.allowNonModules)
 
