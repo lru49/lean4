@@ -7,6 +7,7 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 .olean serialization and deserialization.
 */
 #include <unordered_map>
+#include <atomic>
 #include <vector>
 #include <utility>
 #include <string>
@@ -41,6 +42,7 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#include <poll.h>
 #include <fcntl.h>
 #endif
 
@@ -449,7 +451,7 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
 // root to be interpreted as — the C side does no type checking and the caller is responsible for
 // using a type compatible with what was saved (see `CompactedRegion.read`).
 // Supports both `v2` and `v3` formats.
-extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
+static object * compacted_region_read_core(b_obj_arg ofname, b_obj_arg odep_regions) {
     std::string olean_fn(lean_string_cstr(ofname));
     try {
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
@@ -616,6 +618,105 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
     } catch (exception & ex) {
         return io_result_mk_error((sstream() << "failed to read '" << olean_fn << "': " << ex.what()).str());
     }
+}
+
+/*
+lean-perf (DG, warm start): regions read AHEAD of the request by a waiting `lean` process.
+
+A process started with `LEAN_WARM_START=<list file>` (see `lean_warm_start` in util/shell.cpp) reads, while it waits for
+its command line, the `.olean`/`.ir` parts named in the list file (one module per line: its part files, tab-separated, in
+dependency order: each part is read with the earlier parts of its line as dependency regions, exactly as
+`readModuleDataParts` does). The results are kept here; `lean_compacted_region_read` hands a kept result out (once) when
+the same file is requested with the same dependency regions and the file is unchanged since it was read (same device,
+inode, size and modification time); every other request, and every request in a process without a warm list, takes the
+unchanged read path. A kept result is the object the read path would have built from the same bytes at the same
+addresses, so the import is unchanged (only the time of the read moves). Never written after the warm phase, so lookups
+from the import's loader threads need no lock.
+*/
+struct warm_region {
+    struct stat st;
+    std::vector<std::pair<uintptr_t, size_t>> deps;
+    object * result;      // `(ModuleData x CompactedRegion)`, persistent
+    std::atomic<bool> taken;
+};
+static std::unordered_map<std::string, warm_region *> * g_warm_regions = nullptr;
+
+static bool same_file(struct stat const & a, struct stat const & b) {
+#if defined(__linux__)
+    return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
+           a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
+#else
+    // warm start is Linux-only: never hand out a kept region elsewhere
+    (void)a; (void)b;
+    return false;
+#endif
+}
+
+static std::vector<std::pair<uintptr_t, size_t>> dep_key(b_obj_arg odep_regions) {
+    std::vector<std::pair<uintptr_t, size_t>> k;
+    size_t n = lean_array_size(odep_regions);
+    for (size_t i = 0; i < n; i++) {
+        b_obj_arg r = lean_array_get_core(odep_regions, i);
+        k.push_back({ region_base_addr(r), region_size(r) });
+    }
+    return k;
+}
+
+/* Reads the parts named in `list_fn` into the warm table, until stdin (the request channel) becomes readable. Errors are
+   ignored (the request then reads the file itself). */
+extern "C" LEAN_EXPORT void lean_warm_read_regions(char const * list_fn) {
+    std::ifstream in(list_fn);
+    if (!in) return;
+    auto * tbl = new std::unordered_map<std::string, warm_region *>();
+    std::string line;
+    while (std::getline(in, line)) {
+#if defined(__linux__)
+        // stop as soon as the request is there: the request must never wait for parts it may not need
+        struct pollfd pfd = { 0, POLLIN, 0 };
+        if (poll(&pfd, 1, 0) > 0) break;
+#endif
+        object * deps = lean_mk_empty_array();
+        size_t pos = 0;
+        while (pos <= line.size()) {
+            size_t tab = line.find('\t', pos);
+            std::string fn = line.substr(pos, tab == std::string::npos ? std::string::npos : tab - pos);
+            pos = tab == std::string::npos ? line.size() + 1 : tab + 1;
+            if (fn.empty() || tbl->count(fn)) break;
+            struct stat st;
+            if (stat(fn.c_str(), &st) != 0) break;
+            object * ofname = lean_mk_string(fn.c_str());
+            std::vector<std::pair<uintptr_t, size_t>> k = dep_key(deps);
+            object * r = compacted_region_read_core(ofname, deps);
+            lean_dec(ofname);
+            if (!lean_io_result_is_ok(r)) { lean_dec(r); break; }
+            object * pair = lean_io_result_get_value(r);
+            lean_inc(pair);
+            lean_dec(r);
+            lean_mark_persistent(pair);
+            auto * w = new warm_region();
+            w->st = st; w->deps = std::move(k); w->result = pair; w->taken = false;
+            (*tbl)[fn] = w;
+            lean_inc(lean_ctor_get(pair, 1));
+            deps = lean_array_push(deps, lean_ctor_get(pair, 1));
+        }
+        lean_dec(deps);
+    }
+    g_warm_regions = tbl;
+}
+
+extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
+    if (g_warm_regions) {
+        auto it = g_warm_regions->find(std::string(lean_string_cstr(ofname)));
+        if (it != g_warm_regions->end()) {
+            warm_region * w = it->second;
+            struct stat st;
+            if (!w->taken.load(std::memory_order_relaxed) && stat(lean_string_cstr(ofname), &st) == 0 &&
+                same_file(st, w->st) && dep_key(odep_regions) == w->deps && !w->taken.exchange(true)) {
+                return io_result_mk_ok(w->result);
+            }
+        }
+    }
+    return compacted_region_read_core(ofname, odep_regions);
 }
 
 extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object *) {

@@ -282,6 +282,40 @@ static void report_task_get_blocked_time(std::chrono::nanoseconds d) {
     }
 }
 
+#if defined(__linux__)
+#include <unistd.h>
+extern "C" void lean_warm_read_regions(char const * list_fn);
+
+/*
+lean-perf (DG): warm start. `LEAN_WARM_START=<list file>` makes this process read the module parts named in the
+list file (see `lean_warm_read_regions`, library/module.cpp) and then wait for its request on stdin, so that a build
+driver can start it before the module it will compile is known and before that module's imports exist, while cores
+are idle. The request is a sequence of lines `C <dir>` (working directory), `E <NAME>=<value>` (environment variable),
+`A <arg>` (one command-line argument) ended by a line `R`; the process then runs exactly as `lean <args>` started
+in that directory with that environment. EOF before `R` = no request: exit 0 without doing anything.
+Returns false on EOF.
+*/
+static bool lean_warm_start(char const * list_fn, std::vector<std::string> & args) {
+    std::string list(list_fn);
+    unsetenv("LEAN_WARM_START");
+    if (!list.empty() && list != "-")
+        lean_warm_read_regions(list.c_str());
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line == "R") return true;
+        if (line.size() < 2 || line[1] != ' ') continue;
+        std::string v = line.substr(2);
+        switch (line[0]) {
+        case 'A': args.push_back(v); break;
+        case 'C': if (chdir(v.c_str()) != 0) { std::cerr << "warm start: cannot enter " << v << std::endl; exit(1); } break;
+        case 'E': { size_t eq = v.find('='); if (eq != std::string::npos) setenv(v.substr(0, eq).c_str(), v.substr(eq + 1).c_str(), 1); break; }
+        default: break;
+        }
+    }
+    return false;
+}
+#endif
+
 extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
 #ifdef LEAN_EMSCRIPTEN
     // When running in command-line mode under Node.js, we make system directories available in the virtual filesystem.
@@ -311,6 +345,21 @@ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
     auto init_start = std::chrono::steady_clock::now();
     lean::initializer init;
     second_duration init_time = std::chrono::steady_clock::now() - init_start;
+
+    // lean-perf (DG): warm start, see `lean_warm_start`
+#if defined(__linux__)
+    std::vector<std::string> warm_args;
+    std::vector<char *> warm_argv;
+    if (char const * warm = getenv("LEAN_WARM_START")) {
+        if (!lean_warm_start(warm, warm_args))
+            return 0; // request channel closed without a request: nothing to do
+        warm_argv.push_back(argv[0]);
+        for (std::string & a : warm_args) warm_argv.push_back(&a[0]);
+        warm_argv.push_back(nullptr);
+        argc = static_cast<int>(warm_argv.size()) - 1;
+        argv = warm_argv.data();
+    }
+#endif
 
     try {
         // Remark: This currently runs under `IO.initializing = true`.
