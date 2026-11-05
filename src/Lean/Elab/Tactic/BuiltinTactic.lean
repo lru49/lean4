@@ -204,6 +204,12 @@ private def getOptRotation (stx : Syntax) : Nat :=
 
 @[builtin_tactic Parser.Tactic.open] def evalOpen : Tactic := fun stx => do
   let `(tactic| open $decl in $tac) := stx | throwUnsupportedSyntax
+  -- The scope's `modifyEnv`s drop the `Core`/`Meta` caches. If the scope leaves the environment as it found
+  -- it (same scoped states in effect, same constants, only cache-irrelevant extension writes), the caches
+  -- held before the scope are valid again and are restored; entries computed inside the scope are dropped.
+  let env₀ ← getEnv
+  let metaCache₀ := (← getThe Meta.State).cache
+  let coreCache₀ := (← getThe Core.State).cache
   try
     pushScope
     let openDecls ← elabOpenDecl decl
@@ -211,6 +217,9 @@ private def getOptRotation (stx : Syntax) : Nat :=
       evalTactic tac
   finally
     popScope
+    if (← scopeRestored env₀ (← getEnv)) then
+      modifyThe Core.State fun s => { s with cache := coreCache₀ }
+      modifyThe Meta.State fun s => { s with cache := { metaCache₀ with defEqTrans := s.cache.defEqTrans } }
 
 @[builtin_tactic Parser.Tactic.set_option, builtin_incremental]
 def elabSetOption : Tactic := fun stx => do
