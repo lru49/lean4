@@ -1506,14 +1506,44 @@ static inline atomic<object*> * mt_ref_val_addr(object * o) {
 */
 static inline bool ref_maybe_mt(b_obj_arg ref) { return lean_is_mt(ref) || lean_is_persistent(ref); }
 
+/* lean-perf: backoff for the multi-threaded ref spin loops below. While one thread holds the value of an MT
+   ref (between the two exchanges of `get`, or between `take` and `put` of `modify`), every other accessor
+   spins. The loops used to spin with back-to-back atomic RMWs on the ref's cache line, which slows the
+   holder down (cache-line ping-pong) and, when there are more runnable threads than cores, can keep the
+   holder off the CPU for whole scheduler quanta. Now: a CPU pause hint per failed attempt, and after 64
+   attempts a `yield` per attempt. Only the waiting is changed, not the protocol. */
+namespace {
+struct ref_spin_backoff {
+    unsigned m_attempts{0};
+    void operator()() {
+        if (m_attempts < 64) {
+            m_attempts++;
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#endif
+        } else {
+            this_thread::yield();
+        }
+    }
+};
+}
+
 extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        ref_spin_backoff backoff;
         while (true) {
             /*
               We cannot simply read `val` from the ref and `inc` it like in the `else` branch since someone else could
               write to the ref in between and remove the last owning reference to the object. Instead, we must take
               ownership of the RC token in the ref via `exchange`, duplicate it, then put one RC token back. */
+            if (val_addr->load(std::memory_order_relaxed) == nullptr) {
+                // lean-perf: someone holds the value; wait without writing the line
+                backoff();
+                continue;
+            }
             object * val = val_addr->exchange(nullptr);
             if (val != nullptr) {
                 inc(val);
@@ -1522,6 +1552,7 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
                 (void)tmp;
                 return val;
             }
+            backoff();
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
@@ -1534,10 +1565,16 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
 extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        ref_spin_backoff backoff;
         while (true) {
-            object * val = val_addr->exchange(nullptr);
-            if (val != nullptr)
-                return val;
+            /* lean-perf: test before the exchange, so that waiting threads read the line shared
+               instead of writing it on every attempt */
+            if (val_addr->load(std::memory_order_relaxed) != nullptr) {
+                object * val = val_addr->exchange(nullptr);
+                if (val != nullptr)
+                    return val;
+            }
+            backoff();
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
@@ -1573,10 +1610,12 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
         /* See io_ref_write */
         mark_mt(a);
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        ref_spin_backoff backoff;
         while (true) {
             object * old_a = val_addr->load();
             if (old_a != nullptr && val_addr->compare_exchange_strong(old_a, a))
                 return old_a;
+            backoff();
         }
     } else {
         object * old_a = lean_to_ref(ref)->m_value;
