@@ -59,7 +59,7 @@ type_checker::state::state(environment const & env):
 
 size_t type_checker::state::num_entries() const {
     return m_infer_type[0].size() + m_infer_type[1].size() + m_whnf_core.size() + m_whnf.size() + m_unfold.size()
-        + m_success.size() + m_failure.size();
+        + m_success.size() + m_failure.size() + m_rec_rhs.size();
 }
 
 void type_checker::state::retarget(environment const & env) {
@@ -505,10 +505,33 @@ optional<expr> type_checker::reduce_recursor(expr const & e, bool cheap_rec, boo
                                                 [&](expr const & e) { return cheap_rec ? whnf_core(e, cheap_rec, cheap_proj) : whnf(e); },
                                                 [&](expr const & e) { return infer(e); },
                                                 [&](expr const & e1, expr const & e2) { return is_def_eq(e1, e2); },
-                                                [&](expr const & e) { return is_prop(e); })) {
+                                                [&](expr const & e) { return is_prop(e); },
+                                                [&](expr const & rec_fn, expr const & rhs, names const & lps) {
+                                                    return instantiate_rec_rhs(rec_fn, rhs, lps);
+                                                })) {
         return r;
     }
     return none_expr();
+}
+
+/** \brief `instantiate_lparams(rhs, lps, const_levels(rec_fn))` for the right-hand side `rhs` of a rule of the recursor
+    constant `rec_fn`, memoised in `m_rec_rhs`. Every iota-reduction step instantiated the rule's universe parameters
+    afresh (a full traversal of the rule plus a `replace` memo table); in evaluation-heavy checks (`decide`, `rfl` by
+    computation) the same few rules (`Nat.rec`, `List.rec`, ... at the same levels) fire hundreds of thousands of
+    times. The key is `mk_app(rec_fn, rhs)`: the recursor's name and levels compared structurally, the rule by pointer
+    first (`is_equal` short-cuts on identical objects), and the table keeps both alive. The result is a pure function of
+    `rhs`, `lps` and the levels; `lps` is the parameter list of the recursor named in `rec_fn`, whose `constant_info`
+    is never replaced in this state's environment or any checked descendant of it (see `pooled_state`). */
+expr type_checker::instantiate_rec_rhs(expr const & rec_fn, expr const & rhs, names const & lps) {
+    levels const & ls = const_levels(rec_fn);
+    if (is_nil(ls) || !has_param_univ(rhs))
+        return rhs;   // = instantiate_lparams(rhs, lps, ls): nothing to substitute
+    expr key = mk_app(rec_fn, rhs);
+    if (lean_object * cached = m_st->m_rec_rhs.find(key))
+        return expr(cached, true);
+    expr r = instantiate_lparams(rhs, lps, ls);
+    m_st->m_rec_rhs.insert(key, r);
+    return r;
 }
 
 expr type_checker::whnf_fvar(expr const & e, bool cheap_rec, bool cheap_proj) {
