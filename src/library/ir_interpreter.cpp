@@ -35,6 +35,12 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <psapi.h>
 #else
 #include <dlfcn.h>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <link.h>
+#include <elf.h>
+#include <cstddef>
+#include <cstdlib>
+#endif
 #endif
 #include "library/ir_interpreter.h"
 #include "runtime/flet.h"
@@ -339,7 +345,172 @@ void print_value(tout const & ios, value const & v, type t) {
   return print_value(const_cast<tout &>(ios), v, t);
 }
 
+#if defined(__linux__) && defined(__GLIBC__)
+/* Negative pre-filter for `dlsym(RTLD_DEFAULT, sym)`.
+
+   Most symbols the interpreter asks for do not exist (functions of modules that are not compiled into
+   any loaded object, `_boxed` variants that were never emitted), and a failing `dlsym` costs several
+   times a successful one: glibc walks every object, then raises and catches an error whose message it
+   formats and keeps for `dlerror`. This filter answers "definitely absent" from the objects' own GNU hash
+   tables, with exactly the first steps `dlsym` itself takes for each object (Bloom filter, then the hash
+   chain of the bucket, comparing hashes only); any possible match falls through to `dlsym`, so a symbol
+   `dlsym` would find is never filtered out.
+
+   The tables are those of the objects loaded at process start (the executable and its `DT_NEEDED`
+   closure), taken once when the interpreter is initialized; such objects are never unloaded, so the
+   tables stay valid for the life of the process. The filter is only used while no other object has been
+   loaded or unloaded since (the loader's `dlpi_adds`/`dlpi_subs` counters, read through
+   `dl_iterate_phdr` on every query); after a `dlopen` (e.g. `--load-dynlib`) every query goes to `dlsym`
+   as before. An object without a usable `DT_GNU_HASH` disables the filter. `LEAN_DLSYM_FILTER=0`
+   disables it as well. */
+struct gnu_hash_table {
+    uint32_t m_nbuckets;
+    uint32_t m_symoffset;
+    uint32_t m_bloom_size;
+    uint32_t m_bloom_shift;
+    ElfW(Addr) const * m_bloom;
+    uint32_t const * m_buckets;
+    uint32_t const * m_chain;
+};
+
+struct gnu_hash_filter_state {
+    bool m_valid = true;
+    unsigned long long m_adds = 0;
+    unsigned long long m_subs = 0;
+    std::vector<gnu_hash_table> m_tables;
+};
+static gnu_hash_filter_state * g_gnu_hash_filter = nullptr;
+
+static uint32_t gnu_hash(char const * s) {
+    uint32_t h = 5381;
+    for (unsigned char c = *s; c != '\0'; c = *++s)
+        h = h * 33 + c;
+    return h;
+}
+
+static bool has_loader_counters(size_t size) {
+    return size >= offsetof(struct dl_phdr_info, dlpi_subs) + sizeof(((struct dl_phdr_info *)nullptr)->dlpi_subs);
+}
+
+/* Translate a `DT_*` address of an object to a pointer. glibc relocates dynamic-section addresses in
+   place for most objects but not for all (e.g. read-only dynamic sections); accept the value as absolute
+   if it lies in one of the object's loaded segments, else as relative to the load base, else give up. */
+static void const * dyn_addr_to_ptr(struct dl_phdr_info * info, ElfW(Addr) a) {
+    for (int pass = 0; pass < 2; pass++) {
+        ElfW(Addr) abs = pass == 0 ? a : info->dlpi_addr + a;
+        for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
+            ElfW(Phdr) const & ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD)
+                continue;
+            ElfW(Addr) lo = info->dlpi_addr + ph.p_vaddr;
+            if (abs >= lo && abs < lo + ph.p_memsz)
+                return reinterpret_cast<void const *>(abs);
+        }
+    }
+    return nullptr;
+}
+
+static int gnu_hash_snapshot_cb(struct dl_phdr_info * info, size_t size, void * data) {
+    gnu_hash_filter_state & f = *static_cast<gnu_hash_filter_state *>(data);
+    if (!has_loader_counters(size)) {
+        f.m_valid = false;
+        return 1;
+    }
+    f.m_adds = info->dlpi_adds;
+    f.m_subs = info->dlpi_subs;
+    ElfW(Dyn) const * dyn = nullptr;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC)
+            dyn = reinterpret_cast<ElfW(Dyn) const *>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+    }
+    if (!dyn)
+        return 0; // no dynamic section: `dlsym` cannot find anything in this object
+    uint32_t const * hdr = nullptr;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_GNU_HASH)
+            hdr = static_cast<uint32_t const *>(dyn_addr_to_ptr(info, dyn->d_un.d_ptr));
+    }
+    gnu_hash_table t;
+    if (!hdr || hdr[0] == 0 || hdr[2] == 0 || (hdr[2] & (hdr[2] - 1)) != 0) {
+        f.m_valid = false;
+        return 1;
+    }
+    t.m_nbuckets    = hdr[0];
+    t.m_symoffset   = hdr[1];
+    t.m_bloom_size  = hdr[2];
+    t.m_bloom_shift = hdr[3];
+    t.m_bloom   = reinterpret_cast<ElfW(Addr) const *>(hdr + 4);
+    t.m_buckets = reinterpret_cast<uint32_t const *>(t.m_bloom + t.m_bloom_size);
+    t.m_chain   = t.m_buckets + t.m_nbuckets;
+    f.m_tables.push_back(t);
+    return 0;
+}
+
+static int gnu_hash_counters_cb(struct dl_phdr_info * info, size_t size, void * data) {
+    auto * r = static_cast<std::pair<unsigned long long, unsigned long long> *>(data);
+    if (has_loader_counters(size)) {
+        r->first = info->dlpi_adds;
+        r->second = info->dlpi_subs;
+    }
+    return 1; // the counters are the same in every entry
+}
+
+static bool gnu_hash_table_may_contain(gnu_hash_table const & t, uint32_t h) {
+    constexpr unsigned bits = sizeof(ElfW(Addr)) * 8;
+    ElfW(Addr) word = t.m_bloom[(h / bits) & (t.m_bloom_size - 1)];
+    ElfW(Addr) mask = (ElfW(Addr)(1) << (h % bits)) | (ElfW(Addr)(1) << ((h >> t.m_bloom_shift) % bits));
+    if ((word & mask) != mask)
+        return false;
+    uint32_t idx = t.m_buckets[h % t.m_nbuckets];
+    if (idx == 0)
+        return false;
+    if (idx < t.m_symoffset)
+        return true; // malformed table: be conservative
+    for (uint32_t const * c = t.m_chain + (idx - t.m_symoffset); ; c++) {
+        if (((*c ^ h) >> 1) == 0)
+            return true;
+        if (*c & 1)
+            return false;
+    }
+}
+
+static void init_gnu_hash_filter() {
+    if (char const * v = getenv("LEAN_DLSYM_FILTER")) {
+        if (v[0] == '0' && v[1] == '\0')
+            return;
+    }
+    gnu_hash_filter_state * f = new gnu_hash_filter_state();
+    dl_iterate_phdr(gnu_hash_snapshot_cb, f);
+    if (!f->m_valid) {
+        delete f;
+        return;
+    }
+    g_gnu_hash_filter = f;
+}
+
+/** \brief `false` only if no loaded object can define `sym`. */
+static bool may_be_loaded_symbol(char const * sym) {
+    gnu_hash_filter_state const * f = g_gnu_hash_filter;
+    if (!f)
+        return true;
+    std::pair<unsigned long long, unsigned long long> counters(~0ull, ~0ull);
+    dl_iterate_phdr(gnu_hash_counters_cb, &counters);
+    if (counters.first != f->m_adds || counters.second != f->m_subs)
+        return true; // objects were loaded or unloaded after the snapshot
+    uint32_t h = gnu_hash(sym);
+    for (gnu_hash_table const & t : f->m_tables) {
+        if (gnu_hash_table_may_contain(t, h))
+            return true;
+    }
+    return false;
+}
+#endif
+
 void * lookup_symbol_in_cur_exe(char const * sym) {
+#if defined(__linux__) && defined(__GLIBC__)
+    if (!may_be_loaded_symbol(sym))
+        return nullptr;
+#endif
 #ifdef LEAN_WINDOWS
     std::vector<HMODULE> hmods(128);
     DWORD bytes_needed;
@@ -1282,10 +1453,17 @@ void initialize_ir_interpreter() {
         register_trace_class(*ir::g_interpreter_step);
     });
     ir::g_native_symbol_cache = new ir::native_symbol_cache_shard[ir::g_native_symbol_cache_num_shards];
+#if defined(__linux__) && defined(__GLIBC__)
+    ir::init_gnu_hash_filter();
+#endif
 }
 
 void finalize_ir_interpreter() {
     delete[] ir::g_native_symbol_cache;
+#if defined(__linux__) && defined(__GLIBC__)
+    delete ir::g_gnu_hash_filter;
+    ir::g_gnu_hash_filter = nullptr;
+#endif
     DEBUG_CODE({
         delete ir::g_interpreter_call;
         delete ir::g_interpreter_step;
