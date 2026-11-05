@@ -377,7 +377,10 @@ private def ParserExtension.addImportedPar (as : Array (Array (ScopedEnvExtensio
   let mut start := 0
   while start < pending.size do
     let names := pending.extract start (min pending.size (start + chunk))
-    let t ← BaseIO.asTask (prio := .default) <| names.mapM fun declName =>
+    -- dedicated threads: the task manager's workers are busy with the registry extensions' states at this
+    -- point of the import, and the main thread joins these chunks right away (lean-perf L05 timeline: on
+    -- the default priority the parser phase took 202 ms instead of 132 sequential)
+    let t ← BaseIO.asTask (prio := .dedicated) <| names.mapM fun declName =>
       ((mkParserOfConstant categories declName).run ctx).toBaseIO
     tasks := tasks.push t
     start := start + chunk
