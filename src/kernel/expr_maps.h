@@ -28,7 +28,10 @@ class expr_flat_map {
     entry *  m_tab  = nullptr;
     size_t   m_mask = 0;
     size_t   m_size = 0;
-    static constexpr size_t INITIAL_CAP = 64;
+    // Small first table: a type_checker::state (and so its five caches) is created for every kernel call, most of which
+    // touch a handful of terms; 64 initial slots (1.5 KB zeroed and scanned per cache) cost 1.4 % of cycles on a module
+    // of many small declarations, 8 slots cost nothing measurable and the table doubles when needed.
+    static constexpr size_t INITIAL_CAP = 8;
 
     static size_t slot(unsigned h, size_t mask) {
         uint64_t x = (uint64_t)h * 0x9E3779B97F4A7C15ull;  // the expr hash is a 32-bit mix; spread it over the table
