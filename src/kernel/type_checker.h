@@ -40,10 +40,6 @@ public:
         expr_pair_set             m_success;
         expr_pair_set             m_failure;
         expr_flat_map<expr>       m_unfold;
-        /* Iota-reduction: the recursor rule's right-hand side with the recursor's universe parameters instantiated,
-           keyed by `mk_app(rec_fn, rule_rhs)` (`rec_fn` = the recursor constant with its universe levels). A pure
-           function of the rule object and the levels, as `m_unfold` is for definitions (see `instantiate_rec_rhs`). */
-        expr_flat_map<expr>       m_rec_rhs;
         friend type_checker;
     public:
         state(environment const & env);
@@ -111,7 +107,6 @@ private:
 
     enum class reduction_status { Continue, DefUnknown, DefEqual, DefDiff };
     optional<expr> reduce_recursor(expr const & e, bool cheap_rec, bool cheap_proj);
-    expr instantiate_rec_rhs(expr const & rec_fn, expr const & rhs, names const & lps);
     optional<expr> reduce_proj_core(expr c, name const & sname, unsigned idx);
     optional<expr> reduce_proj(expr const & e, bool cheap_rec, bool cheap_proj);
     expr whnf_fvar(expr const & e, bool cheap_rec, bool cheap_proj);
