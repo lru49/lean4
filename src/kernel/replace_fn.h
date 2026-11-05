@@ -50,7 +50,7 @@ class replace_cache {
         slot * old = m_slots;
         size_t old_cap = m_mask + 1;
         size_t cap = (old == m_initial ? 4 : 2) * old_cap; // lean-perf (step d): 4x when leaving the inline table
-        slot * slots = static_cast<slot *>(std::calloc(cap, sizeof(slot)));
+        slot * slots = static_cast<slot *>(alloc_zeroed_block(cap, sizeof(slot)));
         if (!slots)
             throw std::bad_alloc();
         m_slots = slots;
@@ -59,7 +59,7 @@ class replace_cache {
             if (old[i].m_key)
                 place(old[i].m_key, old[i].m_offset, old[i].m_val);
         if (old != m_initial)
-            std::free(old);
+            free_block(old);
     }
 public:
     replace_cache() {}
@@ -71,7 +71,7 @@ public:
             if (m_slots[i].m_key)
                 lean_dec(m_slots[i].m_val);
         if (m_slots != m_initial)
-            std::free(m_slots);
+            free_block(m_slots);
     }
     /* The cached result for `k` at `offset`, or `nullptr`; borrowed. */
     lean_object * find(lean_object * k, unsigned offset = 0) const {

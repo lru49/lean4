@@ -47,7 +47,7 @@ class expr_flat_map {
     }
     void grow() {
         size_t new_cap  = m_tab ? (m_mask + 1) * 2 : INITIAL_CAP;
-        entry * new_tab = static_cast<entry *>(std::calloc(new_cap, sizeof(entry)));
+        entry * new_tab = static_cast<entry *>(alloc_zeroed_block(new_cap, sizeof(entry)));
         if (new_tab == nullptr) lean_internal_panic_out_of_memory();
         size_t new_mask = new_cap - 1;
         if (m_tab) {
@@ -58,7 +58,7 @@ class expr_flat_map {
                 while (new_tab[j].m_key != nullptr) j = (j + 1) & new_mask;
                 new_tab[j] = e;
             }
-            std::free(m_tab);
+            free_block(m_tab);
         }
         m_tab = new_tab; m_mask = new_mask;
     }
@@ -71,7 +71,7 @@ public:
         for (size_t i = 0; i <= m_mask; i++) {
             if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
         }
-        std::free(m_tab);
+        free_block(m_tab);
     }
     size_t size() const { return m_size; }
     /** \brief Borrowed reference to the value stored for a key structurally equal to `k`, or nullptr. */

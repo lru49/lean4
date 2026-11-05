@@ -8,6 +8,7 @@ Author: Leonardo de Moura
 #include <cstdint>
 #include <cstdlib>
 #include <new>
+#include "util/alloc.h" // lean-perf (step g): tables from the same allocator as the hash-map nodes they replaced
 
 namespace lean {
 /* A set of pairs of a non-null pointer and a word, for the caches of traversals such as
@@ -34,7 +35,7 @@ class ptr_pair_set {
         slot * old = m_slots;
         size_t old_cap = m_mask + 1;
         size_t cap = 2 * old_cap;
-        slot * slots = static_cast<slot *>(std::calloc(cap, sizeof(slot)));
+        slot * slots = static_cast<slot *>(alloc_zeroed_block(cap, sizeof(slot)));
         if (!slots)
             throw std::bad_alloc();
         m_slots = slots;
@@ -48,14 +49,14 @@ class ptr_pair_set {
             }
         }
         if (old != m_initial)
-            std::free(old);
+            free_block(old);
     }
 public:
     ptr_pair_set() {}
     ptr_pair_set(ptr_pair_set const &) = delete;
     ~ptr_pair_set() {
         if (m_slots != m_initial)
-            std::free(m_slots);
+            free_block(m_slots);
     }
     /* Inserts `(p, w)`, returning whether it was absent. */
     bool insert(void const * p, uintptr_t w) {
