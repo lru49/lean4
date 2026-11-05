@@ -61,6 +61,7 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include "kernel/trace.h"
 #include "library/constants.h"
 #include "library/time_task.h"
+#include "library/native_cache.h"
 #include "library/ir_types.h"
 #include "library/init_attribute.h"
 #include "util/nat.h"
@@ -1637,6 +1638,9 @@ extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, obj
 
 /* runModInitCore (sym : @& String) : IO Bool */
 extern "C" LEAN_EXPORT obj_res lean_run_mod_init_core(b_obj_arg  sym) {
+    // all `.olean` files of the import have been read when the first module initializer is looked up:
+    // load a cached native bundle for them, if one matches (src/library/native_cache.cpp)
+    native_cache_load_once();
     if (void * init = lookup_symbol_in_cur_exe(string_cstr(sym))) {
         auto init_fn = reinterpret_cast<object *(*)(uint8_t)>(init);
         uint8_t builtin = 0;
