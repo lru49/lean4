@@ -1,7 +1,0 @@
-array size 8004
-snapshot unchanged true
-ref updated 12345 7
-task array 0 42 100
-string 1000 bytes 1000
-string counts [250, 250, 250, 250]
-byte counts [250, 250, 250, 250]
