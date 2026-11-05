@@ -720,16 +720,41 @@ static void mark_persistent_pool_donate(mark_persistent_pool * pool, std::vector
 
 /* Depth-first marking of everything reachable from the entries of `todo`. `Par = true` claims
    nodes with an atomic exchange (several threads may share the graph), `Par = false` is the
-   original single-threaded walk. */
+   original single-threaded walk.
+
+   lean-perf (perf-cd-mark-persistent): the walk is pointer chasing, and almost every pop is a cache
+   miss on the popped object's header (fresh heap objects and the compacted-region objects they point
+   to, which only need the `rc == 0` load to be skipped). Popped objects therefore go through a small
+   FIFO of `MARK_PERSISTENT_PREFETCH` slots: an object is prefetched when it enters the FIFO and
+   examined when it leaves it, so up to that many header misses are in flight at once instead of one
+   (the "prefetch-on-grey FIFO" of software-prefetching mark-sweep collectors). The set of marked
+   objects is the same as the plain depth-first walk's (every reachable object with rc != 0 gets
+   rc = 0; only the visiting order changes, and rc := 0 stores are idempotent); the walk is still
+   depth-first up to the FIFO's few slots, so the stack does not grow. */
+#ifndef MARK_PERSISTENT_PREFETCH
+#define MARK_PERSISTENT_PREFETCH 8
+#endif
+static_assert((MARK_PERSISTENT_PREFETCH & (MARK_PERSISTENT_PREFETCH - 1)) == 0, "power of two");
 template<bool Par>
 static void mark_persistent_core(std::vector<object*> & todo, mark_persistent_pool * pool = nullptr) {
     unsigned n = 0;
     size_t claimed = 0;
-    while (!todo.empty()) {
-        object * o = todo.back();
-        todo.pop_back();
-        if (Par && (++n % MARK_PERSISTENT_DONATE_EVERY) == 0) mark_persistent_pool_donate(pool, todo);
-        if (lean_is_scalar(o)) continue;
+    object * fifo[MARK_PERSISTENT_PREFETCH];
+    unsigned head = 0, cnt = 0;
+    while (true) {
+        while (cnt < MARK_PERSISTENT_PREFETCH && !todo.empty()) {
+            object * c = todo.back();
+            todo.pop_back();
+            if (Par && (++n % MARK_PERSISTENT_DONATE_EVERY) == 0) mark_persistent_pool_donate(pool, todo);
+            if (lean_is_scalar(c)) continue;
+            __builtin_prefetch(c);
+            fifo[(head + cnt) & (MARK_PERSISTENT_PREFETCH - 1)] = c;
+            cnt++;
+        }
+        if (cnt == 0) break;
+        object * o = fifo[head];
+        head = (head + 1) & (MARK_PERSISTENT_PREFETCH - 1);
+        cnt--;
         if (Par) {
             /* Objects inside compacted regions already have rc = 0 and live in read-only
                mappings: never write to them (the plain load filters them, the exchange decides
@@ -800,6 +825,10 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
     frontier.push_back(o);
     size_t i = 0;
     while (i < frontier.size() && frontier.size() - i < target) {
+        if (i + MARK_PERSISTENT_PREFETCH < frontier.size()) {
+            object * p = frontier[i + MARK_PERSISTENT_PREFETCH];
+            if (!lean_is_scalar(p)) __builtin_prefetch(p);
+        }
         object * c = frontier[i++];
         if (lean_is_scalar(c) || !lean_has_rc(c)) continue;
         lean_internal_set_rc(c, 0);
