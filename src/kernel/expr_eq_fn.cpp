@@ -38,7 +38,7 @@ class ptr_pair_set {
     }
     void grow() {
         size_t new_cap  = (m_mask + 1) * 2;
-        entry * new_tab = static_cast<entry *>(std::calloc(new_cap, sizeof(entry)));
+        entry * new_tab = static_cast<entry *>(alloc_zeroed_block(new_cap, sizeof(entry)));
         if (new_tab == nullptr) lean_internal_panic_out_of_memory();
         size_t new_mask = new_cap - 1;
         for (size_t i = 0; i <= m_mask; i++) {
@@ -48,14 +48,14 @@ class ptr_pair_set {
             while (new_tab[j].m_a != nullptr) j = (j + 1) & new_mask;
             new_tab[j] = e;
         }
-        if (m_tab != m_inline) std::free(m_tab);
+        if (m_tab != m_inline) free_block(m_tab);
         m_tab = new_tab; m_mask = new_mask;
     }
 public:
     ptr_pair_set() {}
     ptr_pair_set(ptr_pair_set const &) = delete;
     ptr_pair_set & operator=(ptr_pair_set const &) = delete;
-    ~ptr_pair_set() { if (m_tab != nullptr && m_tab != m_inline) std::free(m_tab); }
+    ~ptr_pair_set() { if (m_tab != nullptr && m_tab != m_inline) free_block(m_tab); }
     /** \brief Insert `(a, b)`; return true iff it was already present. */
     bool check_and_insert(lean_object * a, lean_object * b) {
         if (m_tab == nullptr) {
