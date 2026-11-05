@@ -205,6 +205,11 @@ def tryTheorem? (e : Expr) (thm : SimpTheorem) : SimpM (Option Result) := do
 Remark: the parameter tag is used for creating trace messages. It is irrelevant otherwise.
 -/
 def rewrite? (e : Expr) (s : SimpTheoremTree) (erased : PHashSet Origin) (tag : String) (rflOnly : Bool) : SimpM (Option Result) := do
+  -- lean-perf (cr): an empty tree (e.g. the `pre` tree of a `simp only` set without `↓` lemmas) has no
+  -- candidates; skip the key computation (`reduceDT` of `e`) and the root lookups of the retrieval.
+  if s.root.isEmpty then
+    trace[Debug.Meta.Tactic.simp] "no theorems found for {tag}-rewriting {e}"
+    return none
   if (← getConfig).index then
     rewriteUsingIndex?
   else
