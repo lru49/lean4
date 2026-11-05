@@ -216,7 +216,7 @@ expr cheap_beta_reduce(expr const & e) {
 expr instantiate_lparams(expr const & e, names const & lps, levels const & ls) {
     if (!has_param_univ(e))
         return e;
-    return replace(e, [&](expr const & e) -> optional<expr> {
+    return replace(e, [&](expr const & e, unsigned) -> optional<expr> {
             if (!has_param_univ(e))
                 return some_expr(e);
             if (is_constant(e)) {
