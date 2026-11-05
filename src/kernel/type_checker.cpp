@@ -594,18 +594,6 @@ static bool is_let_fvar(local_ctx const & lctx, expr const & e) {
     If `cheap == true`, then we don't perform delta-reduction when reducing major premise of recursors and projections.
     We also do not cache results. */
 expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
-    return whnf_core_impl(e, cheap_rec, cheap_proj, /* cache_result */ true);
-}
-
-/* `cache_result = false` is used for the REDUCTS that `whnf_core` itself constructs (the beta-reduct, the iota-reduct,
-   the let-body instance, the re-applied head; a projection's field is an existing sub-term and keeps the caller's mode): they are looked up in `m_whnf_core` as before,
-   but not inserted. Such a term is freshly allocated and, in evaluation-heavy checks, is almost never met again (a
-   `decide` module: 3.67 M such entries, 4.6 % of them ever hit), while every entry costs an insert into a table of
-   millions of entries and keeps the term alive until the state dies. The entry for the term `whnf_core` was called
-   on (`e`) still records the final result, so a repeated outer query is answered as before, and every `whnf` result
-   reached on the way (major premises, projected structures) stays memoised in `m_whnf`. A cache is only a memo of a
-   deterministic function: what is inserted never changes a result, only how often it is recomputed. */
-expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_proj, bool cache_result) {
     scope_rec_depth guard;
     check_system("type checker: whnf", /* do_check_interrupted */ true);
 
@@ -616,7 +604,7 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
     case expr_kind::Lit:
         return e;
     case expr_kind::MData:
-        return whnf_core_impl(mdata_expr(e), cheap_rec, cheap_proj, cache_result);
+        return whnf_core(mdata_expr(e), cheap_rec, cheap_proj);
     case expr_kind::FVar:
         if (is_let_fvar(m_lctx, e))
             break;
@@ -642,7 +630,7 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
         return whnf_fvar(e, cheap_rec, cheap_proj);
     case expr_kind::Proj: {
         if (auto m = reduce_proj(e, cheap_rec, cheap_proj))
-            r = whnf_core_impl(*m, cheap_rec, cheap_proj, cache_result);   // a field: an existing sub-term, not a fresh one
+            r = whnf_core(*m, cheap_rec, cheap_proj);
         else
             r = e;
         break;
@@ -659,8 +647,8 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
                 m++;
             }
             lean_assert(m <= num_args);
-            r = whnf_core_impl(mk_rev_app(instantiate(binding_body(f), m, args.data() + (num_args - m)), num_args - m, args.data()),
-                               cheap_rec, cheap_proj, false);
+            r = whnf_core(mk_rev_app(instantiate(binding_body(f), m, args.data() + (num_args - m)), num_args - m, args.data()),
+                          cheap_rec, cheap_proj);
         } else if (f == f0) {
             if (auto r = reduce_recursor(e, cheap_rec, cheap_proj)) {
                 if (m_diag) {
@@ -669,21 +657,21 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
                         m_diag->record_unfold(const_name(f));
                 }
                 /* iota-reduction and quotient reduction rules */
-                return whnf_core_impl(*r, cheap_rec, cheap_proj, false);
+                return whnf_core(*r, cheap_rec, cheap_proj);
             } else {
                 return e;
             }
         } else {
-            r = whnf_core_impl(mk_rev_app(f, args.size(), args.data()), cheap_rec, cheap_proj, false);
+            r = whnf_core(mk_rev_app(f, args.size(), args.data()), cheap_rec, cheap_proj);
         }
         break;
     }
     case expr_kind::Let:
-        r = whnf_core_impl(instantiate(let_body(e), let_value(e)), cheap_rec, cheap_proj, false);
+        r = whnf_core(instantiate(let_body(e), let_value(e)), cheap_rec, cheap_proj);
         break;
     }
 
-    if (cache_result && !cheap_rec && !cheap_proj) {
+    if (!cheap_rec && !cheap_proj) {
         m_st->m_whnf_core.insert(e, r);
     }
     return r;
