@@ -8,6 +8,7 @@ Author: Leonardo de Moura
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <memory>
 #include <deque>
 #include <cmath>
 #include <lean/lean.h>
@@ -567,10 +568,15 @@ extern "C" LEAN_EXPORT b_obj_res lean_thunk_get_core(b_obj_arg t) {
 // =======================================
 // Mark Persistent
 
+#include <chrono>
+#include <cstdio>
+
 extern "C" void lean_mark_persistent(object * o);
+static void mark_persistent_seq(object * o);
 
 static obj_res mark_persistent_fn(obj_arg o) {
-    lean_mark_persistent(o);
+    // Called for the children of `LeanExternal` objects; stays on the calling thread.
+    mark_persistent_seq(o);
     return lean_box(0);
 }
 
@@ -580,72 +586,283 @@ static obj_res mark_persistent_fn(obj_arg o) {
 #endif
 #endif
 
-extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
-    buffer<object*> todo;
-    todo.push_back(o);
+/* lean-perf (perf/parallel-import): `lean_mark_persistent` walks the whole freshly imported
+   environment (constant map, extension states) once per `lean` process, which is ~13 % of the
+   import phase of a Mathlib-sized environment and purely pointer chasing. The walk is a set of
+   idempotent `rc := 0` stores, so it is split over several threads: a short breadth-first expansion
+   on the calling thread builds a frontier of subtrees, then up to `mark_persistent_num_threads()`
+   threads (the task manager's worker budget, i.e. `lean -j`, capped by `LEAN_IMPORT_THREADS`)
+   claim frontier batches. A node is claimed with an atomic exchange of its RC against 0, so each
+   object is visited exactly once even when subtrees are shared; the result (every reachable object
+   with rc != 0 gets rc = 0) is identical to the sequential walk by construction, and the walk
+   stays sequential (plain loads/stores, no atomics) when only one thread is available or the graph
+   is small. */
+
+/* Expands `o` into `todo`: pushes the children that may still need marking. Returns nothing.
+   `o` must already be claimed (rc set to 0). */
+struct mark_persistent_pool;
+static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** begin, object ** end);
+/* Arrays with more children than this are split into `MARK_PERSISTENT_CHUNK`-sized ranges shared with
+   the other workers (the environment's constant map is a single array of ~2M buckets). */
+#define MARK_PERSISTENT_SPLIT 4096
+#define MARK_PERSISTENT_CHUNK 1024
+
+template<bool Par>
+static inline void mark_persistent_expand(object * o, std::vector<object*> & todo, mark_persistent_pool * pool) {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    // do not report as leak
+    // NOTE: Most persistent objects are actually reachable from global
+    // variables up to the end of the process. However, this is *not*
+    // true for closures inside of persistent thunks, which are
+    // "orphaned" after being evaluated.
+    __lsan_ignore_object(o);
+#endif
+#endif
+    uint8_t tag = lean_ptr_tag(o);
+    if (tag <= LeanMaxCtorTag) {
+        object ** it  = lean_ctor_obj_cptr(o);
+        object ** end = it + lean_ctor_num_objs(o);
+        for (; it != end; ++it) todo.push_back(*it);
+    } else {
+        switch (tag) {
+        case LeanScalarArray:
+        case LeanString:
+        case LeanMPZ:
+            break;
+        case LeanExternal: {
+            object * fn = lean_alloc_closure((void*)mark_persistent_fn, 1, 0);
+            lean_to_external(o)->m_class->m_foreach(lean_to_external(o)->m_data, fn);
+            lean_dec(fn);
+            break;
+        }
+        case LeanTask:
+            todo.push_back(lean_task_get(o));
+            break;
+        case LeanPromise:
+            todo.push_back((lean_object *)lean_to_promise(o)->m_result);
+            break;
+        case LeanClosure: {
+            object ** it  = lean_closure_arg_cptr(o);
+            object ** end = it + lean_closure_num_fixed(o);
+            for (; it != end; ++it) todo.push_back(*it);
+            break;
+        }
+        case LeanArray: {
+            object ** it  = lean_array_cptr(o);
+            object ** end = it + lean_array_size(o);
+            if (Par && end - it > MARK_PERSISTENT_SPLIT) {
+                /* keep the first chunk, share the rest */
+                object ** mid = it + MARK_PERSISTENT_CHUNK;
+                mark_persistent_pool_push(pool, mid, end);
+                end = mid;
+            }
+            for (; it != end; ++it) todo.push_back(*it);
+            break;
+        }
+        case LeanThunk:
+            if (object * c = lean_to_thunk(o)->m_closure) todo.push_back(c);
+            if (object * v = lean_to_thunk(o)->m_value) todo.push_back(v);
+            break;
+        case LeanRef:
+            if (object * v = lean_to_ref(o)->m_value) todo.push_back(v);
+            break;
+        default:
+            lean_unreachable();
+            break;
+        }
+    }
+}
+
+/* Shared work pool of one parallel `lean_mark_persistent` call. A work item is either a range of an
+   array that is part of the graph being marked (no copy; the array stays alive) or an owned chunk of
+   objects donated from a walker's stack. */
+struct mark_persistent_work {
+    object ** begin = nullptr;
+    object ** end = nullptr;
+    std::vector<object*> owned;
+};
+struct mark_persistent_pool {
+    mutex m;
+    std::vector<mark_persistent_work> items;
+    unsigned active{0};
+    unsigned num_threads{1};
+    std::atomic<size_t> claimed{0};
+    std::atomic<size_t> donations{0};
+};
+
+static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** begin, object ** end) {
+    unique_lock<mutex> lock(pool->m);
+    for (; begin < end; begin += MARK_PERSISTENT_CHUNK) {
+        mark_persistent_work w;
+        w.begin = begin;
+        w.end = std::min(begin + MARK_PERSISTENT_CHUNK, end);
+        pool->items.push_back(std::move(w));
+    }
+}
+
+/* Every `MARK_PERSISTENT_DONATE_EVERY` pops a walker offers the older half of its stack to the pool
+   when the pool runs low: a wide, shallow trie such as a `PersistentHashMap` or `DiscrTree` keeps the
+   depth-first stack small although the remaining work is large, so the stack size itself is no
+   trigger. The older entries are the higher-level siblings, i.e. the largest subtrees. */
+#define MARK_PERSISTENT_DONATE_EVERY 512
+static void mark_persistent_pool_donate(mark_persistent_pool * pool, std::vector<object*> & todo) {
+    if (todo.size() < 2) return;
+    unique_lock<mutex> lock(pool->m);
+    if (pool->items.size() >= pool->num_threads) return;
+    size_t half = todo.size() / 2;
+    mark_persistent_work w;
+    w.owned.assign(todo.begin(), todo.begin() + half);
+    pool->items.push_back(std::move(w));
+    todo.erase(todo.begin(), todo.begin() + half);
+    pool->donations.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* Depth-first marking of everything reachable from the entries of `todo`. `Par = true` claims
+   nodes with an atomic exchange (several threads may share the graph), `Par = false` is the
+   original single-threaded walk. */
+template<bool Par>
+static void mark_persistent_core(std::vector<object*> & todo, mark_persistent_pool * pool = nullptr) {
+    unsigned n = 0;
+    size_t claimed = 0;
     while (!todo.empty()) {
         object * o = todo.back();
         todo.pop_back();
-        if (!lean_is_scalar(o) && lean_has_rc(o)) {
+        if (Par && (++n % MARK_PERSISTENT_DONATE_EVERY) == 0) mark_persistent_pool_donate(pool, todo);
+        if (lean_is_scalar(o)) continue;
+        if (Par) {
+            /* Objects inside compacted regions already have rc = 0 and live in read-only
+               mappings: never write to them (the plain load filters them, the exchange decides
+               races between workers on heap objects). */
+            if (__atomic_load_n(&o->m_rc, __ATOMIC_RELAXED) == 0) continue;
+            if (__atomic_exchange_n(&o->m_rc, 0, __ATOMIC_RELAXED) == 0) continue;
+            claimed++;
+        } else {
+            if (!lean_has_rc(o)) continue;
             lean_internal_set_rc(o, 0);
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-            // do not report as leak
-            // NOTE: Most persistent objects are actually reachable from global
-            // variables up to the end of the process. However, this is *not*
-            // true for closures inside of persistent thunks, which are
-            // "orphaned" after being evaluated.
-            __lsan_ignore_object(o);
+        }
+        mark_persistent_expand<Par>(o, todo, pool);
+    }
+    if (Par) pool->claimed.fetch_add(claimed, std::memory_order_relaxed);
+}
+
+static void mark_persistent_seq(object * o) {
+    std::vector<object*> todo;
+    todo.push_back(o);
+    mark_persistent_core<false>(todo);
+}
+
+// defined after `task_manager` below
+static unsigned get_num_std_workers();
+
+/* Number of threads to use for one `lean_mark_persistent` walk: the task manager's worker budget
+   (`lean -j`, `LEAN_NUM_THREADS`), at most 16, overridable with `LEAN_IMPORT_THREADS` (0 or 1 =
+   sequential). Cached after the first call that sees a task manager. */
+static unsigned mark_persistent_num_threads() {
+#if !defined(LEAN_MULTI_THREAD)
+    return 1;
+#else
+    static int g_override = -2;  // -2: not parsed, -1: unset, >= 0: value
+    if (g_override == -2) {
+        char const * s = std::getenv("LEAN_IMPORT_THREADS");
+        g_override = s ? std::max(0, atoi(s)) : -1;
+    }
+    unsigned n = get_num_std_workers();
+    if (n == 0) return 1;  // no task manager (process start-up / shutdown): stay sequential
+    if (g_override >= 0) return std::max(1u, std::min(n, (unsigned)g_override));
+    return std::min(n, 16u);
 #endif
-#endif
-            uint8_t tag = lean_ptr_tag(o);
-            if (tag <= LeanMaxCtorTag) {
-                object ** it  = lean_ctor_obj_cptr(o);
-                object ** end = it + lean_ctor_num_objs(o);
-                for (; it != end; ++it) todo.push_back(*it);
-            } else {
-                switch (tag) {
-                case LeanScalarArray:
-                case LeanString:
-                case LeanMPZ:
+}
+
+static bool mark_persistent_debug() {
+    static int g_debug = -1;
+    if (g_debug < 0) { char const * s = std::getenv("LEAN_IMPORT_DEBUG"); g_debug = (s && atoi(s) > 0) ? 1 : 0; }
+    return g_debug == 1;
+}
+
+extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
+    unsigned num_threads = mark_persistent_num_threads();
+    bool dbg = mark_persistent_debug();
+    auto t0 = std::chrono::steady_clock::now();
+    if (num_threads <= 1) {
+        mark_persistent_seq(o);
+        if (dbg) {
+            auto t1 = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[mark_persistent] sequential %.1f ms (threads=%u)\n",
+                         std::chrono::duration<double, std::milli>(t1 - t0).count(), num_threads);
+        }
+        return;
+    }
+    /* Phase 1 (calling thread): breadth-first expansion of the graph until the frontier holds
+       enough entries to share. `frontier[i...*]` are unclaimed objects whose parents are marked. */
+    size_t const target = (size_t)num_threads * 1024;
+    std::vector<object*> frontier;
+    frontier.push_back(o);
+    size_t i = 0;
+    while (i < frontier.size() && frontier.size() - i < target) {
+        object * c = frontier[i++];
+        if (lean_is_scalar(c) || !lean_has_rc(c)) continue;
+        lean_internal_set_rc(c, 0);
+        mark_persistent_expand<false>(c, frontier, nullptr);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    if (frontier.size() - i < 2048) {
+        /* small graph (e.g. a dynlib handle or a single closure): not worth the threads */
+        std::vector<object*> todo;
+        for (; i < frontier.size(); i++) todo.push_back(frontier[i]);
+        mark_persistent_core<false>(todo);
+        if (dbg) {
+            auto t2 = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[mark_persistent] small graph: expanded %zu, frontier %zu, %.1f ms\n", i,
+                         frontier.size(), std::chrono::duration<double, std::milli>(t2 - t0).count());
+        }
+        return;
+    }
+    /* Phase 2: `num_threads` walkers (this thread included) take ranges of unclaimed objects from a
+       shared pool; each range is marked depth-first with atomic claims. Large arrays met on the way
+       are split and their ranges pushed back to the pool, so one 2M-entry bucket array does not end
+       up on one thread. A walker stops when the pool is empty and no walker is still active. */
+    mark_persistent_pool pool;
+    pool.num_threads = num_threads;
+    mark_persistent_pool_push(&pool, frontier.data() + i, frontier.data() + frontier.size());
+    size_t const end = frontier.size();
+    auto worker = [&]() {
+        std::vector<object*> todo;
+        while (true) {
+            {
+                unique_lock<mutex> lock(pool.m);
+                if (!pool.items.empty()) {
+                    mark_persistent_work w = std::move(pool.items.back());
+                    pool.items.pop_back();
+                    pool.active++;
+                    lock.unlock();
+                    if (w.begin) todo.assign(w.begin, w.end); else todo.swap(w.owned);
+                } else if (pool.active == 0) {
                     break;
-                case LeanExternal: {
-                    object * fn = lean_alloc_closure((void*)mark_persistent_fn, 1, 0);
-                    lean_to_external(o)->m_class->m_foreach(lean_to_external(o)->m_data, fn);
-                    lean_dec(fn);
-                    break;
-                }
-                case LeanTask:
-                    todo.push_back(lean_task_get(o));
-                    break;
-                case LeanPromise:
-                    todo.push_back((lean_object *)lean_to_promise(o)->m_result);
-                    break;
-                case LeanClosure: {
-                    object ** it  = lean_closure_arg_cptr(o);
-                    object ** end = it + lean_closure_num_fixed(o);
-                    for (; it != end; ++it) todo.push_back(*it);
-                    break;
-                }
-                case LeanArray: {
-                    object ** it  = lean_array_cptr(o);
-                    object ** end = it + lean_array_size(o);
-                    for (; it != end; ++it) todo.push_back(*it);
-                    break;
-                }
-                case LeanThunk:
-                    if (object * c = lean_to_thunk(o)->m_closure) todo.push_back(c);
-                    if (object * v = lean_to_thunk(o)->m_value) todo.push_back(v);
-                    break;
-                case LeanRef:
-                    if (object * v = lean_to_ref(o)->m_value) todo.push_back(v);
-                    break;
-                default:
-                    lean_unreachable();
-                    break;
+                } else {
+                    lock.unlock();
+                    this_thread::yield();
+                    continue;
                 }
             }
+            mark_persistent_core<true>(todo, &pool);
+            todo.clear();
+            {
+                unique_lock<mutex> lock(pool.m);
+                pool.active--;
+            }
         }
+    };
+    std::vector<std::unique_ptr<lthread>> threads;
+    for (unsigned t = 1; t < num_threads; t++)
+        threads.push_back(std::make_unique<lthread>(worker));
+    worker();
+    for (auto & th : threads) th->join();
+    if (dbg) {
+        auto t2 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[mark_persistent] parallel: threads=%u expanded=%zu frontier=%zu claimed=%zu donations=%zu phase1 %.1f ms, phase2 %.1f ms\n",
+                     num_threads, i, end - i, pool.claimed.load(), pool.donations.load(), std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(t2 - t1).count());
     }
 }
 
@@ -969,6 +1186,11 @@ class task_manager {
     }
 
 public:
+    unsigned get_max_std_workers() {
+        unique_lock<mutex> lock(m_mutex);
+        return m_max_std_workers;
+    }
+
     task_manager(unsigned max_std_workers):
         m_max_std_workers(max_std_workers) {
     }
@@ -1102,6 +1324,10 @@ public:
 };
 
 static task_manager * g_task_manager = nullptr;
+
+static unsigned get_num_std_workers() {
+    return g_task_manager ? g_task_manager->get_max_std_workers() : 0;
+}
 
 extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
     lean_assert(g_task_manager == nullptr);
