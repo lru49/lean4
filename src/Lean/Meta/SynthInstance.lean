@@ -964,13 +964,35 @@ private def SynthInstanceCache.insertEntry (c : SynthInstanceCache) (key : Synth
     some <| entry :: (entries?.getD [] |>.filter fun e =>
       e.deps.options != entry.deps.options || e.deps.base != entry.deps.base)
 
+/--
+The identity witnesses of the persistent tier (see `Environment.reviveSynthCache`): the instance
+table in effect. Scopes that activate a scoped instance (`open Classical in`, the `classical`
+tactic, `by_cases`) replace it and restore the very same object when they close.
+-/
+private def synthCacheWitnesses (env : Environment) : Array (Nat × NonScalar) :=
+  match instanceExtension.ext.toEnvExtension.genIdx? with
+  -- not a dependency of a search: only compared by identity
+  | some i => #[(i, unsafe unsafeCast (instanceExtension.getState (genRecorded := true) env))]
+  | none   => #[]
+
+/--
+Brings back a parked persistent tier that is valid again, if the stored one is not current; see
+`Environment.reviveSynthCache`.
+-/
+private def revivePersistentTier : MetaM Unit := do
+  if (← getEnv).isSynthCacheStale then
+    -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
+    modifyThe Core.State fun s => { s with env := s.env.reviveSynthCache (synthCacheWitnesses s.env) }
+
 /-- Adds `entry` to the transient tier, and to the persistent tier if `persist` is set. -/
 private def insertCacheEntry (key : SynthInstanceCacheKey) (entry : SynthInstanceCacheEntry)
     (persist : Bool) : MetaM Unit := do
   if persist then
+    revivePersistentTier
     -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
     modifyThe Core.State fun s =>
-      { s with env := s.env.setSynthCache (s.env.synthCache.insertEntry key entry) }
+      { s with env := s.env.setSynthCacheWith (s.env.synthCache.insertEntry key entry)
+          (synthCacheWitnesses s.env) }
   modifyCache fun c => { c with synthInstance := c.synthInstance.insertEntry key entry }
 
 /--
@@ -985,10 +1007,12 @@ private def findCachedResult? (key : SynthInstanceCacheKey) : MetaM (Option Synt
     entries.find? fun e => validOptionAccesses opts e.deps && validEnvDeps env e.deps
   let (entry, persistent) ← if let some entry := find? (← get).cache.synthInstance then
       pure (entry, false)
-    else if let some entry := find? env.synthCache then
-      pure (entry, true)
     else
-      return none
+      revivePersistentTier
+      if let some entry := find? (← getEnv).synthCache then
+        pure (entry, true)
+      else
+        return none
   if entry.deps.baseTrackedGen != env.trackedGen ||
       entry.deps.baseChangeLogPos != env.declChangeLog.size then
     -- Re-stamped, so that later lookups skip the environment checks just done.
