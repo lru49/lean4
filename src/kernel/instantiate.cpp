@@ -15,7 +15,7 @@ namespace lean {
 expr instantiate(expr const & a, unsigned s, unsigned n, expr const * subst) {
     if (s >= get_loose_bvar_range(a) || n == 0)
         return a;
-    return replace_tpl(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    return replace_tpl_pre(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             unsigned s1 = s + offset;
             if (is_bvar(m)) {
                 nat const & vidx = bvar_idx(m);
@@ -32,6 +32,20 @@ expr instantiate(expr const & a, unsigned s, unsigned n, expr const * subst) {
         }, true, [=](expr const & m, unsigned offset) {
             unsigned s1 = s + offset;
             return s1 < s || s1 >= get_loose_bvar_range(m);
+        }, [=](expr const & m, unsigned offset) -> optional<expr> {
+            /* lean-perf (CE instbvar): a variable replaced by a value that needs no lifting is answered without
+               the cache (see `replace_rec_fn`); `skip` has already ruled out `vidx < s1`. */
+            if (is_bvar(m)) {
+                unsigned s1 = s + offset;
+                nat const & vidx = bvar_idx(m);
+                unsigned h = s1 + n;
+                if (vidx >= s1 && (h < s1 || vidx < h)) {
+                    expr const & v = subst[vidx.get_small_value() - s1];
+                    if (offset == 0 || !has_loose_bvars(v))
+                        return some_expr(v);
+                }
+            }
+            return none_expr();
         });
 }
 
@@ -56,7 +70,7 @@ static object * lean_expr_instantiate_core(b_obj_arg a0, size_t n, object** subs
         lean_inc(a0);
         return a0;
     }
-    expr r = replace_tpl(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    expr r = replace_tpl_pre(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (is_bvar(m)) {
                 nat const & vidx = bvar_idx(m);
                 if (vidx >= offset) {
@@ -70,7 +84,20 @@ static object * lean_expr_instantiate_core(b_obj_arg a0, size_t n, object** subs
                 }
             }
             return none_expr();
-        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); });
+        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); },
+        [=](expr const & m, unsigned offset) -> optional<expr> {
+            /* lean-perf (CE instbvar): see `instantiate` above. */
+            if (is_bvar(m)) {
+                nat const & vidx = bvar_idx(m);
+                size_t h = offset + n;
+                if (vidx >= offset && (h < offset || (vidx.is_small() && vidx.get_small_value() < h))) {
+                    expr const & v = TO_REF(expr, subst[vidx.get_small_value() - offset]);
+                    if (offset == 0 || !has_loose_bvars(v))
+                        return some_expr(v);
+                }
+            }
+            return none_expr();
+        });
     return r.steal();
 }
 
@@ -95,7 +122,7 @@ extern "C" LEAN_EXPORT object * lean_expr_instantiate_range(b_obj_arg a, b_obj_a
 expr instantiate_rev(expr const & a, unsigned n, expr const * subst) {
     if (!has_loose_bvars(a))
         return a;
-    return replace_tpl(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    return replace_tpl_pre(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (is_bvar(m)) {
                 nat const & vidx = bvar_idx(m);
                 if (vidx >= offset) {
@@ -108,7 +135,20 @@ expr instantiate_rev(expr const & a, unsigned n, expr const * subst) {
                 }
             }
             return none_expr();
-        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); });
+        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); ,
+        [=](expr const & m, unsigned offset) -> optional<expr> {
+            /* lean-perf (CE instbvar): see `instantiate` above. */
+            if (is_bvar(m)) {
+                nat const & vidx = bvar_idx(m);
+                size_t h = offset + n;
+                if (vidx >= offset && (h < offset || (vidx.is_small() && vidx.get_small_value() < h))) {
+                    expr const & v = subst[n - (vidx.get_small_value() - offset) - 1];
+                    if (offset == 0 || !has_loose_bvars(v))
+                        return some_expr(v);
+                }
+            }
+            return none_expr();
+        });
 }
 
 static object * lean_expr_instantiate_rev_core(object * a0, size_t n, object ** subst) {
@@ -117,7 +157,7 @@ static object * lean_expr_instantiate_rev_core(object * a0, size_t n, object ** 
         lean_inc(a0);
         return a0;
     }
-    expr r = replace_tpl(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    expr r = replace_tpl_pre(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (is_bvar(m)) {
                 nat const & vidx = bvar_idx(m);
                 if (vidx >= offset) {
@@ -131,7 +171,20 @@ static object * lean_expr_instantiate_rev_core(object * a0, size_t n, object ** 
                 }
             }
             return none_expr();
-        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); });
+        }, true, [](expr const & m, unsigned offset) { return offset >= get_loose_bvar_range(m); ,
+        [=](expr const & m, unsigned offset) -> optional<expr> {
+            /* lean-perf (CE instbvar): see `instantiate` above. */
+            if (is_bvar(m)) {
+                nat const & vidx = bvar_idx(m);
+                size_t h = offset + n;
+                if (vidx >= offset && (h < offset || (vidx.is_small() && vidx.get_small_value() < h))) {
+                    expr const & v = TO_REF(expr, subst[n - (vidx.get_small_value() - offset) - 1]);
+                    if (offset == 0 || !has_loose_bvars(v))
+                        return some_expr(v);
+                }
+            }
+            return none_expr();
+        });
     return r.steal();
 }
 

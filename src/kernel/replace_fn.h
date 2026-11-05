@@ -109,11 +109,21 @@ struct replace_skip_none {
     bool operator()(expr const &, unsigned) const { return false; }
 };
 
-template<typename F, typename S>
+/* lean-perf (CE instbvar): the default `pre` of `replace_tpl`: no subterm is answered before the cache. */
+struct replace_pre_none {
+    optional<expr> operator()(expr const &, unsigned) const { return none_expr(); }
+};
+
+/* `pre(m, offset)`, consulted after `skip` and before the cache, may answer a subterm directly; it may only
+   return a result that does not depend on whether `m` was visited before and that is pointer-identical to
+   what the cached path would return (e.g. a substitution value that needs no lifting), so the output,
+   including its sharing, is the same as without it. */
+template<typename F, typename S, typename P = replace_pre_none>
 class replace_rec_fn {
     replace_cache m_cache;
     F const & m_f;
     S         m_skip;
+    P         m_pre;
     bool      m_use_cache;
 
     expr save_result(expr const & e, unsigned offset, expr r, bool shared) {
@@ -125,6 +135,8 @@ class replace_rec_fn {
     expr apply(expr const & e, unsigned offset) {
         if (m_skip(e, offset))
             return e;
+        if (optional<expr> r = m_pre(e, offset))
+            return *r;
         bool shared = false;
         if (m_use_cache && !is_likely_unshared(e)) {
             if (lean_object * r = m_cache.find(e.raw(), offset))
@@ -168,7 +180,7 @@ class replace_rec_fn {
         }
     }
 public:
-    replace_rec_fn(F const & f, S const & skip, bool use_cache):m_f(f), m_skip(skip), m_use_cache(use_cache) {}
+    replace_rec_fn(F const & f, S const & skip, bool use_cache, P const & pre = P()):m_f(f), m_skip(skip), m_pre(pre), m_use_cache(use_cache) {}
 
     expr operator()(expr const & e) { return apply(e, 0); }
 };
@@ -179,6 +191,12 @@ public:
 template<typename F, typename S = replace_skip_none>
 expr replace_tpl(expr const & e, F const & f, bool use_cache = true, S const & skip = S()) {
     return replace_rec_fn<F, S>(f, skip, use_cache)(e);
+}
+
+/** \brief `replace_tpl` with a `pre` functor (see `replace_rec_fn`). */
+template<typename F, typename S, typename P>
+expr replace_tpl_pre(expr const & e, F const & f, bool use_cache, S const & skip, P const & pre) {
+    return replace_rec_fn<F, S, P>(f, skip, use_cache, pre)(e);
 }
 
 /**
