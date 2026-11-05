@@ -236,6 +236,29 @@ if(LEAN_PGO_PROFILE AND NOT STAGE EQUAL 0)
   set(LEAN_CORE_LEANC_FLAGS "${LEAN_PGO_FLAGS}")
 endif()
 
+# ThinLTO (clang + lld only): the C++ runtime/kernel and the core library's C are compiled to LLVM bitcode and optimized
+# together when `libleanshared` and the executables are linked, so small runtime functions (allocation, `Nat`/array
+# primitives, ...) and small Lean functions inline across translation units. Like the PGO flags, the compile flags reach
+# the core library through Lake's `moreLeancArgs` only, never `leanc`. The static core libraries then hold bitcode, so they
+# need an `llvm-ar` of the same LLVM, which is selected here. Set `-DLEAN_LTO=OFF` to build without it.
+get_filename_component(LEAN_CC_REALPATH "${CMAKE_C_COMPILER}" REALPATH)
+get_filename_component(LEAN_CC_DIR "${LEAN_CC_REALPATH}" DIRECTORY)
+find_program(LEAN_LLVM_AR NAMES llvm-ar HINTS "${LEAN_CC_DIR}" NO_DEFAULT_PATH)
+find_program(LEAN_LLVM_RANLIB NAMES llvm-ranlib HINTS "${LEAN_CC_DIR}" NO_DEFAULT_PATH)
+set(LEAN_LTO_DEFAULT OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_NAME MATCHES "Linux" AND LLD_PATH AND LEAN_LLVM_AR AND LEAN_LLVM_RANLIB)
+  set(LEAN_LTO_DEFAULT ON)
+endif()
+option(LEAN_LTO "Link-time optimization (ThinLTO) of the runtime, kernel and core library" ${LEAN_LTO_DEFAULT})
+if(LEAN_LTO AND NOT STAGE EQUAL 0)
+  message(STATUS "ThinLTO with ${LEAN_LLVM_AR}")
+  set(CMAKE_AR "${LEAN_LLVM_AR}" CACHE FILEPATH "archiver" FORCE)
+  set(CMAKE_RANLIB "${LEAN_LLVM_RANLIB}" CACHE FILEPATH "ranlib" FORCE)
+  string(APPEND LEAN_EXTRA_CXX_FLAGS " -flto=thin")
+  string(STRIP "${LEAN_CORE_LEANC_FLAGS} -flto=thin" LEAN_CORE_LEANC_FLAGS)
+  string(APPEND LEAN_EXTRA_LINKER_FLAGS " -flto=thin -Wl,--thinlto-jobs=all")
+endif()
+
 # On Windows we want to disable writing COFF object file time stamps.
 # LLVM 23 seems to have a regression in this regard.
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
