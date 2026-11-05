@@ -66,8 +66,16 @@ public:
     expr_flat_map() {}
     expr_flat_map(expr_flat_map const &) = delete;
     expr_flat_map & operator=(expr_flat_map const &) = delete;
+    static void free_block_fn(void * p) { free_block(p); }
+    /** \brief A large table is released on the runtime's release thread (`lean_dec_refs_deferred`): its entries are a
+        contiguous array of {key, value} pointers with nullptr for empty slots. */
+    bool release_deferred() {
+        static_assert(sizeof(entry) == 2 * sizeof(lean_object *), "entry = two pointers");
+        return lean_dec_refs_deferred(reinterpret_cast<lean_object **>(m_tab), 2 * (m_mask + 1), free_block_fn, m_tab);
+    }
     ~expr_flat_map() {
         if (m_tab == nullptr) return;
+        if (m_size >= 4096 && release_deferred()) return;
         for (size_t i = 0; i <= m_mask; i++) {
             if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
         }
@@ -77,6 +85,7 @@ public:
     /** \brief Release every entry and the table (the next `insert` starts from the initial capacity again). */
     void clear() {
         if (m_tab == nullptr) return;
+        if (m_size >= 4096 && release_deferred()) { m_tab = nullptr; m_mask = 0; m_size = 0; return; }
         for (size_t i = 0; i <= m_mask; i++) {
             if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
         }
