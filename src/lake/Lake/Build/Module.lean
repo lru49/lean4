@@ -14,6 +14,7 @@ import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
+import Lake.Build.HeaderSnapshot
 import Init.Omega
 public import Init.Task
 
@@ -1203,7 +1204,7 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
 def Module.buildLean
-  (mod : Module) (presetup : ModulePreSetup)
+  (mod : Module) (presetup : ModulePreSetup) (importHash? : Option Hash := none)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
@@ -1211,8 +1212,20 @@ def Module.buildLean
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
-    (← getLeanPath) (← getLean)
+  let leanPath ← getLeanPath
+  -- Lake-managed header snapshots (see `Lake.HeaderSnapshot`)
+  let hsnap ← match importHash? with
+    | some importHash => do
+      let srcText? ← (IO.FS.readFile presetup.srcFile).toBaseIO
+      match srcText? with
+      | .ok srcText =>
+        HeaderSnapshot.plan (mod.pkg.buildDir / "headers") srcText setup importHash args
+          (← getLean) (← getLeanInstall).githash #[("LEAN_PATH", some leanPath.toString)]
+      | .error _ => pure {}
+    | none => pure {}
+  hsnap.startSave
+  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts (args ++ hsnap.loadArgs)
+    leanPath (← getLean)
   mod.computeArtifacts setup.isModule presetup.postponeCompile
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
@@ -1241,9 +1254,12 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
+  let impInfoJob ← mod.importInfo.fetch
   presetupJob.mapM fun presetup => do
     setTrace presetup.trace
-    let arts ← fetchCore presetup
+    -- finished already: the presetup is computed from the import info
+    let importHash? := (← impInfoJob.wait?).map (·.trace.hash)
+    let arts ← fetchCore presetup importHash?
     let arts ← adjustMTime arts mod.traceFile
     return arts
 where
@@ -1290,7 +1306,7 @@ where
           let ltar ← computeArtifact mod.ltarFile "ltar"
           return .complete {arts with ltar? := some ltar}
       return .complete arts
-  fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
+  fetchCore (presetup : ModulePreSetup) (importHash? : Option Hash) : JobM ModuleOutputArtifacts := do
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
@@ -1310,9 +1326,9 @@ where
             if status == .hashUpToDate then
               mod.unpackLtar mod.ltarFile depTrace.hash
             else
-              discard <| mod.buildLean presetup
+              discard <| mod.buildLean presetup importHash?
         else
-          discard <| mod.buildLean presetup
+          discard <| mod.buildLean presetup importHash?
         if status.isCacheable then
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
@@ -1329,7 +1345,7 @@ where
           if status == .hashUpToDate then
             mod.unpackLtar mod.ltarFile depTrace.hash
           else
-            discard <| mod.buildLean presetup
+            discard <| mod.buildLean presetup importHash?
         mod.computeArtifacts presetup.isModule presetup.postponeCompile
       else
         if (← mod.pkg.isArtifactCacheReadable) then
@@ -1341,9 +1357,9 @@ where
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
               return {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              mod.buildLean presetup
+              mod.buildLean presetup importHash?
         else
-          mod.buildLean presetup
+          mod.buildLean presetup importHash?
 
 /-- The `ModuleFacetConfig` for the builtin `elabArtsFacet`. -/
 public def Module.elabArtsFacetConfig : ModuleFacetConfig elabArtsFacet :=
@@ -1830,13 +1846,18 @@ public def prepareLeanCommand
   if let some mod ← findModuleBySrc? path then
     logVerbose s!"file identified as module: {mod.name}"
     let setupJob ← mod.setup.fetch
+    let impInfoJob ← mod.importInfo.fetch
     setupJob.mapM (sync := true) fun setup => do
-      mkSpawnArgs path setup mod.leanArgs
+      let importHash? := (← impInfoJob.wait?).map (·.trace.hash)
+      mkSpawnArgs path setup mod.leanArgs importHash? mod.pkg.buildDir
   else
     let header ← Lean.parseImports' (← IO.FS.readFile path) leanFile.toString
     let setupJob ← setupExternalModule leanFile.toString header (← getLeanOptions)
+    let impInfoJob ← fetchImportInfo leanFile.toString .anonymous .anonymous header
+    let buildDir := (← getRootPackage).buildDir
     setupJob.mapM (sync := true) fun setup => do
-      mkSpawnArgs path setup (← getLeanArgs)
+      let importHash? := (← impInfoJob.wait?).map (·.trace.hash)
+      mkSpawnArgs path setup (← getLeanArgs) importHash? buildDir
 where
   mkArgs leanFile setup cfgArgs := do
     let args := cfgArgs.push leanFile.toString
@@ -1846,12 +1867,23 @@ where
     h.putStr contents
     let args := args ++ #["--setup", setupFile.toString]
     return args
-  mkSpawnArgs leanFile setup cfgArgs := do
+  mkSpawnArgs leanFile setup cfgArgs importHash? (buildDir : FilePath) := do
     let args ← mkArgs leanFile setup cfgArgs
+    let env ← getAugmentedEnv
+    -- Lake-managed header snapshots (see `Lake.HeaderSnapshot`)
+    let hsnap ← match importHash? with
+      | some importHash => do
+        match (← (IO.FS.readFile leanFile).toBaseIO) with
+        | .ok srcText =>
+          HeaderSnapshot.plan (buildDir / "headers") srcText setup importHash (cfgArgs ++ moreArgs)
+            (← getLean) (← getLeanInstall).githash env
+        | .error _ => pure {}
+      | none => pure {}
+    hsnap.startSave
     let spawnArgs : IO.Process.SpawnArgs := {
-      args := args ++ moreArgs
+      args := args ++ moreArgs ++ hsnap.loadArgs
       cmd := (← getLean).toString
-      env := (← getAugmentedEnv)
+      env
     }
     logVerbose (mkCmdLog spawnArgs)
     return spawnArgs
