@@ -58,9 +58,6 @@ structure Descr (α : Type) (β : Type) (σ : Type) where
   trackGen : Bool := false
   /-- See `EnvExtension.logWrites`. -/
   logWrites : Bool := false
-  /-- See `PersistentEnvExtensionDescrCore.parallelImport`: `ofOLeanEntry`, `addEntry`,
-  `finalizeImport` and `mkInitial` are pure. -/
-  parallelImport : Bool := false
   /--
   The declaration an entry is about. Required with `logWrites`: adding an entry and scope
   operations adding or removing entries log their declarations (`Environment.logDeclChange`).
@@ -223,7 +220,6 @@ unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (Scope
     asyncMode       := .mainOnly
     trackGen        := descr.trackGen
     logWrites       := descr.logWrites
-    parallelImport  := descr.parallelImport
   }
   let ext := { descr := descr, ext := ext : ScopedEnvExtension α β σ }
   scopedEnvExtensionsRef.modify fun exts => exts.push (unsafeCast ext)
@@ -389,7 +385,7 @@ structure SimpleScopedEnvExtension.Descr (α : Type) (σ : Type) where
   entryDecl? : Option (α → Name) := none
 
 def registerSimpleScopedEnvExtension (descr : SimpleScopedEnvExtension.Descr α σ) : IO (SimpleScopedEnvExtension α σ) := do
-  registerScopedEnvExtension {
+  let ext ← registerScopedEnvExtension {
     name           := descr.name
     mkInitial      := return descr.initial
     addEntry       := descr.addEntry
@@ -400,7 +396,9 @@ def registerSimpleScopedEnvExtension (descr : SimpleScopedEnvExtension.Descr α 
     trackGen       := descr.trackGen
     logWrites      := descr.logWrites
     entryDecl?     := descr.entryDecl?
-    parallelImport := true -- lean-perf: all functions above are pure
   }
+  -- lean-perf: all functions above are pure, so the imported state may be computed on a task
+  registerParallelImportExt descr.name
+  return ext
 
 end Lean
