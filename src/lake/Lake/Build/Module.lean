@@ -321,6 +321,68 @@ where
         else q
       else q
 
+/--
+The transitive import artifacts of the non-`module` files whose setup was computed in this
+process, keyed by `transImportArtsMemoKey` (source file and dependency trace hash).
+
+For a non-`module` importer, `fetchTransImportArts` visits every reachable import with
+`importAll` set, so its result is exactly `{m ↦ allArts m | m reachable from the direct
+imports}`: a function of the import graph only, independent of the traversal order. The result
+for a module therefore contains the result for each of its non-`module` imports, and
+`fetchTransImportArtsNonModule` starts from those instead of re-walking the whole closure
+(thousands of modules, two build-store fetches each) for every module of a chain.
+-/
+builtin_initialize transImportArtsMemo : IO.Ref (NameMap (NameMap ImportArtifacts)) ←
+  IO.mkRef {}
+
+def transImportArtsMemoKey (mod : Module) (depHash : Hash) : Name :=
+  .mkNum (.mkStr .anonymous mod.leanFile.toString) depHash.val.toNat
+
+/--
+`fetchTransImportArts directImports directArts (nonModule := true)`, computed from the memoized
+results of the direct imports (when they are non-`module` files built in this process) plus a
+plain reachability walk over what they do not cover. See `transImportArtsMemo`.
+-/
+partial def fetchTransImportArtsNonModule
+  (directImports : Array ModuleImport)
+: FetchM (NameMap ImportArtifacts) := do
+  let memo ← transImportArtsMemo.get
+  let mut seeds : Array (NameMap ImportArtifacts) := #[]
+  for imp in directImports do
+    let some mod := imp.module? | continue
+    let presetup ← (← mod.presetup.fetch).await
+    unless presetup.isModule do
+      if let some arts := memo.find? (transImportArtsMemoKey mod presetup.trace.hash) then
+        seeds := seeds.push arts
+  -- Merge the smaller closures into the largest one.
+  let size (m : NameMap ImportArtifacts) : Nat := Std.TreeMap.size m
+  let mut best := 0
+  for i in [0:seeds.size] do
+    if size seeds[i]! > size seeds[best]! then best := i
+  let mut s : NameMap ImportArtifacts := seeds[best]?.getD {}
+  for i in [0:seeds.size] do
+    unless i == best do
+      for (n, a) in seeds[i]! do
+        unless s.contains n do s := s.insert n a
+  let q := directImports.foldr (init := #[]) fun imp q =>
+    if let some mod := imp.module? then q.push mod else q
+  walk s q
+where
+  walk (s : NameMap ImportArtifacts) (q : Array Module) : FetchM (NameMap ImportArtifacts) := do
+    if h : 0 < q.size then
+      let mod := q.back
+      let q := q.pop
+      if s.contains mod.name then
+        return ← walk s q
+      let info ← (← mod.fetchExportInfo).await
+      let s := s.insert mod.name info.allArts
+      let input ← (← mod.input.fetch).await
+      let q := input.imports.foldr (init := q) fun imp q =>
+        if let some mod := imp.module? then q.push mod else q
+      walk s q
+    else
+      return s
+
 def ModuleImportInfo.nil (modName : Name) : ModuleImportInfo where
   directArts := {}
   trace := .nil s!"imports"
@@ -751,8 +813,12 @@ public def Module.depsFacetConfig : ModuleFacetConfig depsFacet :=
   mkFacetJobConfig fun mod => (·.toOpaque) <$> mod.presetup.fetch
 
 def mkModuleSetup (mod : Module) (presetup : ModulePreSetup) : FetchM ModuleSetup := do
-  let importArts ← fetchTransImportArts
-    presetup.directImports presetup.directImportArts !presetup.isModule
+  let importArts ← if presetup.isModule then
+      fetchTransImportArts presetup.directImports presetup.directImportArts false
+    else
+      let arts ← fetchTransImportArtsNonModule presetup.directImports
+      transImportArtsMemo.modify (·.insert (transImportArtsMemoKey mod presetup.trace.hash) arts)
+      pure arts
   return {
     name := mod.name
     isModule := presetup.isModule
