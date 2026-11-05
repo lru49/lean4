@@ -2417,7 +2417,215 @@ def tick (what : String) : IO Unit := do
   if (← debugEnabled) then
     IO.eprintln s!"[timeline] {← sinceStart (← IO.monoNanosNow)} {what}"
 
+def checkEnabled : BaseIO Bool := do
+  return (← envNat? "LEAN_IMPORT_CHECK").getD 0 != 0
+
+/-!
+lean-perf (L01d, perf-parallel-import-3): conversions of imported extension entries precomputed on tasks.
+
+Some `ScopedEnvExtension`s convert every imported entry through the interpreter inside `addImportedFn`,
+on the main thread: `parserExtension` (`mkParserOfConstant`, 114-186 ms of the import of a Mathlib-sized
+prefix) and every `KeyedDeclsAttribute` (`evalConstCheck`: delaborators, macros, unexpanders, elaborators).
+Such an extension registers a `ConvertFn` under its name: given the imported entries (per module) and a
+thread budget it returns, per entry, `some` converted value (or the `IO.Error` the conversion threw) or
+`none` for the entries it leaves to `ofOLeanEntry`. `finalizePersistentExtensions` spawns every registered
+function right after `runInitAttrs` (the conversions may evaluate constants whose modules are
+`[init]`ialized there; upstream converts after it too, at the extension's own index), and
+`ScopedEnvExtension.addImportedFn` takes the result and folds the entries in the usual order, so the state
+is the same value as the sequential construction. Registries keyed by name, not `Descr` fields: the object
+layout of `Descr` must stay the one stage 0 expects (see L01c).
+-/
+
+/-- Priority of the import tasks the main thread waits for soon after spawning them (entry conversions,
+entry indexing): above the pure extension states, which it collects only at the end of the phase. -/
+def criticalPrio : Task.Priority := Task.Priority.max
+
+/-- Number of imported entries of an extension, estimated from every 64th module. -/
+partial def sampleEntryCount {α : Type} (as : Array (Array α)) (i : Nat := 0) (n : Nat := 0) : Nat :=
+  if h : i < as.size then sampleEntryCount as (i + 64) (n + as[i].size) else n * 64
+
+/-- Priority of a pure extension-state task from its entry count: the longest states first (LPT). -/
+def extTaskPrio (numEntries : Nat) : Task.Priority :=
+  min (Task.Priority.max - 1) (Nat.log2 (numEntries + 1) / 2)
+
+/-- Per entry (module index, position): the converted entry, the error its conversion threw, or `none`. -/
+abbrev ConvertResult (β : Type) := Array (Array (Option (Except IO.Error β)))
+/-- The chunk tasks of a conversion (`spawnJobs`): job `t` of chunk `k` is entry `pos[k * chunk + t]`. A task never
+waits for another task (a pool worker blocked in `Task.get` costs a worker), so the registered function returns the
+pending chunks and the main thread collects them (`collectJobs`) when it reaches the extension. -/
+structure JobTasks (β : Type) where
+  pos   : Array (Nat × Nat)
+  chunk : Nat
+  tasks : Array (Task (Array (Except IO.Error β)))
+abbrev ConvertFn (α β : Type) := Array (Array α) → Nat → ImportM (JobTasks β)
+
+builtin_initialize convertFnsRef : IO.Ref (NameMap (ConvertFn EnvExtensionEntry EnvExtensionEntry)) ← IO.mkRef {}
+/-- The running conversion tasks of the current import, by extension name (chunks, start, end). -/
+builtin_initialize convertTasksRef :
+    IO.Ref (NameMap (Task (Except IO.Error (JobTasks EnvExtensionEntry × Nat × Nat)))) ← IO.mkRef {}
+
+unsafe def registerConvertFnUnsafe {α β : Type} (extName : Name) (f : ConvertFn α β) : IO Unit :=
+  convertFnsRef.modify (·.insert extName (unsafeCast f))
+
+/-- Registers the parallel conversion of extension `extName`'s imported entries; `f as n` must agree with
+`ofOLeanEntry` (on the state the sequential fold would pass) on every entry it converts. -/
+@[implemented_by registerConvertFnUnsafe]
+opaque registerConvertFn {α β : Type} (extName : Name) (f : ConvertFn α β) : IO Unit
+
+/-- Runs `f` over `jobs` (entry position plus the job's input) in chunks of consecutive jobs on tasks at
+`criticalPrio`; `4 * numThreads` chunks balance uneven job costs. Every chunk's results are marked persistent
+on the task (conversions are only spawned with `leakEnv`: the values end up in persistent states anyway). -/
+def spawnJobs {γ β : Type} [Inhabited γ] (jobs : Array (Nat × Nat × γ)) (numThreads : Nat)
+    (f : γ → BaseIO (Except IO.Error β)) : BaseIO (JobTasks β) := do
+  if jobs.isEmpty then return { pos := #[], chunk := 1, tasks := #[] }
+  if numThreads == 0 then
+    -- `LEAN_IMPORT_PAR_CONVERT=2`: run the jobs here, on the single conversion thread
+    let mut out : Array (Except IO.Error β) := Array.emptyWithCapacity jobs.size
+    for j in jobs do
+      out := out.push (← f j.2.2)
+    let outP ← unsafe (markPersistentSeq out : BaseIO _)
+    return { pos := jobs.map fun (i, j, _) => (i, j), chunk := jobs.size, tasks := #[Task.pure outP] }
+  let nChunks := max 1 (min jobs.size (4 * max 1 numThreads))
+  let chunk := (jobs.size + nChunks - 1) / nChunks
+  let tasks ← (Array.range nChunks).mapM fun k => BaseIO.asTask (prio := criticalPrio) do
+    let lo := k * chunk
+    let hi := min jobs.size ((k + 1) * chunk)
+    let mut out : Array (Except IO.Error β) := Array.emptyWithCapacity (hi - lo)
+    for idx in [lo:hi] do
+      out := out.push (← f jobs[idx]!.2.2)
+    unsafe (markPersistentSeq out : BaseIO _)
+  return { pos := jobs.map fun (i, j, _) => (i, j), chunk, tasks }
+
+/-- Waits for the chunks and places every result at its entry position in an array shaped like `shape`. -/
+def collectJobs {α β : Type} (shape : Array (Array α)) (jt : JobTasks β) : BaseIO (ConvertResult β) := do
+  let mut res : ConvertResult β := shape.map fun a => Array.replicate a.size none
+  for k in [:jt.tasks.size] do
+    let out := jt.tasks[k]!.get
+    let lo := k * jt.chunk
+    for t in [:out.size] do
+      let (i, j) := jt.pos[lo + t]!
+      res := res.modify i (·.set! j (some out[t]!))
+  return res
+
+unsafe def takeConvertedUnsafe {α β : Type} (extName : Name) (shape : Array (Array α)) : IO (Option (ConvertResult β)) := do
+  let m ← convertTasksRef.get
+  let some t := m.find? extName | return none
+  convertTasksRef.set (m.erase extName)
+  let tw0 ← IO.monoNanosNow
+  let (jt, ta, tb) ← IO.ofExcept t.get
+  let r ← collectJobs shape (unsafeCast jt : JobTasks β)
+  let tw1 ← IO.monoNanosNow
+  if (← debugEnabled) then
+    IO.eprintln s!"[conv-ext] {extName}: spawned {jt.tasks.size} chunks ({← sinceStart ta}..{← sinceStart tb}); main waited {elapsedMs tw0 tw1} ({← sinceStart tw0}..{← sinceStart tw1})"
+  return some r
+
+/-- The precomputed conversions of extension `extName` for the current import, if any (consumed once). -/
+@[implemented_by takeConvertedUnsafe]
+opaque takeConverted {α β : Type} (extName : Name) (shape : Array (Array α)) : IO (Option (ConvertResult β))
+
+/-- `LEAN_IMPORT_CHECK=1`: a comparison of the state built with precomputed conversions against the
+sequential one, by extension name. -/
+builtin_initialize checkFnsRef : IO.Ref (NameMap (EnvExtensionState → EnvExtensionState → IO Unit)) ← IO.mkRef {}
+
+unsafe def registerCheckFnUnsafe {σ : Type} (extName : Name) (f : σ → σ → IO Unit) : IO Unit :=
+  checkFnsRef.modify (·.insert extName (unsafeCast f))
+
+@[implemented_by registerCheckFnUnsafe]
+opaque registerCheckFn {σ : Type} (extName : Name) (f : σ → σ → IO Unit) : IO Unit
+
+unsafe def runCheckFnUnsafe {σ : Type} (extName : Name) (par seq : σ) : IO Unit := do
+  match (← checkFnsRef.get).find? extName with
+  | some f => f (unsafeCast par) (unsafeCast seq)
+  | none => IO.eprintln s!"[check-ext] {extName}: no check function registered"
+
+@[implemented_by runCheckFnUnsafe]
+opaque runCheckFn {σ : Type} (extName : Name) (par seq : σ) : IO Unit
+
 end ParallelImport
+
+/--
+lean-perf (L01d): `setImportedEntries` on tasks. Pass 1 (module ranges) resolves every `(extName, entries)`
+pair of every module to its extension index once; pass 2 (extension ranges) builds the `importedEntries`
+array of each extension in the range, visiting the pairs in the sequential order (repeated names in one
+module resolve identically). The arrays are the same values as the sequential loop's.
+-/
+private def setImportedEntriesPar (states : Array EnvExtensionState) (mods : Array ModuleData)
+    (startingAt : Nat) (numThreads : Nat) : IO (Array EnvExtensionState) := do
+  let extDescrs ← persistentEnvExtensionsRef.get
+  let numExts := extDescrs.size - startingAt
+  if numExts == 0 then return states
+  let extNameIdx ← mkExtNameMap startingAt
+  let n := max 1 numThreads
+  let modChunk := (mods.size + n - 1) / n
+  let idxTasks ← (Array.range n).mapM fun k => BaseIO.asTask (prio := ParallelImport.criticalPrio) do
+    let lo := k * modChunk
+    let hi := min mods.size ((k + 1) * modChunk)
+    let mut out : Array (Array Nat) := Array.emptyWithCapacity (hi - lo)
+    for m in [lo:hi] do
+      out := out.push <| mods[m]!.entries.map fun (extName, _) =>
+        match extNameIdx[extName]? with
+        | some e => e - startingAt
+        | none => numExts
+    return out
+  -- the main thread waits for pass 1 (a task waiting for a task would cost a pool worker)
+  let idxs := idxTasks.map (·.get)
+  let extChunk := (numExts + n - 1) / n
+  let entTasks ← (Array.range n).mapM fun k => BaseIO.asTask (prio := ParallelImport.criticalPrio) do
+    let elo := k * extChunk
+    let ehi := min numExts ((k + 1) * extChunk)
+    let mut arrs : Array (Array (Array EnvExtensionEntry)) := Array.emptyWithCapacity (ehi - elo)
+    for _ in [elo:ehi] do
+      arrs := arrs.push (Array.replicate mods.size #[])
+    for kIdx in [:n] do
+      let idxs := idxs[kIdx]!
+      for t in [:idxs.size] do
+        let m := kIdx * modChunk + t
+        let entries := mods[m]!.entries
+        let idx := idxs[t]!
+        for p in [:idx.size] do
+          let e := idx[p]!
+          if elo ≤ e && e < ehi then
+            arrs := arrs.modify (e - elo) (·.set! m entries[p]!.2)
+    return arrs
+  let mut states := states
+  for k in [:n] do
+    let arrs := entTasks[k]!.get
+    for t in [:arrs.size] do
+      let e := startingAt + k * extChunk + t
+      states := unsafe extDescrs[e]!.toEnvExtension.modifyStateImpl states fun s =>
+        { s with importedEntries := arrs[t]! }
+  return states
+
+/-- lean-perf (L01d): `setImportedEntries`, on tasks when the import has several threads
+(`LEAN_IMPORT_PAR_SETENTRIES=0` keeps the sequential loop; `LEAN_IMPORT_CHECK=1` compares the two). -/
+private def setImportedEntriesAuto (states : Array EnvExtensionState) (mods : Array ModuleData)
+    (startingAt : Nat := 0) : IO (Array EnvExtensionState) := do
+  let n ← ParallelImport.numThreads
+  if n > 1 && mods.size ≥ 256 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_SETENTRIES") then
+    let par ← setImportedEntriesPar states mods startingAt n
+    if (← ParallelImport.checkEnabled) then
+      let seq ← setImportedEntries states mods startingAt
+      let extDescrs ← persistentEnvExtensionsRef.get
+      let mut bad := 0
+      let mut cells := 0
+      for e in [startingAt:extDescrs.size] do
+        -- `states` is indexed by `EnvExtension.idx` (all extensions), not by the persistent-extension index
+        let idx := extDescrs[e]!.toEnvExtension.idx
+        let a : PersistentEnvExtensionState EnvExtensionEntry EnvExtensionState := unsafe unsafeCast par[idx]!
+        let b : PersistentEnvExtensionState EnvExtensionEntry EnvExtensionState := unsafe unsafeCast seq[idx]!
+        if a.importedEntries.size != b.importedEntries.size then
+          bad := bad + 1
+        else
+          for m in [:a.importedEntries.size] do
+            let x := a.importedEntries[m]!
+            let y := b.importedEntries[m]!
+            cells := cells + 1
+            unless (x.isEmpty && y.isEmpty) || unsafe ptrEq x y do
+              bad := bad + 1
+      IO.eprintln s!"[check-setentries] extensions {extDescrs.size - startingAt}, modules {mods.size}, cells {cells}: {if bad == 0 then "identical" else s!"{bad} DIFFER"}"
+    return par
+  else
+    setImportedEntries states mods startingAt
 
 private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
@@ -2429,9 +2637,55 @@ private abbrev ExtTask := Task (Except IO.Error (EnvExtensionState × Nat × Nat
 
 private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options)
     (par : Bool := false) : IO Environment := do
+  ParallelImport.convertTasksRef.set {}
   let tasks ← if par then spawnTasks env 0 #[] else pure #[]
-  loop 0 env tasks
+  let env ← loop 0 env tasks
+  ParallelImport.convertTasksRef.set {}
+  return env
 where
+  /-- lean-perf (L01d): spawns the registered entry conversions (`ParallelImport.registerConvertFn`) of
+  the extensions with index `≥ start`, right after `runInitAttrs`. -/
+  spawnConvertTasks (env : Environment) (opts : Options) (start : Nat) : IO Unit := do
+    -- LEAN_IMPORT_PAR_CONVERT: 0 = off (conversions on the main thread as upstream), 1 = every conversion in
+    -- chunks on the worker pool, 2 (default) = all conversions in extension order on ONE task (the interpreter's
+    -- native-symbol cache takes a writer lock per `dlsym` miss, so concurrent conversions mostly wait for each other)
+    let mode := (← ParallelImport.envNat? "LEAN_IMPORT_PAR_CONVERT").getD 2
+    if mode == 0 then return
+    let fns ← ParallelImport.convertFnsRef.get
+    let pExtDescrs ← persistentEnvExtensionsRef.get
+    let n ← ParallelImport.numThreads
+    if mode == 2 then
+      let mut exts : Array (Name × ParallelImport.ConvertFn EnvExtensionEntry EnvExtensionEntry × Array (Array EnvExtensionEntry)) := #[]
+      for i in [start:pExtDescrs.size] do
+        let d := pExtDescrs[i]!
+        if let some f := fns.find? d.name then
+          exts := exts.push (d.name, f, (d.toEnvExtension.getState (asyncMode := .sync) env).importedEntries)
+      let big ← IO.asTask (prio := ParallelImport.criticalPrio) (do
+        let mut out : Array (Name × ParallelImport.JobTasks EnvExtensionEntry × Nat × Nat) := #[]
+        for (name, f, entries) in exts do
+          let ta ← IO.monoNanosNow
+          let r ← f entries 0 { env := env, opts := opts }
+          let tb ← IO.monoNanosNow
+          out := out.push (name, r, ta, tb)
+        pure out : IO (Array (Name × ParallelImport.JobTasks EnvExtensionEntry × Nat × Nat)))
+      for (name, _, _) in exts do
+        let t ← IO.mapTask (prio := ParallelImport.criticalPrio) (t := big) fun r => do
+          let out ← IO.ofExcept r
+          match out.find? (·.1 == name) with
+          | some (_, jt, ta, tb) => pure (jt, ta, tb)
+          | none => throw (IO.userError s!"ParallelImport: no conversion result for {name}")
+        ParallelImport.convertTasksRef.modify (·.insert name t)
+      return
+    for i in [start:pExtDescrs.size] do
+      let d := pExtDescrs[i]!
+      if let some f := fns.find? d.name then
+        let s := d.toEnvExtension.getState (asyncMode := .sync) env
+        let t ← IO.asTask (prio := ParallelImport.criticalPrio) (do
+          let ta ← IO.monoNanosNow
+          let r ← f s.importedEntries n { env := env, opts := opts }
+          let tb ← IO.monoNanosNow
+          pure (r, ta, tb) : IO (ParallelImport.JobTasks EnvExtensionEntry × Nat × Nat))
+        ParallelImport.convertTasksRef.modify (·.insert d.name t)
   /-- lean-perf: spawns the `addImportedFn` of every `parallelImport` extension with index `≥ start` on
   the current environment: such a function is pure in its imported entries (see
   `PersistentEnvExtensionDescrCore.parallelImport`), so it does not observe which other extension
@@ -2444,7 +2698,10 @@ where
       let d := pExtDescrs[i]!
       if d.parallelImport then
         let s := d.toEnvExtension.getState (asyncMode := .sync) env
-        let t ← IO.asTask (prio := .default) (do
+        -- lean-perf (L01d): the largest states first; the conversion tasks the main thread waits for
+        -- earlier run at `criticalPrio`
+        let prio := ParallelImport.extTaskPrio (ParallelImport.sampleEntryCount s.importedEntries)
+        let t ← IO.asTask (prio := prio) (do
           let ta ← IO.monoNanosNow
           let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
           -- `par` implies `leakEnv`: the state ends up persistent anyway, do it on the task's thread
@@ -2500,12 +2757,16 @@ where
         -- This branch is executed when `pExtDescrs[i]` is the extension associated with the `init` attribute, and
         -- a user-defined persistent extension is imported.
         -- Thus, we invoke `setImportedEntries` to update the array `importedEntries` with the entries for the new extensions.
-        env := env.setCheckedSync { env.base.private with extensions := (← setImportedEntries env.base.private.extensions mods prevSize) }
+        env := env.setCheckedSync { env.base.private with extensions := (← setImportedEntriesAuto env.base.private.extensions mods prevSize) }
         -- See comment at `updateEnvAttributesRef`
         env ← updateEnvAttributes env
         -- lean-perf: the new extensions now have their imported entries
         if par then
           tasks ← spawnTasks env prevSize tasks
+      -- lean-perf (L01d): the conversions of the extensions still to come, now that `runInitAttrs` has
+      -- run and the extensions it registered have their entries
+      if par && extDescr.name == `Lean.regularInitAttr then
+        spawnConvertTasks env opts (i + 1)
       loop (i + 1) env tasks
     else
       return env
@@ -3234,7 +3495,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   }
   let publicConstants : ConstMap := SMap.fromHashMap publicConstantMap false
   let publicBase := { privateBase with constants := publicConstants, header.regions := #[] }
-  let extensions ← setImportedEntries privateBase.extensions moduleData
+  let extensions ← setImportedEntriesAuto privateBase.extensions moduleData
   ParallelImport.tick "setImportedEntries"
   -- fall back to basic data when not in server
   let serverData := modules.mapIdx (fun idx mod => mod.serverData? level |>.getD moduleData[idx]!)

@@ -128,6 +128,31 @@ protected unsafe def init {γ} (df : Def γ) (attrDeclName : Name := by exact de
     addEntry     := fun s e => s.insert e
     toOLeanEntry := (·.toOLeanEntry)
   }
+  -- lean-perf (L01d): the imported entries' `evalConstCheck`s on tasks (`ParallelImport.registerConvertFn`);
+  -- `ofOLeanEntry` above ignores its state argument, so every conversion is independent of the fold
+  ParallelImport.registerConvertFn (α := ScopedEnvExtension.Entry OLeanEntry) (β := AttributeEntry γ) attrDeclName
+    fun as n => do
+      let ctx ← read
+      let mut jobs : Array (Nat × Nat × OLeanEntry) := #[]
+      let mut i := 0
+      for a in as do
+        let mut j := 0
+        for e in a do
+          let entry := match e with
+            | .global a => a
+            | .scoped _ a => a
+          jobs := jobs.push (i, j, entry)
+          j := j + 1
+        i := i + 1
+      ParallelImport.spawnJobs jobs n fun entry => do
+        match ctx.env.evalConstCheck γ ctx.opts df.valueTypeName entry.declName with
+        | Except.ok f     => return .ok { toOLeanEntry := entry, value := f, isBuiltin := false }
+        | Except.error ex => return .error (IO.userError ex)
+  ParallelImport.registerCheckFn (σ := ExtensionState γ) attrDeclName fun a b => do
+    let sig (s : ExtensionState γ) : List (Key × List Name) :=
+      ((s.table.toList.map fun (k, es) => (k, es.map (·.declName))).toArray.qsort fun x y => Name.quickLt x.1 y.1).toList
+    let ok := sig a == sig b && a.newEntries.length == b.newEntries.length
+    IO.eprintln s!"[check-ext] {attrDeclName}: keys {(sig a).length}, entries {(sig a).foldl (fun n x => n + x.2.length) 0}: {if ok then "identical" else "DIFFER"}"
   unless df.builtinName.isAnonymous do
     registerBuiltinAttribute {
       ref   := attrDeclName

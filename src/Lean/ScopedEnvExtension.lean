@@ -131,29 +131,54 @@ def ScopedEntries.insert (scopedEntries : ScopedEntries β) (ns : Name) (b : β)
 def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) := do
   let mut s ← descr.mkInitial
   let mut scopedEntries : ScopedEntries β := {}
+  -- lean-perf (L01d): conversions precomputed on tasks (`ParallelImport.registerConvertFn`), consumed at
+  -- their entry positions; entries without one go through `ofOLeanEntry` as before
+  let pre? ← ParallelImport.takeConverted (β := β) descr.name as
+  let conv (i j : Nat) (s : σ) (a : α) : ImportM β := do
+    if let some pre := pre? then
+      if let some r := pre[i]![j]! then
+        return (← IO.ofExcept r)
+    descr.ofOLeanEntry s a
   -- lean-perf (L01c): parallel fold of the global entries when the extension registered one
   if let some addEntriesPar ← getParEntriesFn (β := β) (σ := σ) descr.name then
     let numThreads ← ParallelImport.numThreads
     if numThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_ENTRIES") then
       let mut bs : Array β := #[]
+      let mut i := 0
       for a in as do
+        let mut j := 0
         for e in a do
           match e with
-          | Entry.global a => bs := bs.push (← descr.ofOLeanEntry s a)
-          | Entry.scoped ns a => scopedEntries := scopedEntries.insert ns (← descr.ofOLeanEntry s a)
+          | Entry.global a => bs := bs.push (← conv i j s a)
+          | Entry.scoped ns a => scopedEntries := scopedEntries.insert ns (← conv i j s a)
+          j := j + 1
+        i := i + 1
       s ← addEntriesPar s bs numThreads
       s := descr.finalizeImport s
       return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
+  let mut i := 0
   for a in as do
+    let mut j := 0
     for e in a do
       match e with
       | Entry.global a =>
-        let b ← descr.ofOLeanEntry s a
+        let b ← conv i j s a
         s := descr.addEntry s b
       | Entry.scoped ns a =>
-        let b ← descr.ofOLeanEntry s a
+        let b ← conv i j s a
         scopedEntries := scopedEntries.insert ns b
+      j := j + 1
+    i := i + 1
   s := descr.finalizeImport s
+  -- lean-perf (L01d): `LEAN_IMPORT_CHECK=1` compares with the sequential construction
+  if pre?.isSome && (← ParallelImport.checkEnabled) then
+    let mut s' ← descr.mkInitial
+    for a in as do
+      for e in a do
+        if let Entry.global a := e then
+          s' := descr.addEntry s' (← descr.ofOLeanEntry s' a)
+    s' := descr.finalizeImport s'
+    ParallelImport.runCheckFn descr.name s s'
   return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
 
 def addEntryFn (descr : Descr α β σ) (s : StateStack α β σ) (e : Entry β) : StateStack α β σ :=

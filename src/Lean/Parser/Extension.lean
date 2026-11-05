@@ -353,6 +353,69 @@ builtin_initialize parserExtension : ParserExtension ←
     ofOLeanEntry    := ParserExtension.OLeanEntry.toEntry
   }
 
+/--
+lean-perf (L01d): the imported parser entries converted on tasks. `OLeanEntry.toEntry` depends on the
+fold's state only through `s.categories` in `compileParserDescr`, which checks that the categories a
+`ParserDescr` mentions exist (`addEntryImpl` adds a global `category` entry when the fold reaches it),
+so a pre-pass records, for every parser entry, the categories defined before it; the evaluations
+(`mkParserOfConstant`: interpreter) then run in chunks on tasks and `addImportedFn` folds the results in
+entry order, which yields the same tables as the sequential conversion.
+-/
+private def ParserExtension.convertImportedPar (as : Array (Array (ScopedEnvExtension.Entry OLeanEntry)))
+    (numThreads : Nat) : ImportM (ParallelImport.JobTasks Entry) := do
+  let ctx ← read
+  let mut categories := (← ParserExtension.mkInitial).categories
+  let mut jobs : Array (Nat × Nat × (OLeanEntry × ParserCategories)) := #[]
+  let mut i := 0
+  for a in as do
+    let mut j := 0
+    for e in a do
+      match e with
+      | .global (.category catName declName behavior) =>
+        unless categories.contains catName do
+          categories := categories.insert catName { declName, behavior }
+      | .global (entry@(.parser ..)) => jobs := jobs.push (i, j, (entry, categories))
+      | .scoped _ (entry@(.parser ..)) => jobs := jobs.push (i, j, (entry, categories))
+      | _ => pure ()
+      j := j + 1
+    i := i + 1
+  ParallelImport.spawnJobs jobs numThreads fun (entry, categories) => do
+    match entry with
+    | .parser catName declName prio =>
+      EIO.toBaseIO <| (do
+        let (leading, p) ← mkParserOfConstant categories declName
+        return Entry.parser catName declName leading p prio : ImportM Entry).run ctx
+    | _ => return .error (IO.userError "ParserExtension.convertImportedPar: not a parser entry")
+
+/-- `LEAN_IMPORT_CHECK=1`: structural comparison of two parser extension states (tokens, kinds, categories
+with their kinds and parsing tables by token, count and priority; the parsers themselves are closures). -/
+private def ParserExtension.checkStates (a b : State) : IO Unit := do
+  let sortNames (ns : Array Name) : Array Name := ns.qsort Name.quickLt
+  let kindNames (ks : SyntaxNodeKindSet) : Array Name :=
+    sortNames (ks.toList.map fun (x : SyntaxNodeKind × Unit) => x.1).toArray
+  let tokens (s : State) : Array String := s.tokens.values.qsort (· < ·)
+  let tableSig (t : TokenMap (Parser × Nat)) : List (Name × List Nat) :=
+    t.toList.map fun (k, ps) => (k, ps.map (·.2))
+  let behaviorIdx : LeadingIdentBehavior → Nat
+    | .default => 0
+    | .symbol => 1
+    | .both => 2
+  let prios (ps : List (Parser × Nat)) : List Nat := ps.map (·.2)
+  let catSig1 (nc : Name × ParserCategory) :
+      Name × Name × Nat × Array Name × List (Name × List Nat) × List Nat × List (Name × List Nat) × List Nat :=
+    let c := nc.2
+    (nc.1, c.declName, behaviorIdx c.behavior, kindNames c.kinds, tableSig c.tables.leadingTable,
+     prios c.tables.leadingParsers, tableSig c.tables.trailingTable, prios c.tables.trailingParsers)
+  let catSig (s : State) :=
+    ((s.categories.toList.toArray.qsort fun (x y : Name × ParserCategory) => Name.quickLt x.1 y.1).map catSig1).toList
+  let ok := tokens a == tokens b && kindNames a.kinds == kindNames b.kinds && catSig a == catSig b
+  IO.eprintln s!"[check-ext] parserExtension: tokens {(tokens a).size}, kinds {(kindNames a.kinds).size}, categories {(catSig a).length}: {if ok then "identical" else "DIFFER"}"
+
+builtin_initialize
+  ParallelImport.registerConvertFn (α := ScopedEnvExtension.Entry ParserExtension.OLeanEntry)
+    (β := ParserExtension.Entry) ``parserExtension ParserExtension.convertImportedPar
+  ParallelImport.registerCheckFn (σ := ParserExtension.State) ``parserExtension ParserExtension.checkStates
+
 def getParserCategory? (env : Environment) (catName : Name) : Option ParserCategory :=
   (parserExtension.getState env).categories.find? catName
 
