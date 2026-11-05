@@ -62,24 +62,38 @@ class expr_flat_map {
         }
         m_tab = new_tab; m_mask = new_mask;
     }
+    /* Release every entry. The keys and values are scattered heap objects whose reference counts usually miss the cache;
+       the table itself is scanned sequentially, so the counts of the entries `RELEASE_DISTANCE` slots ahead are
+       prefetched (indirect prefetching at a fixed distance) and several of those misses overlap instead of one per
+       `lean_dec`. Same decrements in the same order. */
+    static constexpr size_t RELEASE_DISTANCE = 8;
+    void release_entries() {
+        size_t cap = m_mask + 1;
+        for (size_t i = 0; i < cap; i++) {
+            if (i + RELEASE_DISTANCE < cap) {
+                entry const & f = m_tab[i + RELEASE_DISTANCE];
+                if (f.m_key != nullptr) {
+                    __builtin_prefetch(f.m_key, 1, 3);
+                    if (!lean_is_scalar(f.m_val)) __builtin_prefetch(f.m_val, 1, 3);
+                }
+            }
+            if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
+        }
+    }
 public:
     expr_flat_map() {}
     expr_flat_map(expr_flat_map const &) = delete;
     expr_flat_map & operator=(expr_flat_map const &) = delete;
     ~expr_flat_map() {
         if (m_tab == nullptr) return;
-        for (size_t i = 0; i <= m_mask; i++) {
-            if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
-        }
+        release_entries();
         free_block(m_tab);
     }
     size_t size() const { return m_size; }
     /** \brief Release every entry and the table (the next `insert` starts from the initial capacity again). */
     void clear() {
         if (m_tab == nullptr) return;
-        for (size_t i = 0; i <= m_mask; i++) {
-            if (m_tab[i].m_key != nullptr) { lean_dec(m_tab[i].m_key); lean_dec(m_tab[i].m_val); }
-        }
+        release_entries();
         free_block(m_tab);
         m_tab = nullptr; m_mask = 0; m_size = 0;
     }
