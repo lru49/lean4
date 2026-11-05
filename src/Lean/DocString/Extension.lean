@@ -124,24 +124,31 @@ register_builtin_option doc.verso.module : Bool := {
 }
 
 private builtin_initialize builtinDocStrings : IO.Ref (NameMap String) ← IO.mkRef {}
-builtin_initialize docStringExt : MapDeclarationExtension String ←
-  mkMapDeclarationExtension
+builtin_initialize docStringExt : MapDeclarationExtension String ← do
+  let ext ← mkMapDeclarationExtension
     (asyncMode := .async .asyncEnv)
     (exportEntriesFn := fun _ s =>
       let ents := s.toArray
       { exported := #[], server := ents, «private» := ents })
-private builtin_initialize inheritDocStringExt : MapDeclarationExtension Name ←
-  mkMapDeclarationExtension (exportEntriesFn := fun _ s =>
+  -- doc strings are never consulted by elaboration: `CoreM`/`MetaM` keep their caches across this write
+  ext.toEnvExtension.markMetaCacheSafe
+  return ext
+private builtin_initialize inheritDocStringExt : MapDeclarationExtension Name ← do
+  let ext ← mkMapDeclarationExtension (exportEntriesFn := fun _ s =>
     let ents := s.toArray
     { exported := #[], server := ents, «private» := ents })
+  ext.toEnvExtension.markMetaCacheSafe
+  return ext
 
 private builtin_initialize builtinVersoDocStrings : IO.Ref (NameMap VersoDocString) ← IO.mkRef {}
-builtin_initialize versoDocStringExt : MapDeclarationExtension VersoDocString ←
-  mkMapDeclarationExtension
+builtin_initialize versoDocStringExt : MapDeclarationExtension VersoDocString ← do
+  let ext ← mkMapDeclarationExtension
     (asyncMode := .async .asyncEnv)
     (exportEntriesFn := fun _ s =>
       let ents := s.toArray
       { exported := #[], server := ents, «private» := ents })
+  ext.toEnvExtension.markMetaCacheSafe
+  return ext
 
 /--
 Adds a builtin docstring to the compiler.

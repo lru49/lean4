@@ -17,10 +17,13 @@ public section
 namespace Lean
 
 builtin_initialize builtinDeclRanges : IO.Ref (NameMap DeclarationRanges) ← IO.mkRef {}
-builtin_initialize declRangeExt : MapDeclarationExtension DeclarationRanges ←
-  mkMapDeclarationExtension (exportEntriesFn := fun _ s =>
+builtin_initialize declRangeExt : MapDeclarationExtension DeclarationRanges ← do
+  let ext ← mkMapDeclarationExtension (exportEntriesFn := fun _ s =>
     let ents := s.toArray
     { exported := #[], server := ents, «private» := ents })
+  -- declaration ranges are never consulted by elaboration: `CoreM`/`MetaM` keep their caches across this write
+  ext.toEnvExtension.markMetaCacheSafe
+  return ext
 
 def addBuiltinDeclarationRanges (declName : Name) (declRanges : DeclarationRanges) : IO Unit :=
   builtinDeclRanges.modify (·.insert declName declRanges)
