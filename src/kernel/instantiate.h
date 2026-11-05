@@ -12,6 +12,9 @@ namespace lean {
 class ro_metavar_env;
 /** \brief Replace the loose bound variables with indices 0, ..., n-1 with s[0], ..., s[n-1] in e. */
 expr instantiate(expr const & e, unsigned n, expr const * s);
+/** \brief `out[i] = instantiate(es[i], n, s)` for `i < num`, through ONE traversal cache, so the results are those
+    (pointer for pointer, sharing included) of the argument positions of `instantiate(mk_app(h, num, es), n, s)`. */
+void instantiate_each(unsigned num, expr const * es, unsigned n, expr const * s, expr * out);
 /** \brief Replace loose bound variable \c i with \c s in \c e. */
 expr instantiate(expr const & e, unsigned i, expr const & s);
 /** \brief Replace loose bound variable \c 0 with \c s in \c e. */

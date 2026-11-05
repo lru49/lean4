@@ -75,6 +75,20 @@ LEAN_EXPORT scope_rec_depth::scope_rec_depth() {
 
 LEAN_EXPORT scope_rec_depth::~scope_rec_depth() { g_rec_depth--; }
 
+LEAN_EXPORT void scope_rec_depth_n::push() {
+    if (g_max_rec_depth > 0 && g_rec_depth + 1 > g_max_rec_depth * g_kernel_rec_depth_factor)
+        throw stack_space_exception("type checker");
+    g_rec_depth++;
+    m_n++;
+}
+
+LEAN_EXPORT void scope_rec_depth_n::probe() {
+    if (g_max_rec_depth > 0 && g_rec_depth + 1 > g_max_rec_depth * g_kernel_rec_depth_factor)
+        throw stack_space_exception("type checker");
+}
+
+LEAN_EXPORT scope_rec_depth_n::~scope_rec_depth_n() { g_rec_depth -= m_n; }
+
 LEAN_THREAD_VALUE(lean_object *, g_cancel_tk, nullptr);
 
 LEAN_EXPORT scope_cancel_tk::scope_cancel_tk(lean_object * o):flet<lean_object *>(g_cancel_tk, o) {}
