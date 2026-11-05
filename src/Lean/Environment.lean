@@ -2156,6 +2156,25 @@ builtin_initialize parallelImportExtsRef : IO.Ref NameSet ← IO.mkRef {}
 def registerParallelImportExt (extName : Name) : IO Unit :=
   parallelImportExtsRef.modify (·.insert extName)
 
+/-!
+lean-perf (L05): a second opt-in registry for extensions whose `addImportedFn` is a pure READ of the
+environment: it evaluates imported constants with the interpreter (`evalConstCheck`) and reads the
+builtin table its `builtin_initialize` filled before any import, but it writes nothing and reads no
+other extension's state (`KeyedDeclsAttribute`: delaborators, unexpanders, macros, term/tactic/command
+elaborators). Such a state is a function of the imported entries and of the environment's constants and
+IR, which are fixed once the `[init]` declarations of the imported modules have been executed
+(`runInitAttrs`, needed because an evaluated constant may refer to an initialized one). `finalizeImport`
+therefore computes these states on tasks spawned right after `runInitAttrs` and joins each one at the
+extension's own position in the sequential order, so every later `addImportedFn` sees exactly the states
+the sequential import would have set.
+-/
+builtin_initialize parallelAfterInitExtsRef : IO.Ref NameSet ← IO.mkRef {}
+
+/-- lean-perf (L05): marks the persistent environment extension `extName` as computable on a task after
+`runInitAttrs` (see `parallelAfterInitExtsRef`). -/
+def registerParallelAfterInitExt (extName : Name) : IO Unit :=
+  parallelAfterInitExtsRef.modify (·.insert extName)
+
 /--
 Fills the `ModuleData` prefix tree fields from the corresponding arrays. Done by the module writers
 just before saving so that no `ModuleData` producer can leave them inconsistent.
@@ -2478,7 +2497,8 @@ where
   entries, so it does not observe which other extension states are already finalized. Called at the
   start and after `setImportedEntries` has supplied the entries of extensions registered by
   `runInitAttrs` (which register their names at the same time). -/
-  spawnTasks (env : Environment) (start : Nat) (tasks : Array (Option ExtTask)) : IO (Array (Option ExtTask)) := do
+  spawnTasks (env : Environment) (start : Nat) (tasks : Array (Option ExtTask))
+      (afterInit : Bool := false) : IO (Array (Option ExtTask)) := do
     -- lean-perf (L02 crash fix v2 A3): the environment the tasks capture must already be persistent: the states
     -- they compute may reference it (every interpreter stub closure created by an `evalConst` on a task captures
     -- the environment it was evaluated against), and the tasks' `markPersistentSeq` of those states would
@@ -2489,10 +2509,16 @@ where
     let env ← unsafe Runtime.markPersistent env
     let pExtDescrs ← persistentEnvExtensionsRef.get
     let parExts ← parallelImportExtsRef.get
+    -- lean-perf (L05): extensions of `parallelAfterInitExtsRef` are spawned only once `runInitAttrs` has
+    -- run (`afterInit`), from index `start` on; entries already holding a task are kept.
+    let afterInitExts ← if afterInit && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_AFTER_INIT") then
+        parallelAfterInitExtsRef.get else pure {}
     let mut tasks := tasks
     for i in [start:pExtDescrs.size] do
       let d := pExtDescrs[i]!
-      if parExts.contains d.name then
+      if let some (some _) := tasks[i]? then
+        continue
+      if parExts.contains d.name || afterInitExts.contains d.name then
         let s := d.toEnvExtension.getState (asyncMode := .sync) env
         let t ← IO.asTask (prio := .default) (do
           let ta ← IO.monoNanosNow
@@ -2501,8 +2527,8 @@ where
           let st : EnvExtensionState ← unsafe (ParallelImport.markPersistentSeq st : BaseIO EnvExtensionState)
           let tb ← IO.monoNanosNow
           pure (st, ta, tb) : IO (EnvExtensionState × Nat × Nat))
-        tasks := tasks.push (some t)
-      else
+        tasks := if i < tasks.size then tasks.set! i (some t) else tasks.push (some t)
+      else if i ≥ tasks.size then
         tasks := tasks.push none
     return tasks
   loop (i : Nat) (env : Environment) (tasks : Array (Option ExtTask)) : IO Environment := do
@@ -2565,6 +2591,10 @@ where
         -- lean-perf: the new extensions now have their imported entries
         if par then
           tasks ← spawnTasks env prevSize tasks
+      if par && extDescr.name == `Lean.regularInitAttr then
+        -- lean-perf (L05): the `[init]` declarations have run; the environment's constants and IR are
+        -- final, so the after-init extensions (all indices after this one) may be evaluated on tasks
+        tasks ← spawnTasks env (i + 1) tasks (afterInit := true)
       loop (i + 1) env tasks
     else
       return env
