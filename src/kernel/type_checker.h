@@ -23,13 +23,13 @@ namespace lean {
 class type_checker {
 public:
     class state {
-        typedef expr_map<expr> infer_cache;
+        typedef expr_flat_map<expr> infer_cache;
         typedef lean::unordered_set<expr_pair, expr_pair_hash, expr_pair_eq> expr_pair_set;
         environment               m_env;
         name_generator            m_ngen;
         infer_cache               m_infer_type[2];
-        expr_map<expr>            m_whnf_core;
-        expr_map<expr>            m_whnf;
+        expr_flat_map<expr>       m_whnf_core;
+        expr_flat_map<expr>       m_whnf;
         /* Positive and negative caches for `is_def_eq`. Since kernel expressions contain no
            metavariables and free variables are globally unique with fixed types, the result of
            `is_def_eq` is a function of its two arguments, so both results can be cached and shared
@@ -39,7 +39,7 @@ public:
            depend on evaluation order. */
         expr_pair_set             m_success;
         expr_pair_set             m_failure;
-        expr_map<expr>            m_unfold;
+        expr_flat_map<expr>       m_unfold;
         friend type_checker;
     public:
         state(environment const & env);
