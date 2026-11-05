@@ -102,15 +102,15 @@ open N in
 #guard_msgs in
 def d2 : Unit := let _ : Doo Nat := inferInstance; ()
 
--- Ending the scope changes the instances in effect again, so the query is recomputed rather than
--- served from before the `open`.
+-- Ending the scope restores the very instance table in effect before the `open`, so the failure
+-- cached before it is served again (the tier is revived, see `Environment.reviveSynthCache`).
 /--
 error: failed to synthesize instance of type class
   Doo Nat
 
 Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
 ---
-trace: [Meta.synthInstance.cache] new: Doo Nat
+trace: [Meta.synthInstance.cache] cached: Doo Nat
 -/
 #guard_msgs in
 def d3 : Unit := let _ : Doo Nat := inferInstance; ()
