@@ -97,17 +97,15 @@ inline expr to_cnstr_when_structure(environment const & env, recursor_val const 
    `args` (forward order) instead of building the application, which the type checker usually takes apart again at once.
    `inst_rhs(rec_fn, rule_rhs, lparams)` must return `instantiate_lparams(rule_rhs, lparams, const_levels(rec_fn))`
    (the type checker memoises it per recursor constant and rule). */
+/* The same for the application of `rec_fn` to `rec_args` (forward order), given as its parts. */
 template<typename WHNF, typename INFER, typename IS_DEF_EQ, typename IS_PROP, typename INST_RHS>
-inline optional<expr> inductive_reduce_rec(environment const & env, expr const & e,
-                                           WHNF const & whnf, INFER const & infer_type, IS_DEF_EQ const & is_def_eq,
-                                           IS_PROP const & is_prop, INST_RHS const & inst_rhs,
-                                           buffer<expr> & args) {
-    expr const & rec_fn   = get_app_fn(e);
+inline optional<expr> inductive_reduce_rec_args(environment const & env, expr const & rec_fn, buffer<expr> const & rec_args,
+                                                WHNF const & whnf, INFER const & infer_type, IS_DEF_EQ const & is_def_eq,
+                                                IS_PROP const & is_prop, INST_RHS const & inst_rhs,
+                                                buffer<expr> & args) {
     if (!is_constant(rec_fn)) return none_expr();
     optional<constant_info> rec_info = env.find(const_name(rec_fn));
     if (!rec_info || !rec_info->is_recursor()) return none_expr();
-    buffer<expr> rec_args;
-    get_app_args(e, rec_args);
     recursor_val const & rec_val = rec_info->to_recursor_val();
     unsigned major_idx           = rec_val.get_major_idx();
     if (major_idx >= rec_args.size()) return none_expr(); // major premise is missing
@@ -150,6 +148,18 @@ inline optional<expr> inductive_reduce_rec(environment const & env, expr const &
         args.append(nextra, rec_args.data() + major_idx + 1);
     }
     return some_expr(rhs);
+}
+
+template<typename WHNF, typename INFER, typename IS_DEF_EQ, typename IS_PROP, typename INST_RHS>
+inline optional<expr> inductive_reduce_rec(environment const & env, expr const & e,
+                                           WHNF const & whnf, INFER const & infer_type, IS_DEF_EQ const & is_def_eq,
+                                           IS_PROP const & is_prop, INST_RHS const & inst_rhs,
+                                           buffer<expr> & args) {
+    expr const & rec_fn   = get_app_fn(e);
+    if (!is_constant(rec_fn)) return none_expr();
+    buffer<expr> rec_args;
+    get_app_args(e, rec_args);
+    return inductive_reduce_rec_args(env, rec_fn, rec_args, whnf, infer_type, is_def_eq, is_prop, inst_rhs, args);
 }
 
 template<typename WHNF, typename IS_STUCK>

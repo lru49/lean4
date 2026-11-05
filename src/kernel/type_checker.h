@@ -113,6 +113,9 @@ private:
     optional<expr> reduce_recursor(expr const & e, bool cheap_rec, bool cheap_proj, buffer<expr> & args);
     expr whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_proj, bool cache_result);
     expr whnf_core_beta(expr f, buffer<expr> & rev_args, bool cheap_rec, bool cheap_proj);
+    expr whnf_core_iota(expr const & h, buffer<expr> & args, bool cheap_rec, bool cheap_proj);
+    optional<expr> reduce_inductive_rec_args(expr const & rec_fn, buffer<expr> const & rec_args, bool cheap_rec, bool cheap_proj,
+                                             buffer<expr> & args);
     bool fresh_app_may_be_cached(expr const & f, unsigned num_args, expr const * args, bool rev) const;
     expr instantiate_rec_rhs(expr const & rec_fn, expr const & rhs, names const & lps);
     optional<expr> reduce_proj_core(expr c, name const & sname, unsigned idx);

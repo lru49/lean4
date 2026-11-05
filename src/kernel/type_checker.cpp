@@ -517,6 +517,20 @@ optional<expr> type_checker::reduce_recursor(expr const & e, bool cheap_rec, boo
     return none_expr();
 }
 
+/* `reduce_recursor` for the application of the constant `rec_fn` to `rec_args` (forward order) given as its parts, when
+   `rec_fn` is not `Quot.lift`/`Quot.ind` (so `quot_reduce_rec` would answer none without doing anything). */
+optional<expr> type_checker::reduce_inductive_rec_args(expr const & rec_fn, buffer<expr> const & rec_args, bool cheap_rec,
+                                                       bool cheap_proj, buffer<expr> & args) {
+    return inductive_reduce_rec_args(env(), rec_fn, rec_args,
+                                     [&](expr const & e) { return cheap_rec ? whnf_core(e, cheap_rec, cheap_proj) : whnf(e); },
+                                     [&](expr const & e) { return infer(e); },
+                                     [&](expr const & e1, expr const & e2) { return is_def_eq(e1, e2); },
+                                     [&](expr const & e) { return is_prop(e); },
+                                     [&](expr const & rec_fn, expr const & rhs, names const & lps) {
+                                         return instantiate_rec_rhs(rec_fn, rhs, lps);
+                                     }, args);
+}
+
 /** \brief `instantiate_lparams(rhs, lps, const_levels(rec_fn))` for the right-hand side `rhs` of a rule of the recursor
     constant `rec_fn`, memoised in `m_rec_rhs`. Every iota-reduction step instantiated the rule's universe parameters
     afresh (a full traversal of the rule plus a `replace` memo table); in evaluation-heavy checks (`decide`, `rfl` by
@@ -607,6 +621,29 @@ bool type_checker::fresh_app_may_be_cached(expr const & f, unsigned num_args, ex
     return m_st->m_whnf_core.may_contain_hash(h);
 }
 
+/* `whnf_core_impl(mk_app(h, args), .., false)` for a reduct `h args` of `reduce_recursor` (`args` forward, consumed). */
+expr type_checker::whnf_core_iota(expr const & h, buffer<expr> & args, bool cheap_rec, bool cheap_proj) {
+    if (is_lambda(h) && !args.empty() && !fresh_app_may_be_cached(h, args.size(), args.data(), false)) {
+        scope_rec_depth_n depth;
+        depth.push();                                         // `whnf_core_impl(t, ..)`
+        check_system("type checker: whnf", /* do_check_interrupted */ true);
+        depth.probe();                                        // its `whnf_core(head)` on the lambda
+        check_system("type checker: whnf", /* do_check_interrupted */ true);
+        std::reverse(args.begin(), args.end());
+        return whnf_core_beta(h, args, cheap_rec, cheap_proj);
+    }
+    return whnf_core_impl(mk_app(h, args.size(), args.data()), cheap_rec, cheap_proj, false);
+}
+
+/* Recursor names: `I.rec` and the auxiliary `I.rec_<i>` of nested inductives. A cheap pre-filter only (the environment
+   decides); a constant that passes it but is not a recursor just takes the general path's answer. */
+static bool has_recursor_name(expr const & c) {
+    name const & n = const_name(c);
+    if (!n.is_string()) return false;
+    char const * s = n.get_string().data();
+    return s[0] == 'r' && s[1] == 'e' && s[2] == 'c' && (s[3] == 0 || s[3] == '_');
+}
+
 /* `whnf_core` of `mk_rev_app(f, rev_args)` for a lambda `f` (`rev_args` nonempty, consumed): beta-reduces, and while
    the reduct `t = mk_rev_app(instantiate(body, m, s), rest)` has a substituted lambda `v` as its head
    (`body = #i b1 ... bk`, the case of every recursor rule's right-hand side applied to its minor premise and of
@@ -658,6 +695,38 @@ expr type_checker::whnf_core_beta(expr f, buffer<expr> & rev_args, bool cheap_re
             f = v;
             std::swap(rev_args, next);
             continue;
+        }
+        if (is_constant(h) && has_recursor_name(h)) {
+            /* The reduct `t = c b1' .. bk' rest` is a recursor application: `whnf_core_impl(t, .., false)` would hold a
+               depth level, count a heartbeat, look `t` up, `whnf_core(c)` (heartbeat + transient level), then
+               `reduce_recursor(t)` (`quot_reduce_rec` does nothing for a recursor) and, if that fails, return `t`. The
+               same without building `t` unless it is returned or may be cached. */
+            expr c = h;
+            buffer<expr> bargs;
+            get_app_args(body, bargs);
+            unsigned k = bargs.size();
+            next.clear();
+            next.append(rest, rev_args.data());
+            next.resize(rest + k);
+            instantiate_each(k, bargs.data(), m, s, next.data() + rest);
+            std::reverse(next.begin() + rest, next.end());
+            if (!next.empty() && !fresh_app_may_be_cached(c, next.size(), next.data(), true)) {
+                depth.push();                               // `whnf_core_impl(t, ..)`
+                check_system("type checker: whnf", /* do_check_interrupted */ true);
+                depth.probe();                              // its `whnf_core(c)`
+                check_system("type checker: whnf", /* do_check_interrupted */ true);
+                buffer<expr> fwd;
+                fwd.append(next.size(), next.data());
+                std::reverse(fwd.begin(), fwd.end());
+                buffer<expr> rargs;
+                if (auto r = reduce_inductive_rec_args(c, fwd, cheap_rec, cheap_proj, rargs)) {
+                    if (m_diag)
+                        m_diag->record_unfold(const_name(c));
+                    return whnf_core_iota(*r, rargs, cheap_rec, cheap_proj);
+                }
+                return mk_rev_app(c, next.size(), next.data());
+            }
+            return whnf_core_impl(mk_rev_app(c, next.size(), next.data()), cheap_rec, cheap_proj, false);
         }
         return whnf_core_impl(mk_rev_app(instantiate(body, m, s), rest, rev_args.data()), cheap_rec, cheap_proj, false);
     }
@@ -737,16 +806,7 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
                 /* iota-reduction and quotient reduction rules: the reduct is `t = mk_app(*h, rargs)`, and
                    `whnf_core_impl(t, .., false)` would look `t` up, then (`t`'s head being the rule's lambda) beta-reduce
                    it. When no cached key can match `t`, that is done without building `t` (see `whnf_core_beta`). */
-                if (is_lambda(*h) && !rargs.empty() && !fresh_app_may_be_cached(*h, rargs.size(), rargs.data(), false)) {
-                    scope_rec_depth_n depth;
-                    depth.push();                                         // `whnf_core_impl(t, ..)`
-                    check_system("type checker: whnf", /* do_check_interrupted */ true);
-                    depth.probe();                                        // its `whnf_core(head)` on the lambda
-                    check_system("type checker: whnf", /* do_check_interrupted */ true);
-                    std::reverse(rargs.begin(), rargs.end());
-                    return whnf_core_beta(*h, rargs, cheap_rec, cheap_proj);
-                }
-                return whnf_core_impl(mk_app(*h, rargs.size(), rargs.data()), cheap_rec, cheap_proj, false);
+                return whnf_core_iota(*h, rargs, cheap_rec, cheap_proj);
             } else {
                 return e;
             }
