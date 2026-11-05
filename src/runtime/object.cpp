@@ -1346,6 +1346,8 @@ extern "C" LEAN_EXPORT lean_obj_res lean_runtime_mark_persistent_seq(lean_obj_ar
     return a;
 }
 
+bool lean_task_manager_exists() { return g_task_manager != nullptr; }
+
 extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
     lean_assert(g_task_manager == nullptr);
 #if defined(LEAN_MULTI_THREAD)

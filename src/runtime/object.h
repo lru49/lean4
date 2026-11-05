@@ -269,6 +269,9 @@ inline obj_res thunk_get_own(b_obj_arg t) { return lean_thunk_get_own(t); }
 // =======================================
 // Tasks
 
+/* true once a task manager has been created (other threads may run Lean code) */
+LEAN_EXPORT bool lean_task_manager_exists();
+
 class LEAN_EXPORT scoped_task_manager {
 public:
     scoped_task_manager(unsigned num_workers);
