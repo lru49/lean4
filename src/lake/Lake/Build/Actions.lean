@@ -8,6 +8,7 @@ module
 prelude
 public import Lake.Util.Log
 import Lake.Util.Proc
+public import Lake.Util.ChainServer
 import Lake.Util.FilePath
 import Lake.Util.IO
 import Lake.Util.Url
@@ -46,6 +47,8 @@ public def compileLeanModule
   (leanArgs : Array String := #[])
   (leanPath : SearchPath := [])
   (lean : FilePath := "lean")
+  -- lean-perf (chain batching): chain servers of the build
+  (chain? : Option ChainPool := none)
 : LogIO Unit := do
   let mut args := leanArgs.push leanFile.toString
   if let some oleanFile := arts.olean? then
@@ -71,13 +74,26 @@ public def compileLeanModule
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
-  let out ← rawProc {
+  let spawnArgs : IO.Process.SpawnArgs := {
     args
     cmd := lean.toString
     env := #[
       ("LEAN_PATH", leanPath.toString)
     ]
   }
+  let served? ← match chain? with
+    | some pool =>
+      -- `importArts` lists the module's transitive imports
+      if pool.leanPath == leanPath.toString then
+        if let some (i, restart) ← pool.acquire setup.name (setup.importArts.contains ·) then
+          logVerbose s!"(chain server {i}{if restart then ", restarted" else ""}) {mkCmdLog spawnArgs}"
+          pool.run i restart setup.name args
+        else pure none
+      else pure none
+    | none => pure none
+  let out ← match served? with
+    | some out => pure out
+    | none => rawProc spawnArgs
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
