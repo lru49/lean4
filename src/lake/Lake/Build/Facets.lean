@@ -168,6 +168,14 @@ builtin_facet oleanPrivateFacet @ olean.private : Module => FilePath
 /-- The `ilean` file produced by `lean`. -/
 builtin_facet ilean : Module => FilePath
 
+/--
+The module's declaration-level dependency summary (`.lake/decldeps/<module>.json`): for every
+command, the workspace modules whose constants it references (directly or through earlier commands
+of the same module). Computed from the module's `.olean`/`.ilean` after it is built; never affects
+any other build output. See `Lake.DeclDeps`.
+-/
+builtin_facet declDeps : Module => FilePath
+
 /-- The `ir.sig` file produced by `lean` (with the module system enabled). -/
 builtin_facet irSigFacet @ ir.sig : Module => FilePath
 

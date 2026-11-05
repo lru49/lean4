@@ -216,6 +216,9 @@ public abbrev leanArts (self : Module) :=
 @[inherit_doc ileanFacet] public abbrev ilean (self : Module)  :=
   self.facetCore ileanFacet
 
+@[inherit_doc declDepsFacet] public abbrev declDeps (self : Module)  :=
+  self.facetCore declDepsFacet
+
 @[inherit_doc irSigFacet] public abbrev irSig (self : Module) :=
   self.facetCore irSigFacet
 

@@ -14,6 +14,7 @@ import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
+import Lake.Build.DeclDeps
 import Init.Omega
 
 /-! # Module Build Definitions -/
@@ -1310,6 +1311,32 @@ public def Module.ileanFacetConfig : ModuleFacetConfig ileanFacet :=
       return art.path
 
 /--
+The `ModuleFacetConfig` for the builtin `declDepsFacet`: once the module's `.olean` and `.ilean` and
+those of its workspace imports exist, compute the declaration-level dependency summary
+(`Lake.DeclDeps.compute`) into `<package lakeDir>/decldeps/<module>.json`. The location is outside the
+build directory on purpose: a scheduler reads the summary of the previous build before the module is
+rebuilt (the `src` field holds the source hash it was computed for). Re-runs only when the module's
+`.olean`/`.ilean` change.
+-/
+public def Module.declDepsFacetConfig : ModuleFacetConfig declDepsFacet :=
+  mkFacetJobConfig fun mod => do
+    let oleanJob ← mod.olean.fetch
+    let ileanJob ← mod.ilean.fetch
+    let inputJob ← mod.input.fetch
+    let impsJob ← mod.transImports.fetch
+    oleanJob.bindM (sync := true) fun olean => do
+    ileanJob.bindM (sync := true) fun ilean => do
+    inputJob.bindM (sync := true) fun input => do
+    impsJob.mapM fun imps => do
+      newTrace s!"{mod.name.toString}:declDeps"
+      let out := mod.pkg.lakeDir / "decldeps" / s!"{mod.name}.json"
+      let deps := imps.map fun m => (m.name, m.oleanFile)
+      let j ← DeclDeps.compute mod.name olean ilean deps input.trace.hash.toString
+      createParentDirs out
+      IO.FS.writeFile out j.compress
+      return out
+
+/--
 Recursively fetch the module's code generation artifacts.
 
 Unless code generation was postponed, elaboration already produced them.
@@ -1604,6 +1631,7 @@ public def Module.initFacetConfigs : DNameMap ModuleFacetConfig :=
   |>.insert oleanServerFacet oleanServerFacetConfig
   |>.insert oleanPrivateFacet oleanPrivateFacetConfig
   |>.insert ileanFacet ileanFacetConfig
+  |>.insert declDepsFacet declDepsFacetConfig
   |>.insert irSigFacet irSigFacetConfig
   |>.insert irFacet irFacetConfig
   |>.insert cFacet cFacetConfig
