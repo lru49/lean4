@@ -32,6 +32,7 @@ Author: Leonardo de Moura
 
 #if LEAN_SUPPORTS_BACKTRACE
 #include <execinfo.h>
+#include <dlfcn.h>
 #include <unistd.h>
 // Lean-exported demangler from Lean.Compiler.NameDemangling.
 // Declared as a weak symbol so leanrt doesn't require libLean at link time.
@@ -879,6 +880,7 @@ static obj_res mark_mt_fn(obj_arg o) {
 
 // lane CU diagnostic (not a candidate): counts of lean_mark_mt calls / objects marked, printed at exit with LEAN_MT_STATS=1
 static std::atomic<uint64_t> g_mt_calls{0}, g_mt_objs{0}, g_mt_big{0}, g_mt_tag[256];
+LEAN_THREAD_VALUE(void *, g_mt_cur_fn, nullptr);
 static void mt_stats_print() {
     fprintf(stderr, "mt-stats: calls=%llu marked=%llu calls>=1000=%llu", (unsigned long long)g_mt_calls.load(), (unsigned long long)g_mt_objs.load(), (unsigned long long)g_mt_big.load());
     for (int t = 0; t < 256; t++) if (g_mt_tag[t].load()) fprintf(stderr, " tag%d=%llu", t, (unsigned long long)g_mt_tag[t].load());
@@ -954,7 +956,10 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
             }
         }
     }
-    if (g_mt_stats) { g_mt_calls.fetch_add(1, std::memory_order_relaxed); g_mt_objs.fetch_add(n_marked, std::memory_order_relaxed); if (n_marked >= 1000) g_mt_big.fetch_add(1, std::memory_order_relaxed); }
+    if (g_mt_stats) { g_mt_calls.fetch_add(1, std::memory_order_relaxed); g_mt_objs.fetch_add(n_marked, std::memory_order_relaxed); if (n_marked >= 1000) g_mt_big.fetch_add(1, std::memory_order_relaxed);
+        if (n_marked >= 5000) { Dl_info di; void * fn = g_mt_cur_fn; void * ra = __builtin_return_address(0); Dl_info dr;
+            fprintf(stderr, "mt-big: %llu objs root-tag %u task-fn %s caller %s\n", (unsigned long long)n_marked, (unsigned)lean_ptr_tag(o),
+                (fn && dladdr(fn, &di) && di.dli_sname) ? di.dli_sname : "-", (dladdr(ra, &dr) && dr.dli_sname) ? dr.dli_sname : "?"); } }
 }
 
 // =======================================
@@ -1164,6 +1169,7 @@ class task_manager {
             scoped_current_task_object scope_cur_task(t);
             object * c = imp->m_closure;
             imp->m_closure = nullptr;
+            g_mt_cur_fn = lean_closure_fun(c);
             lock.unlock();
             v = lean_apply_1(c, box(0));
             // If deactivation was delayed by `m_keep_alive`, deactivate after the final execution (`v != nulltpr`)
