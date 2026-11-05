@@ -819,8 +819,11 @@ extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
         if (todo == nullptr)
             return;
 #if defined(LEAN_MULTI_THREAD)
-        // lean-perf (CJ): a large cascade continues on the release thread (see `defer_handoff`)
-        if (LEAN_UNLIKELY(++n == g_defer_min) && defer_handoff(todo) && todo == nullptr)
+        // lean-perf (CJ): a large cascade continues on the release thread (see `defer_handoff`); a medium one is
+        // also a drain point for decrements the release thread returned to this thread
+        ++n;
+        if (LEAN_UNLIKELY(n == 1024)) lean_deferred_free_drain();
+        if (LEAN_UNLIKELY(n == g_defer_min) && defer_handoff(todo) && todo == nullptr)
             return;
 #endif
         o = pop_back(todo);
