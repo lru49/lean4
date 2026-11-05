@@ -1453,7 +1453,10 @@ bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
 
 bool type_checker::is_def_eq(expr const & t, expr const & s) {
     bool r = is_def_eq_core(t, s);
-    if (r)
+    /* A pair of identical objects is not recorded: `quick_is_def_eq` tests `t == s` before consulting
+       `m_success`, and any later query matching the entry `(t, t)` has structurally equal sides, so the entry
+       would never be read. */
+    if (r && !is_eqp(t, s))
         cache_success(t, s);
     return r;
 }
