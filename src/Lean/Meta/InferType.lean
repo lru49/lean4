@@ -276,7 +276,49 @@ def inferTypeImp (e : Expr) : MetaM Expr :=
     | .forallE ..    => checkInferTypeCache e (inferForallType e)
     | .lam ..        => checkInferTypeCache e (inferLambdaType e)
     | .letE ..       => checkInferTypeCache e (inferLambdaType e)
-  withIncRecDepth <| withInferTypeConfig (infer e)
+  -- Fast path: when the configuration already satisfies `withInferTypeConfig` (which then leaves the
+  -- context unchanged, so the cache key is the same) and `e` is cacheable, the cache is consulted
+  -- before entering the deeper recursion-depth context: a hit costs no context allocation. The depth
+  -- limit check, the lookup, the eviction, the computation and the insertion are those of the
+  -- generic path, in the same order.
+  if e.hasMVar || !isInferTypeCacheable e then
+    withIncRecDepth <| withInferTypeConfig (infer e)
+  else do
+    let ctx ← read
+    if !ctx.cacheInferType || !isInferTypeConfig ctx.config then
+      withIncRecDepth <| withInferTypeConfig (infer e)
+    else
+      let curr ← MonadRecDepth.getRecDepth
+      let max  ← MonadRecDepth.getMaxRecDepth
+      if max != 0 && curr == max then
+        throwMaxRecDepthAt (← getRef)
+      let key ← mkExprConfigCacheKey e
+      match ← (← get).cache.inferType.find? key (fun c => modifyInferTypeCache fun _ => c) with
+      | some type => return type
+      | none =>
+        withIncRecDepth do
+          Core.checkInterrupted
+          let type ← inferUncached e
+          unless type.hasMVar do
+            modifyInferTypeCache fun c => c.insert key type
+          return type
+where
+  /-- The kinds `infer` caches. -/
+  isInferTypeCacheable : Expr → Bool
+    | .const _ (_ :: _) | .proj .. | .app .. | .forallE .. | .lam .. | .letE .. => true
+    | _ => false
+  /-- `withInferTypeConfig` leaves the context unchanged under this configuration. -/
+  isInferTypeConfig (cfg : Config) : Bool :=
+    !cfg.transparency.lt .default && cfg.beta && cfg.iota && cfg.zeta && cfg.zetaHave && cfg.zetaDelta &&
+      cfg.proj == .yesWithDelta && cfg.etaStruct == .all
+  /-- The uncached computation `infer` runs for a cacheable kind. -/
+  inferUncached (e : Expr) : MetaM Expr :=
+    match e with
+    | .const c us    => inferConstType c us
+    | .proj n i s    => inferProjType n i s
+    | .app f ..      => inferAppType f.getAppFn e.getAppArgs
+    | .forallE ..    => inferForallType e
+    | _              => inferLambdaType e
 
 /--
 Return `LBool.true` if given level is always equivalent to universe level zero.
