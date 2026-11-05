@@ -79,8 +79,10 @@ def setGoals (mvarIds : List MVarId) : TacticM Unit :=
 
 def pruneSolvedGoals : TacticM Unit := do
   let gs ← getGoals
-  let gs ← gs.filterM fun g => not <$> g.isAssigned
-  setGoals gs
+  -- Usually no goal is solved: then keep the list (and the state) as is instead of rebuilding both.
+  if ← gs.anyM (·.isAssigned) then
+    let gs ← gs.filterM fun g => not <$> g.isAssigned
+    setGoals gs
 
 def getUnsolvedGoals : TacticM (List MVarId) := do
   pruneSolvedGoals
