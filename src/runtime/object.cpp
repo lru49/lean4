@@ -590,13 +590,19 @@ static constexpr uintptr_t DEFER_GRACE = 1;
 static inline void defer_dec(lean_object * o, defer_stack & stack, defer_tally & tally, uint64_t & owned_st) {
     if (lean_is_scalar(o))
         return;
+    if (LEAN_UNLIKELY(defer_owner_only(o))) {
+        // Task / Promise / External, single-threaded OR thread-shared: the release thread never touches their count, so it
+        // never runs their deletion (task manager, foreign finalizers). The owner applies the decrement. v2: v1 deactivated
+        // thread-shared tasks here, which raced with `lean_finalize_task_manager` at process end (deadlock / use-after-free).
+        tally.add(o);
+        return;
+    }
     int rc = defer_load_rc(o);
     if (rc == 1) {
-        if (LEAN_UNLIKELY(defer_owner_only(o))) tally.add(o);
-        else stack.push_back((uintptr_t)o | DEFER_GRACE);
+        stack.push_back((uintptr_t)o | DEFER_GRACE);
     } else if (rc > 1) {
         size_t k = tally.add(o);
-        if ((size_t)defer_load_rc(o) == k && !defer_owner_only(o)) {
+        if ((size_t)defer_load_rc(o) == k) {
             // every reference to `o` was a field of a dying object: it is ours (after the grace barrier)
             tally.consume(o);
             owned_st++;
@@ -648,13 +654,7 @@ static void defer_visit(object * o, defer_stack & stack, defer_tally & tally, ui
 
 /* Free the memory of a visited object (children already dropped). */
 static void defer_release(object * o) {
-    uint8 tag = lean_ptr_tag(o);
-    if (LEAN_UNLIKELY(tag == LeanTask || tag == LeanPromise || tag == LeanExternal)) {
-        object * junk = nullptr;
-        junk = lean_del_core_other(o, tag, junk);  // no Lean children pushed for these kinds
-        lean_assert(junk == nullptr);
-        return;
-    }
+    lean_assert(!defer_owner_only(o));  // never reach the release thread (handoff filter + `defer_dec`)
     lean_free_object(o);
 }
 
@@ -750,11 +750,12 @@ static void defer_atexit() {
                 (unsigned long long)g_defer_n_batches.load(), (unsigned long long)g_defer_n_freed.load(),
                 (unsigned long long)g_defer_n_owned_st.load(), (unsigned long long)g_defer_n_returned.load(),
                 (unsigned long long)g_defer_n_refused.load(), (unsigned long long)g_defer_n_drained.load(), g_defer_min);
-    // stop the release thread at its next check so that it does not run concurrently with static destructors
+    // Stop the release thread at its next check (every 4096 objects). It only touches the allocator and object memory
+    // (never the task manager or foreign finalizers), so a bounded wait suffices; never block exit on it.
     std::unique_lock<std::mutex> lock(*g_defer_mutex);
     g_defer_stop.store(true, std::memory_order_relaxed);
     g_defer_cv->notify_all();
-    while (g_defer_busy) g_defer_idle_cv->wait(lock);
+    g_defer_idle_cv->wait_for(lock, std::chrono::milliseconds(200), [] { return !g_defer_busy; });
 }
 
 static void defer_slot_finalizer(void * p) {
