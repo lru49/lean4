@@ -376,8 +376,21 @@ static object * lean_del_core_other(object * o, uint8 tag, object * todo) {
         break;
     }
     case LeanArray: {
+        /* The elements are scattered objects whose counts usually miss the cache while the array itself is read
+           sequentially: prefetch the element `ARRAY_DEL_DISTANCE` slots ahead so that several of those misses
+           overlap (indirect prefetching at a fixed distance). Same decrements in the same order. */
+        constexpr size_t ARRAY_DEL_DISTANCE = 8;
         object ** it  = lean_array_cptr(o);
         object ** end = it + lean_array_size(o);
+        if (end - it > (ptrdiff_t)ARRAY_DEL_DISTANCE) {
+            for (object ** pf = it; pf != it + ARRAY_DEL_DISTANCE; ++pf)
+                if (!lean_is_scalar(*pf)) __builtin_prefetch(*pf, 1, 3);
+            for (object ** stop = end - ARRAY_DEL_DISTANCE; it != stop; ++it) {
+                object * f = it[ARRAY_DEL_DISTANCE];
+                if (!lean_is_scalar(f)) __builtin_prefetch(f, 1, 3);
+                dec(*it, todo);
+            }
+        }
         for (; it != end; ++it) dec(*it, todo);
         lean_dealloc(o, lean_array_byte_size(o));
         break;
