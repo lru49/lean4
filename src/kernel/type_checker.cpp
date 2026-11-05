@@ -9,6 +9,9 @@ Author: Leonardo de Moura
 #include <limits>
 #include <climits>
 #include <cstdlib>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include "runtime/interrupt.h"
 #include "runtime/sstream.h"
 #include "runtime/flet.h"
@@ -53,6 +56,113 @@ static expr * g_nat_shiftRight = nullptr;
 
 type_checker::state::state(environment const & env):
     m_env(env), m_ngen(*g_kernel_fresh) {}
+
+size_t type_checker::state::num_entries() const {
+    return m_infer_type[0].size() + m_infer_type[1].size() + m_whnf_core.size() + m_whnf.size() + m_unfold.size()
+        + m_success.size() + m_failure.size();
+}
+
+void type_checker::state::retarget(environment const & env) {
+    m_env = env;
+    /* `m_infer_type[0]` is the cache of `infer_type_core(e, infer_only = false)`, whose hits would skip the checks
+       that depend on the checker, not on the environment: `check_level` against the declaration's level parameters
+       and the `unsafe`/`partial` safety checks of `infer_constant`. `m_failure` holds negative `is_def_eq` answers,
+       which are incomplete and depend on `m_eager_reduce`; a stale failure could reject a declaration another checker
+       would accept. Everything else is a function of the environment and of this state's own fvars. */
+    m_infer_type[0].clear();
+    m_failure.clear();
+}
+
+/* Process-wide pool of kernel states, keyed by the kernel environment object a state is valid for.
+
+   A `type_checker::state` holds the memo tables of one checker; upstream creates one per `environment::add_*` and
+   destroys it afterwards, so (a) nothing is remembered between declarations and (b) the teardown of the tables (and
+   of the terms they alone keep alive) is paid on the kernel thread at the end of every check. Here the state of a
+   SUCCESSFUL check is returned to the pool under the pointer identity of the environment it checked against and of
+   the environment the add produced; the next `add_*` against either object takes it over. The environment produced
+   by a check is exactly the object the next check in a module's kernel chain receives (`Environment.checked`), and
+   `example`s (whose result environment is discarded) check against the same object again, so both patterns hit.
+   Pointer identity is the soundness key: the pool keeps a reference to every key object, so a key is never a reused
+   address, and a kernel environment object is immutable, so a state is used again only for the very environment
+   (or a checked descendant) it was built under. Bounds: at most `g_pool_slots` entries (FIFO), and a state with
+   more than `g_pool_max_entries` cached entries is not pooled (its memory would otherwise outlive the declaration
+   that built it); both from the environment (LEAN_KERNEL_CACHE_POOL=0 disables the pool,
+   LEAN_KERNEL_CACHE_POOL_MAX_ENTRIES=<n> sets the bound). Evicted states are destroyed outside the lock. */
+namespace {
+struct pool_entry {
+    object_ref                            m_env;
+    std::shared_ptr<type_checker::state>  m_state;
+};
+class kernel_state_pool {
+    std::mutex             m_mutex;
+    std::deque<pool_entry> m_entries;
+public:
+    std::shared_ptr<type_checker::state> take(environment const & env) {
+        std::shared_ptr<type_checker::state> r;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
+            if (it->m_env.raw() == env.raw()) {
+                r = it->m_state;
+                break;
+            }
+        }
+        if (r) {
+            // a state is used by one checker at a time: remove every key that refers to it
+            for (auto it = m_entries.begin(); it != m_entries.end();) {
+                if (it->m_state == r) it = m_entries.erase(it); else ++it;
+            }
+        }
+        return r;
+    }
+    void put(std::shared_ptr<type_checker::state> const & st, environment const & e1, environment const & e2, size_t slots) {
+        std::vector<pool_entry> evicted;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_entries.push_back(pool_entry{object_ref(e1), st});
+            if (e2.raw() != e1.raw())
+                m_entries.push_back(pool_entry{object_ref(e2), st});
+            while (m_entries.size() > slots) {
+                evicted.push_back(std::move(m_entries.front()));
+                m_entries.pop_front();
+            }
+        }
+        // `evicted` dies here: the teardown of an evicted state happens outside the lock
+    }
+};
+kernel_state_pool * g_kernel_state_pool = nullptr;
+size_t g_pool_slots       = 8;
+size_t g_pool_max_entries = 1u << 24;
+bool   g_pool_enabled     = true;
+void init_kernel_state_pool_config() {
+    if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL")) g_pool_enabled = !(s[0] == '0' && s[1] == 0);
+    if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_MAX_ENTRIES")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0) g_pool_max_entries = v; }
+    if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_SLOTS")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0 && v > 0) g_pool_slots = v; }
+}
+}
+
+type_checker::pooled_state::pooled_state(environment const & env, bool enabled):m_fresh(true) {
+    if (enabled && g_pool_enabled && g_kernel_state_pool) {
+        m_st = g_kernel_state_pool->take(env);
+        if (m_st) {
+            m_st->retarget(env);
+            m_fresh = false;
+        }
+    }
+    if (!m_st)
+        m_st = std::make_shared<state>(env);
+}
+
+type_checker::pooled_state::~pooled_state() {
+    // not committed (or not poolable): the state dies with the lease, as upstream's did with the checker
+}
+
+void type_checker::pooled_state::commit(environment const & in_env, environment const & out_env) {
+    if (!g_pool_enabled || !g_kernel_state_pool || !m_st)
+        return;
+    if (m_st->num_entries() > g_pool_max_entries)
+        return;
+    g_kernel_state_pool->put(m_st, in_env, out_env, g_pool_slots);
+}
 
 /** \brief Make sure \c e "is" a sort, and return the corresponding sort.
     If \c e is not a sort, then the whnf procedure is invoked.
@@ -1272,6 +1382,11 @@ type_checker::type_checker(environment const & env, local_ctx const & lctx, diag
     m_lctx(lctx), m_definition_safety(ds), m_lparams(nullptr) {
 }
 
+type_checker::type_checker(state & st, diagnostics * diag, definition_safety ds):
+    m_st_owner(false), m_st(&st), m_diag(diag),
+    m_lctx(), m_definition_safety(ds), m_lparams(nullptr) {
+}
+
 type_checker::~type_checker() {
     if (m_st_owner)
         delete m_st;
@@ -1297,6 +1412,8 @@ static size_t read_nat_size_env(char const * var, size_t default_value) {
 }
 
 void initialize_type_checker() {
+    init_kernel_state_pool_config();
+    g_kernel_state_pool = new kernel_state_pool();
     g_nat_max_size = read_nat_size_env("LEAN_NAT_MAX_SIZE", LEAN_NAT_MAX_SIZE_DEFAULT);
     g_kernel_fresh = new name("_kernel_fresh");
     mark_persistent(g_kernel_fresh->raw());
@@ -1325,6 +1442,11 @@ void initialize_type_checker() {
 }
 
 void finalize_type_checker() {
+    /* The pooled states are deliberately NOT destroyed at finalization: the tables of the last checks of a `lean`
+       process (for a module ending in a large kernel check, seconds of `lean_dec_ref_cold`) would otherwise be torn
+       down right before exit for no benefit. Finalization happens at process exit, where all memory is returned to the
+       OS anyway. */
+    g_kernel_state_pool = nullptr;
     delete g_kernel_fresh;
     delete g_bool_true;
     delete g_eager_reduce;
