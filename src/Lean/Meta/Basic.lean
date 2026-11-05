@@ -796,11 +796,12 @@ def SavedState.restore (b : SavedState) : MetaM Unit := do
   let restored := b.core.env
   let stampsRolledBack := env.trackedGen != restored.trackedGen ||
     env.declChangeLog.size != restored.declChangeLog.size || env.constGen != restored.constGen
-  b.core.restore
+  -- `b.core.restore` and raising `recordingConstGen` in a single update of the core state.
   -- The surviving entries may have observed declarations up to the latest recording start, so
   -- changes to those must stay logged.
-  modifyThe Core.State fun s =>
-    { s with env := s.env.raiseRecordingConstGen env.recordingConstGen }
+  modifyThe Core.State fun s => { s with
+    env := restored.raiseRecordingConstGen env.recordingConstGen, messages := b.core.messages,
+    infoState := b.core.infoState, snapshotTasks := b.core.snapshotTasks }
   modify fun s => { s with
     mctx := b.meta.mctx, zetaDeltaFVarIds := b.meta.zetaDeltaFVarIds, postponed := b.meta.postponed
     cache := if restored.constGen > env.constGen then

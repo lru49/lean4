@@ -425,9 +425,9 @@ def SavedState.restore (s : SavedState) (restoreInfo : Bool := false) : TermElab
   let infoState ← getInfoState -- We also do not backtrack the info nodes when `restoreInfo == false`
   s.meta.restore
   set s.elab
-  setTraceState traceState
-  unless restoreInfo do
-    setInfoState infoState
+  -- one update of the core state for both
+  modifyThe Core.State fun st =>
+    { st with traceState, infoState := if restoreInfo then st.infoState else infoState }
 
 /--
 Like `Meta.withRestoreOrSaveFull` for `TermElabM`, but also takes a `tacSnap?` that
