@@ -2691,31 +2691,29 @@ private def loadModuleIR (arts : NameMap ImportArtifacts) (i : Import) :
   else
     readIRPartsOfMod i.module
 
-/-- A queued module: its import, the promise its loader resolves, and whether a thread has taken it. -/
-private structure PrefetchItem where
-  imp   : Import
-  prom  : IO.Promise (Except IO.Error PrefetchedParts)
-  taken : IO.Ref Bool
+/-- A queued module: its import and the promise its loader resolves. -/
+private abbrev PrefetchItem := Import × IO.Promise (Except IO.Error PrefetchedParts)
 
 /--
-The prefetch state (lean-perf L04): a fixed set of loader threads (`PrefetchState.start`) take modules
-from a stack, map each module's parts and queue its not-yet-known imports; every module has one promise,
-resolved by whoever loads it, and the DFS waits on that promise's task. The earlier version (L01c)
-spawned one pool task per module, i.e. a closure, an MT marking and ~2 futex wake-ups per module (29k
-context switches and 124k `futex` calls per Mathlib import at `-j 4`). All bookkeeping is a persistent
-map and a cons list behind one blocking mutex (`Std.BaseMutex`; an `IO.Ref` spin lock starved the holder
-under as many threads as cores), so no operation ever copies an array; loaders sleep on the condition
-variable only when the stack is empty. A module the DFS reaches before a loader took it is loaded by the
-DFS thread itself (it would otherwise idle) and skipped by the loaders (`taken`).
+The prefetch state (lean-perf L04): a fixed set of loader threads (`PrefetchState.start`) drain a FIFO
+queue of modules, mapping each module's parts and queueing its not-yet-known imports; every module
+has one promise, resolved by whoever loads it, and the DFS waits on that promise's task. The earlier
+version (L01c) spawned one pool task per module, i.e. a closure, an MT marking and ~2 futex wake-ups
+per module: 29k context switches and 124k `futex` calls per Mathlib import at `-j 4`. The map and
+queue sit behind one blocking mutex (`Std.BaseMutex`; an `IO.Ref` spin lock starved the holder under
+as many threads as cores); loaders sleep on the condition variable when the queue is empty. A module
+the DFS reaches before a loader took it is loaded by the DFS thread itself (it would otherwise idle).
 -/
 private structure PrefetchState where
   mutex : Std.BaseMutex
   cond  : Std.Condvar
-  /-- module -> (result task, its queue item) -/
-  map   : IO.Ref (NameMap (PrefetchTask × PrefetchItem))
-  /-- LIFO stack of queued items; taken items are skipped when popped -/
-  stack : IO.Ref (List PrefetchItem)
-  /-- no more modules will be queued; loaders exit once the stack is drained -/
+  /-- module -> (result task, index into `queue`) -/
+  map   : IO.Ref (NameMap (PrefetchTask × Nat))
+  /-- FIFO; an entry is `none` once a loader (or the DFS) took it -/
+  queue : IO.Ref (Array (Option PrefetchItem))
+  /-- first queue index not taken by a loader -/
+  head  : IO.Ref Nat
+  /-- no more modules will be queued; loaders exit once the queue is drained -/
   done  : IO.Ref Bool
   /-- the loader tasks: kept alive here (a task whose last reference is dropped is deactivated by the
   runtime, i.e. cancelled before it runs) and joined by `finish` -/
@@ -2723,7 +2721,8 @@ private structure PrefetchState where
 
 private def PrefetchState.new : BaseIO PrefetchState := do
   return { mutex := ← Std.BaseMutex.new, cond := ← Std.Condvar.new, map := ← IO.mkRef {},
-           stack := ← IO.mkRef [], done := ← IO.mkRef false, loaders := ← IO.mkRef #[] }
+           queue := ← IO.mkRef #[], head := ← IO.mkRef 0, done := ← IO.mkRef false,
+           loaders := ← IO.mkRef #[] }
 
 /-- The result task of a promise; a dropped promise (cannot happen: every queued item is loaded or
 drained) surfaces as an error instead of a panic. -/
@@ -2745,23 +2744,26 @@ private def prefetchModules (st : PrefetchState) (imports : Array Import) :
     | none =>
       let p ← IO.Promise.new
       let t := prefetchResultTask p
-      let item : PrefetchItem := { imp := i, prom := p, taken := ← IO.mkRef false }
-      st.map.modify (·.insert i.module (t, item))
-      st.stack.modify (item :: ·)
+      -- `modify` keeps the queue array unshared, so the push is in place (a `get`/`set` pair would
+      -- copy the whole array per module)
+      let idx := (← st.queue.get).size
+      st.queue.modify (·.push (some (i, p)))
+      st.map.modify (·.insert i.module (t, idx))
       ts := ts.push t
       queued := true
   st.mutex.unlock
   if queued then st.cond.notifyAll
   return ts
 
-/-- Loads the parts of `item` (the work of one queue item): its `.olean*` parts, its IR parts, then its
+/-- Loads the parts of `i` (the work of one queue item): its `.olean*` parts, its IR parts, then its
 imports are queued (those of the part `ImportedModule.mainModule?` selects under `importAll`: the
 private part of a `module`, else the only part), so the graph is discovered on the loader threads. -/
 private def loadQueued (st : PrefetchState) (arts : NameMap ImportArtifacts) (globalLevel : OLeanLevel)
     (item : PrefetchItem) : BaseIO Unit := do
+  let (i, p) := item
   let r ← EIO.toBaseIO (do
-    let parts ← loadModuleData arts globalLevel item.imp
-    let irParts ← loadModuleIR arts item.imp
+    let parts ← loadModuleData arts globalLevel i
+    let irParts ← loadModuleIR arts i
     pure (parts, irParts) : IO PrefetchedParts)
   if let .ok (parts, _) := r then
     let data? : Option ModuleData := match parts[0]? with
@@ -2770,29 +2772,24 @@ private def loadQueued (st : PrefetchState) (arts : NameMap ImportArtifacts) (gl
       | none => none
     if let some data := data? then
       discard <| prefetchModules st data.imports
-  item.prom.resolve r
+  p.resolve r
 
-/-- Under the lock: pops the next item not yet taken (marking it taken), or `none` when the stack is
-empty. -/
-private partial def popUntaken (st : PrefetchState) : BaseIO (Option PrefetchItem) := do
-  match (← st.stack.get) with
-  | [] => return none
-  | item :: rest =>
-    st.stack.set rest
-    if (← item.taken.get) then
-      popUntaken st
-    else
-      item.taken.set true
-      return some item
-
-/-- One loader thread: takes items until `done` is set and the stack is drained. -/
+/-- One loader thread: takes queue items in FIFO order until `done` is set and the queue is drained. -/
 private partial def loaderLoop (st : PrefetchState) (arts : NameMap ImportArtifacts)
     (globalLevel : OLeanLevel) : BaseIO Unit := do
   st.mutex.lock
   let mut item? : Option PrefetchItem := none
   repeat
-    item? ← popUntaken st
-    if item?.isSome then break
+    let q ← st.queue.get
+    let mut h ← st.head.get
+    -- skip entries the DFS thread took itself
+    while h < q.size && q[h]!.isNone do h := h + 1
+    if h < q.size then
+      item? := q[h]!
+      st.queue.modify (·.set! h none)   -- in place: `q` is dead here
+      st.head.set (h + 1)
+      break
+    st.head.set h
     if (← st.done.get) then break
     st.cond.wait st.mutex
   st.mutex.unlock
@@ -2807,7 +2804,7 @@ private def PrefetchState.start (st : PrefetchState) (arts : NameMap ImportArtif
     let t ← BaseIO.asTask (prio := .dedicated) (loaderLoop st arts globalLevel)
     st.loaders.modify (·.push t)
 
-/-- No more modules will be queued: loaders exit once the stack is drained; joined here, so no loader
+/-- No more modules will be queued: loaders exit once the queue is drained; joined here, so no loader
 thread outlives the import and every queued promise has been resolved. -/
 private def PrefetchState.finish (st : PrefetchState) : BaseIO Unit := do
   st.mutex.lock
@@ -2818,7 +2815,7 @@ private def PrefetchState.finish (st : PrefetchState) : BaseIO Unit := do
     IO.wait t
 
 /--
-The result task of `i` for the DFS. If `i` has not been taken by a loader yet, the calling (DFS) thread
+The result task of `i` for the DFS. If `i` is still waiting in the queue, the calling (DFS) thread
 takes and loads it itself instead of idling until a loader reaches it; a module a loader already took
 is awaited through its task.
 -/
@@ -2827,10 +2824,12 @@ private def prefetchModule (st : PrefetchState) (arts : NameMap ImportArtifacts)
   let ts ← prefetchModules st #[i]
   let t := ts[0]!
   st.mutex.lock
+  let m ← st.map.get
+  let q ← st.queue.get
   let mut mine? : Option PrefetchItem := none
-  if let some (_, item) := (← st.map.get).find? i.module then
-    unless (← item.taken.get) do
-      item.taken.set true
+  if let some (_, idx) := m.find? i.module then
+    if let some (some item) := q[idx]? then
+      st.queue.modify (·.set! idx none)
       mine? := some item
   st.mutex.unlock
   if let some item := mine? then
