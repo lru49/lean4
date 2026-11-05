@@ -1986,6 +1986,8 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   -/
   exportEntriesFn : Environment → σ → OLeanEntries (Array α)
   statsFn         : σ → Format
+  /-- See `PersistentEnvExtensionDescrCore.parallelImport`. -/
+  parallelImport  : Bool := false
 
 instance {α σ} [Inhabited σ] : Inhabited (PersistentEnvExtensionState α σ) :=
   ⟨{importedEntries := #[], state := default }⟩
@@ -2082,6 +2084,14 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   trackGen          : Bool := false
   /-- See `EnvExtension.logWrites`. -/
   logWrites         : Bool := false
+  /--
+  lean-perf: `addImportedFn` is a pure function of its entries (it does not read the environment or
+  any other extension's state and has no side effects), so `finalizeImport` may run it on another
+  thread, concurrently with the other such extensions. Set by the registration helpers whose
+  descriptor types enforce this (`registerSimplePersistentEnvExtension`,
+  `registerSimpleScopedEnvExtension`, `mkMapDeclarationExtension`, `mkTagDeclarationExtension`).
+  -/
+  parallelImport    : Bool := false
 
 attribute [inherit_doc PersistentEnvExtension.exportEntriesFn]
   PersistentEnvExtensionDescrCore.exportEntriesFnEx
@@ -2123,7 +2133,8 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     addImportedFn   := descr.addImportedFn,
     addEntryFn      := descr.addEntryFn,
     exportEntriesFn := descr.exportEntriesFnEx,
-    statsFn         := descr.statsFn
+    statsFn         := descr.statsFn,
+    parallelImport  := descr.parallelImport
   }
   persistentEnvExtensionsRef.modify fun pExts => pExts.push (unsafeCast pExt)
   return pExt
@@ -2366,25 +2377,120 @@ set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_run_init_attrs"]
 private opaque runInitAttrs (env : Environment) (opts : Options) : IO Unit
 
+/-!
+lean-perf (perf/parallel-import, L01b; re-ported onto the prefix-tree import of leanprover/lean4#14362 as
+variant C, 2026-11-05): parallel initialization of pure persistent extension states in `finalizeImport`.
+Design and invariants: docs/levers/L01b-parallel-import.md of the lean-perf repository. The sharded
+construction of the imported constant maps that this lever also carried is gone: upstream's per-module
+constant prefix trees are merged lazily (`ImportedConsts.mergeModuleTreesLazy`), so there is no map to
+build at import time any more.
+
+Thread budget: the task manager's worker count (`lean -j`), capped by `LEAN_IMPORT_THREADS`.
+`LEAN_IMPORT_PAR_EXTS=0` disables the parallel extension states; `LEAN_IMPORT_DEBUG=1` prints timings.
+-/
+
+/-- Worker budget of the task manager (`lean -j`, `LEAN_NUM_THREADS`); 0 when there is none. -/
+@[extern "lean_io_get_num_std_workers"] opaque getNumStdWorkers : BaseIO Nat
+
+namespace ParallelImport
+
+/-- Decimal parse (`String.toNat?` is not available in this module's prelude). -/
+private def parseNat? (s : String) : Option Nat :=
+  if s.isEmpty then none
+  else s.foldl (init := some 0) fun acc c => acc.bind fun n =>
+    if c.val ≥ 48 && c.val ≤ 57 then some (n * 10 + (c.toNat - 48)) else none
+
+def envNat? (var : String) : BaseIO (Option Nat) := do
+  return (← IO.getEnv var).bind parseNat?
+
+/-- `<var>=0` disables a part; anything else (or unset) keeps it enabled. -/
+def envEnabled (var : String) : BaseIO Bool := do
+  return (← envNat? var).getD 1 != 0
+
+/-- `Runtime.markPersistent` with the single-threaded walk; used inside tasks so that their results
+are neither marked MT on completion nor walked again by the environment's final `markPersistent`. -/
+@[extern "lean_runtime_mark_persistent_seq"]
+unsafe def markPersistentSeq (a : α) : BaseIO α := return a
+
+def debugEnabled : BaseIO Bool := do
+  return (← envNat? "LEAN_IMPORT_DEBUG").getD 0 != 0
+
+def elapsedMs (t0 t1 : Nat) : String :=
+  let us := (t1 - t0) / 1000
+  s!"{us / 1000}.{(us % 1000) / 100} ms"
+
+/-- Threads for the import phase: `min (worker budget) LEAN_IMPORT_THREADS cap`, at least 1. -/
+def numThreads (cap : Nat := 8) : BaseIO Nat := do
+  let n ← getNumStdWorkers
+  let n := match (← envNat? "LEAN_IMPORT_THREADS") with
+    | some k => min n k
+    | none => n
+  return max 1 (min n cap)
+
+end ParallelImport
+
 private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
   let extGens ← EnvExtension.ensureGensArraySize env.base.private.extGens
   return env.modifyCheckedAsync ({ · with extensions := exts, extGens })
 
-private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options) : IO Environment := do
-  loop 0 env
+/-- lean-perf: the pending `addImportedFn` task of a `parallelImport` extension (state, start, end). -/
+private abbrev ExtTask := Task (Except IO.Error (EnvExtensionState × Nat × Nat))
+
+private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options)
+    (par : Bool := false) : IO Environment := do
+  let tasks ← if par then spawnTasks env 0 #[] else pure #[]
+  loop 0 env tasks
 where
-  loop (i : Nat) (env : Environment) : IO Environment := do
+  /-- lean-perf: spawns the `addImportedFn` of every `parallelImport` extension with index `≥ start` on
+  the current environment: such a function is pure in its imported entries (see
+  `PersistentEnvExtensionDescrCore.parallelImport`), so it does not observe which other extension
+  states are already finalized. Called at the start and after `setImportedEntries` has supplied the
+  entries of extensions registered by `runInitAttrs`. -/
+  spawnTasks (env : Environment) (start : Nat) (tasks : Array (Option ExtTask)) : IO (Array (Option ExtTask)) := do
+    let pExtDescrs ← persistentEnvExtensionsRef.get
+    let mut tasks := tasks
+    for i in [start:pExtDescrs.size] do
+      let d := pExtDescrs[i]!
+      if d.parallelImport then
+        let s := d.toEnvExtension.getState (asyncMode := .sync) env
+        let t ← IO.asTask (prio := .default) (do
+          let ta ← IO.monoNanosNow
+          let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
+          -- `par` implies `leakEnv`: the state ends up persistent anyway, do it on the task's thread
+          let st : EnvExtensionState ← unsafe (ParallelImport.markPersistentSeq st : BaseIO EnvExtensionState)
+          let tb ← IO.monoNanosNow
+          pure (st, ta, tb) : IO (EnvExtensionState × Nat × Nat))
+        tasks := tasks.push (some t)
+      else
+        tasks := tasks.push none
+    return tasks
+  loop (i : Nat) (env : Environment) (tasks : Array (Option ExtTask)) : IO Environment := do
     -- Recall that the size of the array stored `persistentEnvExtensionRef` may increase when we import user-defined environment extensions.
     let pExtDescrs ← persistentEnvExtensionsRef.get
     if h : i < pExtDescrs.size then
       let extDescr := pExtDescrs[i]
+      if let some (some t) := tasks[i]? then
+        -- lean-perf: state computed on a task; a `parallelImport` extension registers no extensions
+        -- or attributes, so the growth check below is not needed here.
+        let (newState, ta, tb) ← IO.ofExcept t.get
+        let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
+        let env := extDescr.toEnvExtension.setState (asyncMode := .sync) (log := .unlogged) env
+          { s with state := newState }
+        if (← ParallelImport.debugEnabled) && tb - ta ≥ 2000000 then
+          IO.eprintln s!"[par-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs ta tb} (task)"
+        return (← loop (i + 1) env tasks)
       -- Use `sync` to avoid `async` checks; there is only one environment branch at this point
       -- anyway.
       let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
       let prevSize := (← persistentEnvExtensionsRef.get).size
       let prevAttrSize ← getNumBuiltinAttributes
+      let t0 ← IO.monoNanosNow
       let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+      if par && (← ParallelImport.debugEnabled) then
+        let t1 ← IO.monoNanosNow
+        if t1 - t0 ≥ 2000000 then
+          IO.eprintln s!"[seq-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs t0 t1}"
       -- unlogged: nothing has been recorded against this environment yet
       let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) (log := .unlogged) env
         { s with state := newState }
@@ -2394,6 +2500,7 @@ where
         -- extensions further down in `pExtDescrs` so they can access initialized declarations.
         runInitAttrs env opts
       env ← ensureExtensionsArraySize env
+      let mut tasks := tasks
       if (← persistentEnvExtensionsRef.get).size > prevSize || (← getNumBuiltinAttributes) > prevAttrSize then
         -- This branch is executed when `pExtDescrs[i]` is the extension associated with the `init` attribute, and
         -- a user-defined persistent extension is imported.
@@ -2401,7 +2508,10 @@ where
         env := env.setCheckedSync { env.base.private with extensions := (← setImportedEntries env.base.private.extensions mods prevSize) }
         -- See comment at `updateEnvAttributesRef`
         env ← updateEnvAttributes env
-      loop (i + 1) env
+        -- lean-perf: the new extensions now have their imported entries
+        if par then
+          tasks ← spawnTasks env prevSize tasks
+      loop (i + 1) env tasks
     else
       return env
 
@@ -2834,6 +2944,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   let publicImported ← withCache <|
     ImportedConsts.mergeModuleTreesLazy publicTrees (resolveImportedEntry publicFind?)
 
+  -- lean-perf: thread budget of the import phase (see `ParallelImport`)
+  let importThreads ← ParallelImport.numThreads
   let exts ← mkInitialExtensionStates
   let privateBase : Kernel.Environment := {
     constants := { map₁ := privImported }
@@ -2881,7 +2993,10 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
   if loadExts then
-    env ← finalizePersistentExtensions env moduleData opts
+    -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
+    -- already persistent then, so capturing it in task closures costs nothing)
+    let parExts := leakEnv && importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_EXTS")
+    env ← finalizePersistentExtensions env moduleData opts (par := parExts)
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.
