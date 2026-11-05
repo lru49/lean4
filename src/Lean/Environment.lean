@@ -2869,7 +2869,7 @@ and theorems are (mostly) opaque in Lean. For `Acc.rec`, we may unfold theorems
 during type-checking, but we are assuming this is not an issue in practice,
 and we are planning to address this issue in the future.
 -/
-private def subsumesInfo (constMap : Std.HashMap Name ConstantInfo) (cinfo₁ cinfo₂ : ConstantInfo) : Bool :=
+private def subsumesInfoWith (find? : Name → Option ConstantInfo) (cinfo₁ cinfo₂ : ConstantInfo) : Bool :=
   cinfo₁.name == cinfo₂.name &&
     cinfo₁.type == cinfo₂.type &&
     cinfo₁.levelParams == cinfo₂.levelParams &&
@@ -2896,12 +2896,15 @@ where
       let .forallE (body := body) .. := ty | return false
       ty := body
     let .const n .. := ty.getAppFn | return false
-    let some decl := constMap[n]? | return false
+    let some decl := find? n | return false
     let mut p := decl.type
     for _ in 0...ty.getAppNumArgs do
       let .forallE (body := body) .. := p | return false
       p := body
     p.isProp
+
+private def subsumesInfo (constMap : Std.HashMap Name ConstantInfo) (cinfo₁ cinfo₂ : ConstantInfo) : Bool :=
+  subsumesInfoWith (constMap[·]?) cinfo₁ cinfo₂
 
 namespace ParallelImport
 open Std.DHashMap.Internal (AssocList scrambleHash)
@@ -2951,7 +2954,9 @@ def computeIndex (moduleData irData : Array ModuleData) (numTasks k : Nat) (mask
   (parts.foldl (init := Array.mkEmpty moduleData.size) fun acc p => acc ++ p.1, parts.map (·.2))
 
 inductive DeferredKind where
-  /-- `subsumesInfo` needs the map (axiom/axiom pair): decided on the merged map. -/
+  /-- Axiom/axiom pair: upstream's `subsumesInfo` needs `isPropCheap`'s lookup in the map-so-far. The rule is
+  symmetric in the pair (equal types are checked first), so upstream either replaces or throws; the shard has
+  already replaced, and the replay only verifies the condition (`checkDeferred`). -/
   | axiomPair (cinfoPrev : ConstantInfo)
   /-- Neither direction of `subsumesInfo` holds: `throwAlreadyImported`. -/
   | error
@@ -3018,7 +3023,10 @@ private partial def shardEntries (moduleData irData : Array ModuleData) (hashes 
             ((buckets.set! bi .nil).set! bi (bkt.replace cname cinfo), deferred, size)
           | .keep => (buckets, deferred, size)
           | .defer =>
-            (buckets, deferred.push { seq := (modIdx <<< 32) ||| i, modIdx, cname, cinfo, kind := .axiomPair cinfoPrev }, size)
+            -- same bucket operation as upstream's accepted case (`insert` = in-place `replace`); the
+            -- acceptance condition is verified after the merge, see `DeferredKind.axiomPair`
+            ((buckets.set! bi .nil).set! bi (bkt.replace cname cinfo),
+             deferred.push { seq := (modIdx <<< 32) ||| i, modIdx, cname, cinfo, kind := .axiomPair cinfoPrev }, size)
           | .error => (buckets, deferred.push { seq := (modIdx <<< 32) ||| i, modIdx, cname, cinfo, kind := .error }, size)
       let bi := ((hbits &&& m2) >>> sh).toNat
       let bkt := modBuckets[bi]!
@@ -3092,15 +3100,67 @@ private unsafe def sameList (eqv : α → α → Bool) : Bucket α → Bucket α
   | .cons k v t, .cons k' v' t' => k == k' && eqv v v' && sameList eqv t t'
   | _, _ => false
 
-/-- Structural comparison of two maps' raw buckets (`LEAN_IMPORT_CHECK=1`). -/
-unsafe def sameRaw (eqv : α → α → Bool) (m₁ m₂ : Std.HashMap Name α) : Except String Unit := do
+private unsafe def bucketToList (descr : Name → α → String) : Bucket α → List String
+  | .nil => []
+  | .cons k v t => descr k v :: bucketToList descr t
+
+/-- Structural comparison of two maps' raw buckets (`LEAN_IMPORT_CHECK=1`); on a mismatch the message lists
+both versions of the first differing bucket (head first), each entry rendered by `descr`. -/
+unsafe def sameRaw (eqv : α → α → Bool) (m₁ m₂ : Std.HashMap Name α)
+    (descr : Name → α → String := fun n _ => toString n) : Except String Unit := do
   let r₁ := m₁.inner.inner
   let r₂ := m₂.inner.inner
   if r₁.size != r₂.size then throw s!"size {r₁.size} vs {r₂.size}"
   if r₁.buckets.size != r₂.buckets.size then throw s!"buckets {r₁.buckets.size} vs {r₂.buckets.size}"
   for i in *...r₁.buckets.size do
     unless sameList eqv r₁.buckets[i]! r₂.buckets[i]! do
-      throw s!"bucket {i} differs"
+      throw s!"bucket {i} differs\n  parallel:   {bucketToList descr r₁.buckets[i]!}\n  sequential: {bucketToList descr r₂.buckets[i]!}"
+
+def kindName : ConstantInfo → String
+  | .axiomInfo _ => "axiom" | .defnInfo _ => "defn" | .thmInfo _ => "thm" | .opaqueInfo _ => "opaque"
+  | .quotInfo _ => "quot" | .inductInfo _ => "induct" | .ctorInfo _ => "ctor" | .recInfo _ => "rec"
+
+/-- Every module's copy of `n`: `(module name, kind)` in module order (for the `LEAN_IMPORT_CHECK` report). -/
+def copiesOf (s : ImportState) (moduleData : Array ModuleData) (n : Name) : List String := Id.run do
+  let mut r := []
+  for h : modIdx in *...moduleData.size do
+    let data := moduleData[modIdx]
+    for cname in data.constNames, cinfo in data.constants do
+      if cname == n then r := s!"{s.moduleNames[modIdx]!}:{kindName cinfo}" :: r
+  return r.reverse
+
+/--
+Upstream's `isPropCheap` looks the head constant `n` of an axiom's type up in the map-so-far. At scan position
+`(modIdx, pos)` that map contains `n` iff a module before `modIdx` declares it or `modIdx` declares it before
+`pos`; its type is the same in every copy (duplicates must have equal types), so the merged map provides the
+value. `const2ModIdx` gives the first module whose constants or IR `extraConstNames` contain `n`; if that module
+only names `n` in its IR, the first declaring module is found by scanning forward (never happens for a predicate
+in practice).
+-/
+def visibleAt (constMap : Std.HashMap Name ConstantInfo) (const2ModIdx : Std.HashMap Name ModuleIdx)
+    (moduleData : Array ModuleData) (modIdx pos : Nat) (n : Name) : Option ConstantInfo := do
+  let cinfo ← constMap[n]?
+  let mut m := (← const2ModIdx[n]?).toNat
+  while m < modIdx && !(moduleData[m]!.constNames.contains n) do
+    m := m + 1
+  if m < modIdx then return cinfo
+  if m == modIdx then
+    let some i := moduleData[m]!.constNames.findIdx? (· == n) | failure
+    if i < pos then return cinfo
+  failure
+
+/-- Replays the deferred decisions in scan order with upstream's map-so-far semantics; throws exactly where
+upstream throws. The map is never modified: the shards already performed every bucket operation. -/
+def checkDeferred (s : ImportState) (moduleData : Array ModuleData) (constMap : Std.HashMap Name ConstantInfo)
+    (const2ModIdx : Std.HashMap Name ModuleIdx) (deferred : Array Deferred) : IO Unit := do
+  for d in deferred do
+    match d.kind with
+    | .error => throwAlreadyImported s const2ModIdx d.modIdx d.cname
+    | .axiomPair cinfoPrev =>
+      let pos := d.seq &&& ((1 <<< 32) - 1)
+      let find? := visibleAt constMap const2ModIdx moduleData d.modIdx pos
+      unless subsumesInfoWith find? d.cinfo cinfoPrev || subsumesInfoWith find? cinfoPrev d.cinfo do
+        throwAlreadyImported s const2ModIdx d.modIdx d.cname
 
 /-- Parallel construction of `privateConstantMap` and `const2ModIdx` on `numThreads` threads; the
 result is structurally identical to `mkConstantMapsSeq` for every import the latter accepts. -/
@@ -3142,29 +3202,26 @@ def mkConstantMaps (s : ImportState) (moduleData irData : Array ModuleData) (num
   let modSize := shards.foldl (· + ·.modSize) 0
   let buckets := gatherBuckets (shards.map (·.buckets)) b1 log2k
   let modBuckets := gatherBuckets (shards.map (·.modBuckets)) b2 log2k
-  let mut privateConstantMap : Std.HashMap Name ConstantInfo := unsafe mkHashMapUnsafe size buckets
+  let privateConstantMap : Std.HashMap Name ConstantInfo := unsafe mkHashMapUnsafe size buckets
   let const2ModIdx : Std.HashMap Name ModuleIdx := unsafe mkHashMapUnsafe modSize modBuckets
   let t3 ← IO.monoNanosNow
   if dbg then
     IO.eprintln s!"[par-constmap] threads={numThreads} shards={k} consts={size} buckets={b1}: index {elapsedMs t0 t1}, shards {elapsedMs t1 t2}, gather {elapsedMs t2 t3}"
-  -- decisions upstream takes with the map-so-far, replayed in scan order on the merged map
+  -- acceptance checks upstream makes with the map-so-far (and the errors), replayed in scan order
   let deferred := (shards.flatMap (·.deferred)).qsort (·.seq < ·.seq)
-  for d in deferred do
-    match d.kind with
-    | .error => throwAlreadyImported s const2ModIdx d.modIdx d.cname
-    | .axiomPair cinfoPrev =>
-      if subsumesInfo privateConstantMap d.cinfo cinfoPrev then
-        privateConstantMap := privateConstantMap.insert d.cname d.cinfo
-      else if !subsumesInfo privateConstantMap cinfoPrev d.cinfo then
-        throwAlreadyImported s const2ModIdx d.modIdx d.cname
+  checkDeferred s moduleData privateConstantMap const2ModIdx deferred
+  if dbg then
+    IO.eprintln s!"[par-constmap] deferred axiom/axiom checks: {deferred.size}"
   if (← envNat? "LEAN_IMPORT_CHECK").getD 0 != 0 then
     let (seqMap, seqMod) ← mkConstantMapsSeq s moduleData irData numPrivateConsts numAllConsts
-    match unsafe sameRaw (fun a b => ptrEq a b) privateConstantMap seqMap with
+    let descr := fun (n : Name) (c : ConstantInfo) =>
+      s!"{n} ({kindName c}, @{unsafe ptrAddrUnsafe c}, copies {copiesOf s moduleData n})"
+    match unsafe sameRaw (fun a b => ptrEq a b) privateConstantMap seqMap descr with
     | .error e => throw <| IO.userError s!"LEAN_IMPORT_CHECK: constant map differs from sequential construction: {e}"
     | .ok _ => pure ()
     match unsafe sameRaw (fun (a b : ModuleIdx) => a.toNat == b.toNat) const2ModIdx seqMod with
     | .error e => throw <| IO.userError s!"LEAN_IMPORT_CHECK: const2ModIdx differs from sequential construction: {e}"
-    | .ok _ => IO.eprintln s!"LEAN_IMPORT_CHECK: constant maps identical ({size} constants, {k} shards, {b1} buckets)"
+    | .ok _ => IO.eprintln s!"LEAN_IMPORT_CHECK: constant maps identical ({size} constants, {k} shards, {b1} buckets, {deferred.size} deferred checks)"
   return (privateConstantMap, const2ModIdx)
 
 end ParallelImport
