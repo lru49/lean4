@@ -972,6 +972,42 @@ static void free_task(lean_task_object * t) {
     lean_free_small_object((lean_object*)t);
 }
 
+/* lean-perf: CPU pause hint for bounded spin-waits (no-op on other architectures). */
+static inline void task_cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+/* lean-perf: how long `Task.get` spins on an unfinished task before parking on the task manager's
+   condition variable: `LEAN_TASK_GET_SPIN_US` microseconds (default 20, 0 = park at once). Parking costs a
+   futex sleep, the finishing thread's futex wake and a scheduler round trip (much more than 20 us on a
+   loaded machine); short tasks (import conversions, `Task.map` continuations) often finish within it. */
+static int64_t task_get_spin_ns() {
+    static int64_t g_ns = -1;
+    if (g_ns < 0) {
+        char const * s = std::getenv("LEAN_TASK_GET_SPIN_US");
+        int64_t us = s ? std::max(0, atoi(s)) : 20;
+        g_ns = us * 1000;
+    }
+    return g_ns;
+}
+
+static bool task_spin_until_finished(lean_task_object * t) {
+    int64_t ns = task_get_spin_ns();
+    if (ns == 0) return false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+    while (true) {
+        for (unsigned i = 0; i < 32; i++) {
+            if (t->m_value.load(std::memory_order_acquire)) return true;
+            task_cpu_relax();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+    }
+}
+
 struct scoped_current_task_object : flet<lean_task_object *> {
     scoped_current_task_object(lean_task_object * t):flet(g_current_task_object, t) {}
 };
@@ -1255,14 +1291,18 @@ public:
     void wait_for(lean_task_object * t) {
         if (t->m_value)
             return;
+        if (g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO) {
+            lean_panic("`Task.get` called from a `(sync := true)` task");
+        }
+        // lean-perf: bounded spin before parking (and, for a pool worker, before spawning a replacement)
+        if (task_spin_until_finished(t))
+            return;
         unique_lock<mutex> lock(m_mutex);
         if (t->m_value)
             return;
         // see `Task.get`
         bool in_pool = g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio <= LEAN_MAX_PRIO;
-        if (g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO) {
-            lean_panic("`Task.get` called from a `(sync := true)` task");
-        }
+        // (the `(sync := true)` check moved before the spin above)
         if (in_pool) {
             m_max_std_workers++;
             if (m_idle_std_workers == 0)
