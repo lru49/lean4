@@ -984,10 +984,13 @@ private:
                 case fn_body_kind::VDecl: { // variable declaration
                     expr const & e = fn_body_vdecl_expr(b);
                     fn_body const & cont = fn_body_vdecl_cont(b);
-                    // tail recursion?
-                    if (expr_tag(e) == expr_kind::FAp && expr_fap_fun(e) == get_frame().m_fn &&
+                    // tail recursion? The structural checks (an `FAp` whose result is returned at once) come first:
+                    // they read only the IR nodes evaluated next anyway, and they fail for almost every `FAp`, so the
+                    // out-of-line name comparison with the current function runs only for calls in tail position.
+                    if (expr_tag(e) == expr_kind::FAp &&
                         fn_body_tag(cont) == fn_body_kind::Ret && !arg_is_irrelevant(fn_body_ret_arg(cont)) &&
-                        arg_var_id(fn_body_ret_arg(cont)) == fn_body_vdecl_var(b)) {
+                        arg_var_id(fn_body_ret_arg(cont)) == fn_body_vdecl_var(b) &&
+                        expr_fap_fun(e) == get_frame().m_fn) {
                         // tail recursion! copy argument values to parameter slots and reset `b`
                         array_ref<arg> const & args = expr_fap_args(e);
                         // argument and parameter slots may overlap, so first copy arguments to end of stack
