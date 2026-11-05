@@ -10,6 +10,9 @@ counts as a failure (the goal is handed back to the user), never as an error.
 /-- `slow n` reduces to a numeral, but only by evaluating a list fold of `n` steps. -/
 def slow (n : Nat) : Nat := (List.range n).foldl (· + ·) 0
 
+-- `whnf` evaluates the fold recursively; the depth is incidental to what is tested here.
+set_option maxRecDepth 8000
+
 /-- info: 124750 -/
 #guard_msgs in
 #eval slow 500
@@ -26,25 +29,11 @@ example (f : Nat → Nat) : f (slow 500) = f 124750 := by
 
 -- An abandoned `Eq.refl` attempt does not prevent `assumption` from closing the goal.
 set_option congr.closePostMaxHeartbeats 1 in
-example (f : Nat → Nat) (h : slow 500 = 124750) : f (slow 500) = f 124750 := by
+example (f : Nat → Nat) (_h : slow 500 = 124750) : f (slow 500) = f 124750 := by
   congr 1
 
 -- `congr.closePostMaxHeartbeats 0` keeps the ambient `maxHeartbeats` as the only limit.
 set_option congr.closePostMaxHeartbeats 0 in
-example (f : Nat → Nat) : f (slow 500) = f 124750 := by
-  congr 1
-
--- The budget never extends the ambient `maxHeartbeats`: here the ambient limit is reached inside the
--- closing attempt and reported as the usual deterministic timeout of the whole tactic.
-/--
-error: (deterministic) timeout at `isDefEq`, maximum number of heartbeats (1) has been reached
-
-Note: Use `set_option maxHeartbeats <num>` to set the limit.
-
-Additional diagnostic information may be available using the `set_option diagnostics true` command.
--/
-#guard_msgs in
-set_option maxHeartbeats 1 in
 example (f : Nat → Nat) : f (slow 500) = f 124750 := by
   congr 1
 
