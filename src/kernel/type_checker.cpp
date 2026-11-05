@@ -706,6 +706,7 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
     }
 
     if (cache_result && !cheap_rec && !cheap_proj) {
+        g_wc_ins[my_cat]++;
         m_st->m_whnf_core.insert(e, r);
     }
     return r;
