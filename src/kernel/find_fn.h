@@ -12,7 +12,7 @@ namespace lean {
 /** \brief Return a subexpression of \c e that satisfies the predicate \c p. */
 template<typename P> optional<expr> find(expr const & e, P p) {
     optional<expr> result;
-    for_each(e, [&](expr const & e, unsigned offset) {
+    auto fn = [&](expr const & e, unsigned offset) {
             if (result)  {
                 return false;
             } else if (p(e, offset)) {
@@ -21,7 +21,8 @@ template<typename P> optional<expr> find(expr const & e, P p) {
             } else {
                 return true;
             }
-        });
+        };
+    for_each_offset_tpl(e, fn); // lean-perf (CV foreachtpl): no std::function
     return result;
 }
 }

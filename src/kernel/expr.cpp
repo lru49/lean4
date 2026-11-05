@@ -345,7 +345,7 @@ bool has_loose_bvar(expr const & e, unsigned i) {
     if (!has_loose_bvars(e))
         return false;
     bool found = false;
-    for_each(e, [&](expr const & e, unsigned offset) {
+    auto fn = [&](expr const & e, unsigned offset) {
             if (found)
                 return false; // already found
             unsigned n_i = i + offset;
@@ -359,7 +359,8 @@ bool has_loose_bvar(expr const & e, unsigned i) {
                     found = true;
             }
             return true; // continue search
-        });
+        };
+    for_each_offset_tpl(e, fn); // lean-perf (CV foreachtpl): no std::function
     return found;
 }
 
