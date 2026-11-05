@@ -83,10 +83,6 @@ extern "C" object * lean_delayed_mvar_assignment_fvars(obj_arg d);
 extern "C" object * lean_delayed_mvar_assignment_mvar_id_pending(obj_arg d);
 extern "C" object * lean_assign_mvar(obj_arg mctx, obj_arg mid, obj_arg val);
 typedef object_ref metavar_ctx;
-/* lean-perf (CE imvars): the set of MVars whose assignment was already normalized in this pass. It is
-   only queried (`contains`) and extended (`insert`), so a hash set replaces the persistent red-black
-   tree (`name_set`), whose inserts allocate a path of nodes and whose lookups compare names. */
-typedef lean::unordered_set<name, name_hash_fn, name_eq_fn> mvar_id_set;
 typedef object_ref delayed_assignment;
 
 static void assign_lmvar(metavar_ctx & mctx, name const & mid, level const & l) {
@@ -182,7 +178,7 @@ public:
 class instantiate_direct_fn {
     metavar_ctx & m_mctx;
     instantiate_lmvars_all_fn m_level_fn;
-    mvar_id_set m_already_normalized;
+    name_set m_already_normalized;
     /* Set to true when a delayed-assigned MVar with an assigned pending MVar
        is encountered. Pass 2 is needed to resolve or write back such MVars. */
     bool m_has_updateable_delayed;
@@ -213,7 +209,7 @@ class instantiate_direct_fn {
             return optional<expr>();
         }
         expr a(r.get_val());
-        if (!has_mvar(a) || m_already_normalized.count(mid)) {
+        if (!has_mvar(a) || m_already_normalized.contains(mid)) {
             return optional<expr>(a);
         }
         m_already_normalized.insert(mid);
@@ -311,11 +307,7 @@ public:
         case expr_kind::Const:
             return cache(e, update_const(e, visit_levels(const_levels(e))), shared);
         case expr_kind::MVar:
-            /* lean-perf (CE imvars): shared MVar occurrences are cached like every other node. The first visit
-               normalizes and writes back the assignment and records any updateable delayed assignment, so a
-               repeated visit would return the same expression without effects; the cache skips the
-               assignment lookups (two `PersistentHashMap` probes through the Lean ABI per occurrence). */
-            return cache(e, visit_mvar(e), shared);
+            return visit_mvar(e);
         case expr_kind::MData:
             return cache(e, update_mdata(e, visit(mdata_expr(e))), shared);
         case expr_kind::Proj:
@@ -521,7 +513,7 @@ class instantiate_delayed_fn {
     /* Write-back support: in outer mode, normalize and write back direct MVar
        assignments. Downstream code (e.g. MutualDef.mkInitialUsedFVarsMap) reads
        stored assignments and expects inner delayed-assigned MVars to be resolved. */
-    mvar_id_set m_already_normalized;
+    name_set m_already_normalized;
     std::vector<expr> m_saved;
 
     /* Resolvability caches — persistent across all delayed-assigned MVar
@@ -636,7 +628,7 @@ class instantiate_delayed_fn {
             return optional<expr>();
         expr a(r.get_val());
         if (in_outer_mode()) {
-            if (m_already_normalized.count(mid))
+            if (m_already_normalized.contains(mid))
                 return optional<expr>(a);
             m_already_normalized.insert(mid);
             expr a_new = visit(a);
