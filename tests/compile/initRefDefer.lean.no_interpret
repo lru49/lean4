@@ -1,0 +1,1 @@
+-- the test needs `initialize` blocks of the main module, which `lean --run` cannot evaluate in the same module
