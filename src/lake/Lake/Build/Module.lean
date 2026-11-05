@@ -15,6 +15,7 @@ import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
 import Init.Omega
+public import Init.Task
 
 /-! # Module Build Definitions -/
 
@@ -94,9 +95,12 @@ structure ModuleImportData where
   let imps ← imports.mapM fun imp => do
     let (includeSelf, transImports) ← f imp
     return {module := imp, transImports, includeSelf : ModuleImportData}
-  let task : JobTask OrdModuleSet := imps.foldl (init := .pure (.ok .empty {})) fun r imp =>
-    r.bind (sync := true) fun r =>
-    imp.transImports.task.map (sync := true) fun
+  -- One pass over all import results once they are done (not a `bind` per import, whose
+  -- task results would force a copy of the growing set on every step: quadratic).
+  let task : JobTask OrdModuleSet :=
+    Task.mapList (sync := true) (tasks := imps.toList.map (·.transImports.task)) fun rs =>
+    (imps.toList.zip rs).foldl (init := .ok .empty {}) fun r (imp, rx) =>
+    match rx with
     | .ok transImps _ =>
       match r with
       | .ok impSet s =>
@@ -459,10 +463,21 @@ def fetchImportInfo
   let nonModule := !header.isModule
   let info := ModuleImportInfo.nil modName
   let impArtsJob : Job ModuleImportInfo := .pure info
-  header.imports.foldlM (init := impArtsJob) fun s imp => do
+  /-
+  Remark: Single-package imports (the common case) are queued in `pending` and folded into
+  the accumulator job in one pass (`Job.zipWithAll`) rather than one `zipWith` per import,
+  whose task results would force a copy of the growing import info (traces, artifact map)
+  on every step: quadratic for modules with thousands of imports (e.g. `import Mathlib`).
+  The result is the same as folding `zipWith (·.addImport nonModule imp ·)` import by import.
+  -/
+  let flush (s : Job ModuleImportInfo) (pending : Array (Import × Job ModuleMetaExportInfo)) :=
+    if pending.isEmpty then s else
+    s.zipWithAll (fun info (imp, expInfo) => info.addImport nonModule imp expInfo) <|
+      pending.map fun (imp, job) => job.map (sync := true) (imp, ·)
+  let (s, pending) ← header.imports.foldlM (init := (impArtsJob, #[])) fun (s, pending) imp => do
     if modName = imp.module then
       logError s!"{fileName}: module imports itself"
-      return .error
+      return (.error, #[])
     let mods ← findModules imp.module
     if nonModule && !allowNonModules then
       if let some mod := mods.find? (·.requiresModuleSystem) then
@@ -475,7 +490,7 @@ def fetchImportInfo
             system; consider adding `module` to the start of this file"
     let n := mods.size
     if h : n = 0 then
-      return s
+      return (s, pending)
     else if n = 1 then -- common fast path
       let mod := mods[0]
       -- Remark: We've decided to disable this check for now
@@ -484,8 +499,9 @@ def fetchImportInfo
       --     the module `{imp.module}` from the package `{mod.pkg.discriminant}`"
       --   return .error
       let importJob ← mod.fetchExportInfo
-      return s.zipWith (sync := true) (·.addImport nonModule imp ·) importJob
+      return (s, pending.push (imp, importJob))
     else
+      let s := flush s pending
       -- Remark: We've decided to disable this check for now
       -- let isImportable (mod) :=
       --   mod.allowImportAll || pkgName == mod.pkg.keyName
@@ -505,7 +521,7 @@ def fetchImportInfo
       --   return .error
       let mods : Vector Module n := .mk mods rfl
       let expInfosJob ← Job.collectVector <$> mods.mapM (·.fetchExportInfo)
-      s.bindM (sync := true) fun impInfo => do
+      (·, #[]) <$> s.bindM (sync := true) fun impInfo => do
       expInfosJob.mapM (sync := true) fun expInfos => do
         let expInfo := expInfos[0]
         let impHash := expInfo.disambiguationHash nonModule imp
@@ -519,6 +535,7 @@ def fetchImportInfo
             s!"{s}\n  {mods[i].pkg.discriminant} (hash: {hash})"
           error msg
         return impInfo.addImport nonModule imp expInfo
+  return flush s pending
 
 /-- The `ModuleFacetConfig` for the builtin `importInfoFacet`. -/
 public def Module.importInfoFacetConfig : ModuleFacetConfig importInfoFacet :=
