@@ -28,6 +28,34 @@ register_builtin_option linter.constructorNameAsVariable : Bool := {
 }
 
 /--
+Heartbeat budget (in thousands, like `maxHeartbeats`) for the weak-head normalization of one binder
+type in `constructorNameAsVariable`. Normalizing a binder type at default transparency can evaluate
+arbitrary computations: for `h : x ∈ s` with a concrete `s : Finset α`, `whnf` unfolds the
+membership instance to `Quot.lift` and then evaluates `s` itself, which took seconds per binder in
+proofs about concrete finite sets. A type whose normalization exceeds the budget is skipped.
+-/
+def constructorNameAsVariable.whnfHeartbeats : Nat := 1000
+
+/--
+The weak-head normal form of a binder type for `constructorNameAsVariable`, or `none` if computing
+it exceeds `constructorNameAsVariable.whnfHeartbeats`. A type whose head is already an inductive
+type is in weak-head normal form and is returned without calling `whnf`.
+-/
+def constructorNameAsVariable.binderTypeWhnf? (ty : Expr) : MetaM (Option Expr) := do
+  let ty ← instantiateMVars ty
+  if let .const tn _ := ty.getAppFn then
+    if let some (.inductInfo _) := (← getEnv).find? tn then
+      return some ty
+  let ctx ← readThe Core.Context
+  let budget := constructorNameAsVariable.whnfHeartbeats * 1000
+  let budget := if ctx.maxHeartbeats == 0 then budget else min budget ctx.maxHeartbeats
+  tryCatchRuntimeEx
+    (some <$> withTheReader Core.Context
+      (fun c => { c with maxHeartbeats := budget }) (withCurrHeartbeats (Meta.whnf ty)))
+    fun ex => if ex.isMaxHeartbeat then return none else throw ex
+
+open constructorNameAsVariable in
+/--
 Reports when bound variables' names overlap with constructor names for their type. This is to warn
 especially new users that they have built a pattern that matches anything, rather than one that
 matches a particular constructor. Use `linter.constructorNameAsVariable` to disable.
@@ -66,7 +94,7 @@ def constructorNameAsVariable : Linter where
                 let ty ←
                   if let some t := ti.expectedType? then pure t
                   else ti.runMetaM ci (Meta.inferType ti.expr)
-                let ty ← ti.runMetaM ci (instantiateMVars ty >>= Meta.whnf)
+                let some ty ← ti.runMetaM ci (binderTypeWhnf? ty) | return
                 if let .const tn _ := ty.getAppFn' then
                   if let some (.inductInfo i) := (← getEnv).find? tn then
                     for c in i.ctors do
