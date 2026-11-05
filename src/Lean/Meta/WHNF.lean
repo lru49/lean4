@@ -1074,6 +1074,48 @@ def reduceNat? (e : Expr) : MetaM (Option Expr) :=
     return none
 
 
+/--
+`Nat` arithmetic written with the core heterogeneous-operator instances, e.g.
+`@HAdd.hAdd Nat Nat Nat (instHAdd Nat instAddNat) a b`, returns the same literal the general path
+computes, without its four unfolding steps (`HAdd.hAdd`, the projection out of `instHAdd`, `Add.add`, the
+projection out of `instAddNat`), each a `whnf` call with cache insertion.
+
+The general path reaches `Nat.add a b` and then `reduceNat?`, i.e. `reduceBinNatOp Nat.add a b`; it
+gets there exactly when the transparency unfolds the four constants (`.all`, or `.default` and none of
+them is `[irreducible]`), projections reduce with delta (`proj := .yesWithDelta`) and no custom
+unfolding predicate is installed. Those steps create no free variables or metavariables, so calling
+`reduceBinNatOp` first does not change the fresh-name sequence; when an argument is not a numeral it
+returns `none` and the general path runs as before. Skipped under diagnostics (unfold counters).
+-/
+private def reduceNatInstBinOp? (e : Expr) : MetaM (Option Expr) := do
+  let .app (.app (.app (.app (.app (.app (.const hop [_, _, _]) (.const ``Nat [])) (.const ``Nat []))
+      (.const ``Nat [])) (.app (.app (.const hinst [_]) (.const ``Nat [])) (.const natInst []))) a) b := e
+    | return none
+  let some (op, cls, f) := opInfo? hop hinst natInst | return none
+  let ctx ← read
+  if ctx.customCanUnfoldPredicate?.isSome || !(ctx.config.canUnfoldPredicateConfig matches .default) then
+    return none
+  let cfg ← getConfig
+  unless cfg.proj matches .yesWithDelta do return none
+  if (← isDiagnosticsEnabled) then return none
+  match cfg.transparency with
+  | .all => pure ()
+  | .default =>
+    for c in [hop, hinst, cls, natInst] do
+      if (← isIrreducible c) then return none
+  | _ => return none
+  reduceBinNatOp op a b
+where
+  /-- the operation, the class projection `Add.add`/..., and the core `Nat` instance of each operator -/
+  opInfo? (hop hinst natInst : Name) : Option ((Nat → Nat → Nat) × Name × Name) :=
+    match hop, hinst, natInst with
+    | ``HAdd.hAdd, ``instHAdd, ``instAddNat => some (Nat.add, ``Add.add, ``instAddNat)
+    | ``HSub.hSub, ``instHSub, ``instSubNat => some (Nat.sub, ``Sub.sub, ``instSubNat)
+    | ``HMul.hMul, ``instHMul, ``instMulNat => some (Nat.mul, ``Mul.mul, ``instMulNat)
+    | ``HDiv.hDiv, ``instHDiv, ``Nat.instDiv => some (Nat.div, ``Div.div, ``Nat.instDiv)
+    | ``HMod.hMod, ``instHMod, ``Nat.instMod => some (Nat.mod, ``Mod.mod, ``Nat.instMod)
+    | _, _, _ => none
+
 @[inline] private def useWHNFCache (e : Expr) : MetaM Bool := do
   -- We cache only closed terms without expr metavars.
   -- Potential refinement: cache if `e` is not stuck at a metavariable
@@ -1103,6 +1145,9 @@ where
       checkSystem "whnf"
       let e' ← whnfCore e
       match (← reduceNat? e') with
+      | some v => return v
+      | none   =>
+      match (← reduceNatInstBinOp? e') with
       | some v => return v
       | none   =>
         match (← unfoldDefinition? e') with
