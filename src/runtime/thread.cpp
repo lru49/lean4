@@ -8,6 +8,14 @@ Author: Leonardo de Moura
 #include <vector>
 #include <iostream>
 #include <cstring>
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#include <fstream>
+#include <string>
+#include <cstdlib>
+#include <cstdio>
+#endif
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #else
@@ -214,6 +222,88 @@ void run_thread_finalizers() {
     g_finalizers = nullptr;
 }
 
-void initialize_thread() {}
+/* lean-perf: `LEAN_CPU_AFFINITY`, a general opt-in affinity mask for every Lean executable (lean, lake, ...) on Linux.
+   On SMT hosts (two hardware threads per physical core, e.g. Intel Hyper-Threading) a process confined to one thread per
+   core never shares a core's execution resources with a sibling process; for a `lake build` of many single-threaded
+   `lean` processes this removes the SMT contention tax measured in lean-perf (docs/levers/L-smt-contention.md: +5-6 % on
+   a 32-core/64-thread r7i.16xlarge). Values:
+     unset, "", "0", "off"      nothing (default)
+     "one-per-core" / "cores"   keep, from the CURRENT affinity mask (so `taskset`/cgroups are respected), only the
+                                lowest-numbered CPU of each physical core (`/sys/devices/system/cpu/cpuN/topology/
+                                thread_siblings_list`); a no-op on hosts without SMT or when the result would be empty
+     "<cpu list>"               an explicit list such as "0-31,33", intersected with the current mask
+   The mask is set on the calling thread before any worker thread exists and is inherited by every thread and child
+   process (Lake's `lean` children). `LEAN_CPU_AFFINITY_DEBUG=1` prints the resulting mask to stderr. Not Linux: ignored. */
+#ifdef __linux__
+static bool parse_cpu_list(char const * s, cpu_set_t & out) {
+    CPU_ZERO(&out);
+    char const * p = s;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char * end = nullptr;
+        long a = std::strtol(p, &end, 10);
+        if (end == p || a < 0 || a >= CPU_SETSIZE) return false;
+        long b = a;
+        p = end;
+        if (*p == '-') {
+            b = std::strtol(p + 1, &end, 10);
+            if (end == p + 1 || b < a || b >= CPU_SETSIZE) return false;
+            p = end;
+        }
+        for (long c = a; c <= b; c++) CPU_SET(c, &out);
+        if (*p && *p != ',' && *p != ' ') return false;
+    }
+    return true;
+}
+
+static void apply_cpu_affinity_from_env() {
+    char const * v = std::getenv("LEAN_CPU_AFFINITY");
+    if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0) return;
+    bool debug = std::getenv("LEAN_CPU_AFFINITY_DEBUG") != nullptr;
+    cpu_set_t cur;
+    if (sched_getaffinity(0, sizeof(cur), &cur) != 0) return;
+    cpu_set_t want;
+    if (std::strcmp(v, "one-per-core") == 0 || std::strcmp(v, "cores") == 0) {
+        CPU_ZERO(&want);
+        for (int c = 0; c < CPU_SETSIZE; c++) {
+            if (!CPU_ISSET(c, &cur)) continue;
+            std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list";
+            std::ifstream in(path);
+            std::string list;
+            if (!in || !std::getline(in, list)) { CPU_SET(c, &want); continue; }  // no topology: keep the CPU
+            cpu_set_t sib;
+            if (!parse_cpu_list(list.c_str(), sib)) { CPU_SET(c, &want); continue; }
+            // keep `c` only if no lower-numbered sibling of its core is in the current mask
+            bool keep = true;
+            for (int d = 0; d < c; d++) if (CPU_ISSET(d, &sib) && CPU_ISSET(d, &cur)) { keep = false; break; }
+            if (keep) CPU_SET(c, &want);
+        }
+    } else {
+        if (!parse_cpu_list(v, want)) {
+            if (debug) std::fprintf(stderr, "[affinity] LEAN_CPU_AFFINITY=%s: cannot parse, ignored\n", v);
+            return;
+        }
+        CPU_AND(&want, &want, &cur);
+    }
+    int n = CPU_COUNT(&want), ncur = CPU_COUNT(&cur);
+    if (n == 0 || n == ncur) { if (debug) std::fprintf(stderr, "[affinity] LEAN_CPU_AFFINITY=%s: no change (%d of %d cpus)\n", v, n, ncur); return; }
+    if (sched_setaffinity(0, sizeof(want), &want) != 0) {
+        if (debug) std::fprintf(stderr, "[affinity] sched_setaffinity failed\n");
+        return;
+    }
+    if (debug) {
+        std::string s;
+        for (int c = 0; c < CPU_SETSIZE; c++) if (CPU_ISSET(c, &want)) { if (!s.empty()) s += ","; s += std::to_string(c); }
+        std::fprintf(stderr, "[affinity] LEAN_CPU_AFFINITY=%s: pid %d confined to %d of %d cpus: %s\n", v, (int)getpid(), n, ncur, s.c_str());
+    }
+}
+#endif
+
+void initialize_thread() {
+#ifdef __linux__
+    apply_cpu_affinity_from_env();
+#endif
+}
 void finalize_thread() {}
 }
