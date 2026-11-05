@@ -1384,6 +1384,8 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       checkHit entry.result?
       let result? ← applyCachedAbstractResult? type entry.result?
       trace[Meta.synthInstance] "result {result?} (cached)"
+      if (← (IO.getEnv "LEAN_CN_DIAG" : IO (Option String))).isSome then
+        IO.eprintln s!"CNDIAG hit par={parentRecording} replay={replay?} ng={(← getNGen).idx - ngen0.idx} type={(toString type).replace "\n" " "}"
       if let some n := replay? then
         -- The use of a revived entry stands in for the recomputation that would otherwise have run
         -- here; the name generator is left where that recomputation would have left it (never
@@ -1394,11 +1396,14 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       return result?
     | none =>
       trace[Meta.synthInstance.cache] "new: {type}"
+      let t0 ← IO.monoNanosNow
       let abstResult? ← runSearch
       let result? ← applyAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?}"
       let ngen ← getNGen
       let fresh? := if ngen.namePrefix == ngen0.namePrefix then some (ngen.idx - ngen0.idx) else none
+      if (← (IO.getEnv "LEAN_CN_DIAG" : IO (Option String))).isSome then
+        IO.eprintln s!"CNDIAG miss ns={(← IO.monoNanosNow) - t0} par={parentRecording} fresh={fresh?} type={(toString type).replace "\n" " "}"
       cacheResult cacheKey rawKey norm? ((← getThe Core.State).recordedDeps) kind abstResult? result?
         fresh?
       return result?
