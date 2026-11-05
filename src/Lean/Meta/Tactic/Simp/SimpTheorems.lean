@@ -695,6 +695,171 @@ def SimpTheorems.addSimpEntry (d : SimpTheorems) (e : SimpEntry) : SimpTheorems 
   | .toUnfold n => d.addDeclToUnfoldCore n
   | .toUnfoldThms n thms => d.registerDeclToUnfoldThms n thms
 
+/-!
+lean-perf (perf/parallel-import-2, L01c): parallel construction of an imported simp set.
+`SimpTheorems.addSimpEntriesPar d es n = es.foldl addSimpEntry d`, computed on up to `n` threads:
+* the `pre`/`post` discrimination trees depend, per root key, only on the subsequence of theorems with
+  that root key (`DiscrTree.insertKeyValue` is `root.alter k` of the key's own trie), so the root keys
+  are sharded by hash and each shard builds the tries of its keys in entry order;
+* the shape of the root `PersistentHashMap` depends on the whole `alter` sequence (an `alter` of an
+  existing key moves it to the end of its collision node), so one task replays exactly that sequence
+  with placeholder tries (the "skeleton") and the shards' tries are then written into it in place;
+* the other fields (`lemmaNames`, `erased`, `toUnfold`, `toUnfoldThms`) are the sequential fold
+  without the tree inserts (they never read the trees), on one more task.
+`LEAN_IMPORT_CHECK=1` also runs the sequential fold and compares the two states structurally.
+-/
+namespace SimpTheorems
+
+/-- `addSimpTheorem` without the discrimination-tree insert. -/
+private def addSimpTheoremNoTree (d : SimpTheorems) (e : SimpTheorem) : SimpTheorems :=
+  let d := eraseFwdIfBwd d e
+  { d with lemmaNames := d.lemmaNames.insert e.origin }
+
+/-- `addSimpEntry` without the discrimination-tree inserts. -/
+private def addSimpEntryNoTree (d : SimpTheorems) : SimpEntry → SimpTheorems
+  | .thm e => addSimpTheoremNoTree d e
+  | .toUnfold n => d.addDeclToUnfoldCore n
+  | .toUnfoldThms n thms => d.registerDeclToUnfoldThms n thms
+
+/-- The shard of a root key. -/
+@[inline] private def shardOf (k : DiscrTree.Key) (numShards : Nat) : Nat :=
+  (hash k).toNat % numShards
+
+open PersistentHashMap in
+/-- Replaces the value of the (present) key `k` in place; unlike `alter` it keeps the node structure. -/
+private partial def replaceExistingAux {α β : Type} [BEq α] [Hashable α] (k : α) (v : β) :
+    Node α β → USize → Node α β
+  | .collision keys vals heq, _ =>
+    match keys.finIdxOf? k with
+    | some idx =>
+      have : idx.val < vals.size := heq ▸ idx.isLt
+      .collision keys (vals.set idx.val v) (by simp [heq])
+    | none => .collision keys vals heq
+  | .entries entries, h =>
+    let j := (mod2Shift h shift).toNat
+    .entries <| entries.modify j fun
+      | .entry k' v' => if k == k' then .entry k v else .entry k' v'
+      | .ref node => .ref (replaceExistingAux k v node (div2Shift h shift))
+      | .null => .null
+
+private def replaceExisting {α β : Type} [BEq α] [Hashable α] (m : PersistentHashMap α β) (k : α)
+    (v : β) : PersistentHashMap α β :=
+  { root := replaceExistingAux k v m.root (hash k |>.toUSize) }
+
+/-- Exactly the `root.alter` operation `DiscrTree.insertKeyValue` performs, with a placeholder trie. -/
+@[inline] private def skeletonInsert (t : SimpTheoremTree) (k : DiscrTree.Key) : SimpTheoremTree :=
+  { t with root := t.root.alter k fun
+      | none => some default
+      | some c => some c }
+
+/-- The root-map shapes of `pre`/`post` after the fold (placeholder tries). -/
+private def buildSkeleton (d : SimpTheorems) (es : Array SimpEntry) :
+    SimpTheoremTree × SimpTheoremTree := Id.run do
+  let mut pre := d.pre
+  let mut post := d.post
+  for e in es do
+    if let .thm e := e then
+      if h : 0 < e.keys.size then
+        if e.post then post := skeletonInsert post e.keys[0]
+        else pre := skeletonInsert pre e.keys[0]
+  return (pre, post)
+
+/-- The tries of the root keys in shard `j`: `d`'s tries of those keys, then the theorems of `es` with
+those root keys inserted in order. -/
+private def buildTreeShard (d : SimpTheorems) (es : Array SimpEntry) (numShards j : Nat) :
+    SimpTheoremTree × SimpTheoremTree := Id.run do
+  let pick (t : SimpTheoremTree) : SimpTheoremTree :=
+    t.root.foldl (init := {}) fun acc k c =>
+      if shardOf k numShards == j then { acc with root := acc.root.insert k c } else acc
+  let mut pre := pick d.pre
+  let mut post := pick d.post
+  for e in es do
+    if let .thm e := e then
+      if h : 0 < e.keys.size then
+        if shardOf e.keys[0] numShards == j then
+          if e.post then post := post.insertKeyValue e.keys e
+          else pre := pre.insertKeyValue e.keys e
+  return (pre, post)
+
+/-- Writes the shard's tries into the skeleton in place. -/
+private def mergeShard (skel shard : SimpTheoremTree) : SimpTheoremTree :=
+  shard.root.foldl (init := skel) fun acc k c => { acc with root := replaceExisting acc.root k c }
+
+open PersistentHashMap in
+private partial def sameNode {α β : Type} (eqK : α → α → Bool) (eqV : β → β → Bool) :
+    Node α β → Node α β → Bool
+  | .entries es₁, .entries es₂ =>
+    es₁.size == es₂.size && (es₁.zip es₂).all fun p =>
+      match p.1, p.2 with
+      | .null, .null => true
+      | .entry k₁ v₁, .entry k₂ v₂ => eqK k₁ k₂ && eqV v₁ v₂
+      | .ref n₁, .ref n₂ => sameNode eqK eqV n₁ n₂
+      | _, _ => false
+  | .collision ks₁ vs₁ _, .collision ks₂ vs₂ _ =>
+    ks₁.size == ks₂.size && (ks₁.zip ks₂).all (fun p => eqK p.1 p.2) &&
+    vs₁.size == vs₂.size && (vs₁.zip vs₂).all (fun p => eqV p.1 p.2)
+  | _, _ => false
+
+private unsafe def sameTrie : DiscrTree.Trie SimpTheorem → DiscrTree.Trie SimpTheorem → Bool
+  | .chain k₁ c₁, .chain k₂ c₂ => k₁ == k₂ && sameTrie c₁ c₂
+  | .node vs₁ cs₁, .node vs₂ cs₂ =>
+    vs₁.size == vs₂.size && (vs₁.zip vs₂).all (fun p => ptrEq p.1 p.2) &&
+    cs₁.size == cs₂.size && (cs₁.zip cs₂).all (fun p => p.1.1 == p.2.1 && sameTrie p.1.2 p.2.2)
+  | _, _ => false
+
+/-- `LEAN_IMPORT_CHECK=1`: structural comparison of two simp sets (the name of the first field that differs). -/
+private unsafe def checkSame (a b : SimpTheorems) : Option String :=
+  if !sameNode (· == ·) sameTrie a.pre.root.root b.pre.root.root then some "pre"
+  else if !sameNode (· == ·) sameTrie a.post.root.root b.post.root.root then some "post"
+  else if !sameNode (· == ·) (fun _ _ => true) a.lemmaNames.set.root b.lemmaNames.set.root then some "lemmaNames"
+  else if !sameNode (· == ·) (fun _ _ => true) a.toUnfold.set.root b.toUnfold.set.root then some "toUnfold"
+  else if !sameNode (· == ·) (fun _ _ => true) a.erased.set.root b.erased.set.root then some "erased"
+  else if !sameNode (· == ·) (· == ·) a.toUnfoldThms.root b.toUnfoldThms.root then some "toUnfoldThms"
+  else none
+
+/-- Runs `f ()` with start/end time stamps. -/
+private def timed {β : Type} (f : Unit → β) : IO (β × Nat × Nat) := do
+  let ta ← IO.monoNanosNow
+  let r := f ()
+  let tb ← IO.monoNanosNow
+  return (r, ta, tb)
+
+/-- `es.foldl addSimpEntry d` on up to `numThreads` threads (see the section comment above). -/
+def addSimpEntriesPar (d : SimpTheorems) (es : Array SimpEntry) (numThreads : Nat) : IO SimpTheorems := do
+  -- small sets (all but the main `simp` set): the sequential fold is cheaper than 10 task spawns
+  -- competing with the other extensions' tasks (measured 8-50 ms of wall per tiny set at `-j 8`)
+  if es.size < 4096 && (← ParallelImport.envNat? "LEAN_IMPORT_CHECK").getD 0 == 0 then
+    return es.foldl addSimpEntry d
+  let numShards := max 1 (min numThreads 8)
+  let dbg ← ParallelImport.debugEnabled
+  let t0 ← IO.monoNanosNow
+  let restTask ← IO.asTask (prio := .default) (timed fun _ => es.foldl addSimpEntryNoTree d)
+  let skelTask ← IO.asTask (prio := .default) (timed fun _ => buildSkeleton d es)
+  let shardTasks ← (Array.range numShards).mapM fun j =>
+    IO.asTask (prio := .default) (timed fun _ => buildTreeShard d es numShards j)
+  let (rest, tr0, tr1) ← IO.ofExcept restTask.get
+  let ((pre, post), ts0, ts1) ← IO.ofExcept skelTask.get
+  let mut pre := pre
+  let mut post := post
+  let mut shardTimes : Array String := #[]
+  for t in shardTasks do
+    let ((preJ, postJ), ta, tb) ← IO.ofExcept t.get
+    shardTimes := shardTimes.push (ParallelImport.elapsedMs ta tb)
+    pre := mergeShard pre preJ
+    post := mergeShard post postJ
+  let r := { rest with pre, post }
+  let t1 ← IO.monoNanosNow
+  if dbg then
+    IO.eprintln s!"[par-simp] entries={es.size} shards={numShards}: total {ParallelImport.elapsedMs t0 t1}, rest {ParallelImport.elapsedMs tr0 tr1}, skeleton {ParallelImport.elapsedMs ts0 ts1}, shards {shardTimes}"
+  if (← ParallelImport.envNat? "LEAN_IMPORT_CHECK").getD 0 != 0 then
+    let seq := es.foldl addSimpEntry d
+    match unsafe checkSame seq r with
+    | some err => throw <| IO.userError s!"LEAN_IMPORT_CHECK: parallel simp set differs from the sequential one in `{err}`"
+    | none => IO.eprintln s!"LEAN_IMPORT_CHECK: simp set identical ({es.size} entries, {numShards} shards)"
+  return r
+
+end SimpTheorems
+
 /--
 `simp [foo]` should undo a previous `attribute @[-simp] foo`.
 (Note that `attribute @[simp] foo` does not undo a `attribute @[simp] foo`, see #5852)
@@ -729,7 +894,10 @@ def addSimpTheorem (ext : SimpExtension) (declName : Name) (post : Bool) (inv : 
     ext.add (SimpEntry.thm simpThm) attrKind
 
 
-def mkSimpExt (name : Name := by exact decl_name%) : IO SimpExtension :=
+def mkSimpExt (name : Name := by exact decl_name%) : IO SimpExtension := do
+  -- lean-perf (L01c): the imported entries of every simp set are folded in parallel
+  ScopedEnvExtension.registerParEntriesFn name fun (d : SimpTheorems) (es : Array SimpEntry) n =>
+    d.addSimpEntriesPar es n
   registerSimpleScopedEnvExtension {
     name     := name
     initial  := {}
