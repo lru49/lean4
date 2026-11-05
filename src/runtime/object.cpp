@@ -3139,11 +3139,11 @@ extern "C" LEAN_EXPORT object * lean_array_push(obj_arg a, obj_arg v) {
 // =======================================
 // Name primitives
 
-extern "C" LEAN_EXPORT uint8 lean_name_eq(b_lean_obj_arg n1, b_lean_obj_arg n2) {
-    if (n1 == n2)
-        return true;
-    if (lean_is_scalar(n1) != lean_is_scalar(n2) || lean_name_hash_ptr(n1) != lean_name_hash_ptr(n2))
-        return false;
+// Component-by-component comparison, entered only when the two names are distinct objects with equal hashes.
+// Kept out of line so that the common exits of `lean_name_eq` (pointer equality, scalar/non-scalar or hash
+// mismatch) need no stack frame or callee-saved registers: the loop below calls `memcmp` / `mpz` compare and
+// so needs four saved registers, which clang otherwise pushes and pops on every call, including the fast exits.
+__attribute__((noinline)) static uint8 lean_name_eq_components(b_lean_obj_arg n1, b_lean_obj_arg n2) {
     while (true) {
         lean_assert(!lean_is_scalar(n1));
         lean_assert(!lean_is_scalar(n2));
@@ -3169,6 +3169,14 @@ extern "C" LEAN_EXPORT uint8 lean_name_eq(b_lean_obj_arg n1, b_lean_obj_arg n2) 
             return false;
         */
     }
+}
+
+extern "C" LEAN_EXPORT uint8 lean_name_eq(b_lean_obj_arg n1, b_lean_obj_arg n2) {
+    if (n1 == n2)
+        return true;
+    if (lean_is_scalar(n1) != lean_is_scalar(n2) || lean_name_hash_ptr(n1) != lean_name_hash_ptr(n2))
+        return false;
+    return lean_name_eq_components(n1, n2);
 }
 
 // =======================================
