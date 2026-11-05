@@ -717,6 +717,13 @@ structure Environment where
   some point knows that a constant with a larger `constAddedGen` did not exist then.
   -/
   constGen : Nat := 0
+  /--
+  Counter bumped by every write to an environment extension that is not declared cache-safe
+  (`EnvExtension.metaCacheSafe`). Together with the identity of the constant map and `constGen` it
+  tells `Environment.cachesSurvive` whether results cached about constants, reduction and
+  definitional equality (the `Core` and `Meta` caches) are still valid after a modification.
+  -/
+  cacheGen : Nat := 0
 deriving Nonempty
 
 @[inline] private def VisibilityMap.get (m : VisibilityMap α) (env : Environment) : α :=
@@ -734,6 +741,20 @@ namespace Environment
 @[inherit_doc Kernel.Environment.trackedGen]
 def trackedGen (env : Environment) : Nat :=
   env.base.private.trackedGen
+
+/--
+Whether results cached under `old` that depend only on the constants, reducibility, instances and
+other declaration-keyed or reduction-relevant environment state (the `Core.Cache` of instantiated
+constant types and values, the `Meta.Cache` of `whnf`/`inferType`/`isDefEq`/type class results) are
+still valid under `new`: the constant map is the very same object and no constant was announced
+(`constGen`), and every extension written since is one declared not to affect such results
+(`EnvExtension.metaCacheSafe`, e.g. doc strings and declaration ranges; `cacheGen`). `CoreM` and
+`MetaM` keep their caches across `modifyEnv` exactly when this holds and drop them otherwise, as they
+used to do unconditionally.
+-/
+def cachesSurvive (old new : Environment) : Bool :=
+  ptrEq old.base.private.constants new.base.private.constants &&
+    old.constGen == new.constGen && old.cacheGen == new.cacheGen
 
 def header (env : Environment) : EnvironmentHeader :=
   -- can be assumed to be in sync with `env.checked`; see `setMainModule`, the only modifier of the header
@@ -1572,6 +1593,14 @@ structure EnvExtension (σ : Type) where private mk ::
   or be marked unlogged; see `EnvExtension.modifyState`.
   -/
   logWrites : Bool
+  /--
+  Whether writes to this extension never change the result of a `Meta`-level computation about
+  existing declarations (`whnf`, `inferType`, `isDefEq`, type class resolution, instantiating
+  constant types and values), so that `CoreM`/`MetaM` may keep their caches across such a write
+  (`Environment.cachesSurvive`). True for bookkeeping that elaboration does not consult, such as doc
+  strings and declaration ranges; the default `false` bumps `Environment.cacheGen` on every write.
+  -/
+  metaCacheSafe : Bool
   deriving Inhabited
 
 namespace EnvExtension
@@ -1677,6 +1706,8 @@ private def modifyStateCore {σ : Type} (ext : EnvExtension σ) (env : Environme
     (asyncMode : AsyncMode) (asyncDecl : Name) (bumpGen : Bool) : Environment := Id.run do
   -- for panics
   let _ : Inhabited Environment := ⟨env⟩
+  -- a write to an extension not declared cache-safe invalidates the `Core`/`Meta` caches (`Environment.cachesSurvive`)
+  let env := if ext.metaCacheSafe then env else { env with cacheGen := env.cacheGen + 1 }
   let env := match ext.genIdx? with
     | some i =>
       if !bumpGen then env else
@@ -1849,7 +1880,8 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
     (asyncMode : EnvExtension.AsyncMode := .mainOnly)
     (name : Name := by exact decl_name%)
     (trackGen : Bool := false)
-    (logWrites : Bool := false) : IO (EnvExtension σ) := do
+    (logWrites : Bool := false)
+    (metaCacheSafe : Bool := false) : IO (EnvExtension σ) := do
   unless (← initializing) do
     throw (IO.userError "failed to register environment, extensions can only be registered during initialization")
   if trackGen then
@@ -1862,7 +1894,7 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
     some <$> EnvExtension.numTrackedExtsRef.modifyGet fun n => (n, n + 1)
   else pure none
   let ext : EnvExtension σ :=
-    { idx, mkInitial, asyncMode, replay?, name, genIdx?, logWrites }
+    { idx, mkInitial, asyncMode, replay?, name, genIdx?, logWrites, metaCacheSafe }
   -- safety: `EnvExtensionState` is opaque, so we can upcast to it
   EnvExtension.envExtensionsRef.modify fun exts => exts.push (unsafe unsafeCast ext)
   pure ext
@@ -2083,6 +2115,8 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   trackGen          : Bool := false
   /-- See `EnvExtension.logWrites`. -/
   logWrites         : Bool := false
+  /-- See `EnvExtension.metaCacheSafe`. -/
+  metaCacheSafe     : Bool := false
 
 attribute [inherit_doc PersistentEnvExtension.exportEntriesFn]
   PersistentEnvExtensionDescrCore.exportEntriesFnEx
@@ -2111,7 +2145,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     fun oldState newState newConsts s => { s with state := replay oldState.state newState.state newConsts s.state }
   let ext ← registerEnvExtension (asyncMode := descr.asyncMode) (replay? := replay?)
       (name := descr.name) (trackGen := descr.trackGen)
-      (logWrites := descr.logWrites) do
+      (logWrites := descr.logWrites) (metaCacheSafe := descr.metaCacheSafe) do
     let initial ← descr.mkInitial
     let s : PersistentEnvExtensionState α σ := {
       importedEntries := #[],
