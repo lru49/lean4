@@ -777,7 +777,7 @@ template<typename F> optional<expr> type_checker::reduce_bin_nat_op(F const & f,
     // result itself exceeds the size limit.
     if (check_size)
         check_nat_size(env(), nat_size_in_bytes(r));
-    return some_expr(mk_lit(literal(r)));
+    return some_expr(mk_nat_lit(r));
 }
 
 optional<expr> type_checker::reduce_pow(expr const & e) {
@@ -794,7 +794,7 @@ optional<expr> type_checker::reduce_pow(expr const & e) {
         throw kernel_exception(env(), "the kernel refused to evaluate `Nat.pow` because "
             "the result would exceed the maximum numeral size; increase the "
             "LEAN_NAT_MAX_SIZE environment variable to allow it");
-    return some_expr(mk_lit(literal(nat(nat_pow(base.raw(), exp.raw())))));
+    return some_expr(mk_nat_lit(nat(nat_pow(base.raw(), exp.raw()))));
 }
 
 optional<expr> type_checker::reduce_shiftLeft(expr const & e) {
@@ -809,7 +809,7 @@ optional<expr> type_checker::reduce_shiftLeft(expr const & e) {
         size_t k = get_count_arg(env(), shift, "Nat.shiftLeft");
         check_nat_size(env(), nat_size_in_bytes(v) + k / 8 + 1);
     }
-    return some_expr(mk_lit(literal(nat(lean_nat_shiftl(v.raw(), shift.raw())))));
+    return some_expr(mk_nat_lit(nat(lean_nat_shiftl(v.raw(), shift.raw()))));
 }
 
 template<typename F> optional<expr> type_checker::reduce_bin_nat_pred(F const & f, expr const & e) {
@@ -832,7 +832,7 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
             nat v = get_nat_val(arg);
             v = v + nat(1);
             check_nat_size(env(), nat_size_in_bytes(v));
-            return some_expr(mk_lit(literal(v)));
+            return some_expr(mk_nat_lit(v));
         }
     } else if (nargs == 2) {
         expr const & f = app_fn(app_fn(e));
@@ -1201,7 +1201,7 @@ inline optional<expr> is_nat_succ(expr const & t) {
     if (is_nat_lit(t)) {
         nat val = lit_value(t).get_nat();
         if (!val.is_zero()) {
-            return some_expr(mk_lit(literal(val - nat(1))));
+            return some_expr(mk_nat_lit(val - nat(1)));
         }
     }
 
