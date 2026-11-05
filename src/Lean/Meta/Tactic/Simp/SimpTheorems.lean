@@ -721,6 +721,53 @@ private def addSimpEntryNoTree (d : SimpTheorems) : SimpEntry → SimpTheorems
   | .toUnfold n => d.addDeclToUnfoldCore n
   | .toUnfoldThms n thms => d.registerDeclToUnfoldThms n thms
 
+/-!
+lean-perf (cr): converse lookups that cannot succeed. `addSimpTheorem` first calls `eraseFwdIfBwd`, which
+for every forward theorem `.decl n _ false` allocates the converse origin `.decl n _ true` and looks it up
+in `lemmaNames`. During a fold over imported entries that starts from a simp set with empty `lemmaNames`,
+`lemmaNames` only ever contains origins inserted by the fold itself, so that lookup can only succeed if
+`n` occurs in the entries as a backward (`←`) theorem, which is rare. `addSimpEntriesFold` skips the
+lookup in all other cases; the resulting `SimpTheorems` is the one `es.foldl addSimpEntry d` builds
+(the skipped `eraseIfExists` calls would have returned their argument unchanged).
+`LEAN_SIMPSET_SKIP_CONVERSE=0` disables it.
+-/
+
+/-- The names that occur in `es` as a backward (`←`) theorem. -/
+private def backwardNames (es : Array SimpEntry) : NameHashSet :=
+  es.foldl (init := {}) fun s e =>
+    match e with
+    | .thm t => match t.origin with
+      | .decl n _ true => s.insert n
+      | _ => s
+    | _ => s
+
+/-- Whether `eraseFwdIfBwd` can find the converse of `o` (see the section comment). -/
+@[inline] private def mayHaveConverse (bwd : NameHashSet) (o : Origin) : Bool :=
+  match o with
+  | .decl n _ false => bwd.contains n
+  | _ => true
+
+/-- `es.foldl addSimpEntry d` (`tree := true`) or `es.foldl addSimpEntryNoTree d` (`tree := false`),
+without the converse lookups that cannot succeed. -/
+private def addSimpEntriesFold (d : SimpTheorems) (es : Array SimpEntry) (tree : Bool) : SimpTheorems :=
+  if !d.lemmaNames.isEmpty then
+    if tree then es.foldl addSimpEntry d else es.foldl addSimpEntryNoTree d
+  else
+    let bwd := backwardNames es
+    es.foldl (init := d) fun d e =>
+      match e with
+      | .thm t =>
+        if mayHaveConverse bwd t.origin then
+          if tree then d.addSimpTheorem t else addSimpTheoremNoTree d t
+        else if tree then
+          if t.post then
+            { d with post := d.post.insertKeyValue t.keys t, lemmaNames := d.lemmaNames.insert t.origin }
+          else
+            { d with pre := d.pre.insertKeyValue t.keys t, lemmaNames := d.lemmaNames.insert t.origin }
+        else
+          { d with lemmaNames := d.lemmaNames.insert t.origin }
+      | e => if tree then d.addSimpEntry e else addSimpEntryNoTree d e
+
 /-- The shard of a root key. -/
 @[inline] private def shardOf (k : DiscrTree.Key) (numShards : Nat) : Nat :=
   (hash k).toNat % numShards
@@ -828,12 +875,14 @@ private def timed {β : Type} (f : Unit → β) : IO (β × Nat × Nat) := do
 def addSimpEntriesPar (d : SimpTheorems) (es : Array SimpEntry) (numThreads : Nat) : IO SimpTheorems := do
   -- small sets (all but the main `simp` set): the sequential fold is cheaper than 10 task spawns
   -- competing with the other extensions' tasks (measured 8-50 ms of wall per tiny set at `-j 8`)
+  let skipConverse ← ParallelImport.envEnabled "LEAN_SIMPSET_SKIP_CONVERSE"
   if es.size < 4096 && (← ParallelImport.envNat? "LEAN_IMPORT_CHECK").getD 0 == 0 then
-    return es.foldl addSimpEntry d
+    return if skipConverse then addSimpEntriesFold d es (tree := true) else es.foldl addSimpEntry d
   let numShards := max 1 (min numThreads 8)
   let dbg ← ParallelImport.debugEnabled
   let t0 ← IO.monoNanosNow
-  let restTask ← IO.asTask (prio := .default) (timed fun _ => es.foldl addSimpEntryNoTree d)
+  let restTask ← IO.asTask (prio := .default) (timed fun _ =>
+    if skipConverse then addSimpEntriesFold d es (tree := false) else es.foldl addSimpEntryNoTree d)
   let skelTask ← IO.asTask (prio := .default) (timed fun _ => buildSkeleton d es)
   let shardTasks ← (Array.range numShards).mapM fun j =>
     IO.asTask (prio := .default) (timed fun _ => buildTreeShard d es numShards j)
