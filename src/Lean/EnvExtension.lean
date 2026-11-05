@@ -48,6 +48,7 @@ def registerSimplePersistentEnvExtension {α σ : Type} [Inhabited σ] (descr : 
     name            := descr.name,
     mkInitial       := pure ([], descr.addImportedFn #[]),
     addImportedFn   := fun as => pure ([], descr.addImportedFn as),
+    parallelImport  := true, -- lean-perf: `descr.addImportedFn` is pure by type
     addEntryFn      := fun s e => match s with
       | (entries, s) => (e::entries, descr.addEntryFn s e),
     exportEntriesFnEx env s := match descr.exportEntriesFnEx? with
@@ -155,6 +156,7 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
     logWrites       := logWrites,
     mkInitial       := pure {}
     addImportedFn   := fun _ => pure {}
+    parallelImport  := true -- lean-perf
     addEntryFn      := fun s (n, v) => s.insert n v
     exportEntriesFnEx env s := exportEntriesFn env s
     asyncMode

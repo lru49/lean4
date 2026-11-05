@@ -589,7 +589,7 @@ static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** beg
 /* Arrays with more children than this are split into `MARK_PERSISTENT_CHUNK`-sized ranges shared with
    the other workers (the environment's constant map is a single array of ~2M buckets). */
 #define MARK_PERSISTENT_SPLIT 4096
-#define MARK_PERSISTENT_CHUNK 1024
+#define MARK_PERSISTENT_CHUNK 256
 
 template<bool Par>
 static inline void mark_persistent_expand(object * o, std::vector<object*> & todo, mark_persistent_pool * pool) {
@@ -689,7 +689,7 @@ static void mark_persistent_pool_push(mark_persistent_pool * pool, object ** beg
    when the pool runs low: a wide, shallow trie such as a `PersistentHashMap` or `DiscrTree` keeps the
    depth-first stack small although the remaining work is large, so the stack size itself is no
    trigger. The older entries are the higher-level siblings, i.e. the largest subtrees. */
-#define MARK_PERSISTENT_DONATE_EVERY 512
+#define MARK_PERSISTENT_DONATE_EVERY 256
 static void mark_persistent_pool_donate(mark_persistent_pool * pool, std::vector<object*> & todo) {
     if (todo.size() < 2) return;
     unique_lock<mutex> lock(pool->m);
@@ -1113,6 +1113,10 @@ class task_manager {
             if (v != nullptr && imp->m_keep_alive) {
                 lean_dec_ref((lean_object*)t);
             }
+            /* lean-perf: mark the result MT here, outside the task manager lock. `resolve_core` marks
+               it again under the lock, which is then a no-op; a large result (e.g. an imported
+               constant-map shard) no longer serializes every other task completion. */
+            if (v != nullptr) mark_mt(v);
             lock.lock();
         }
         lean_assert(imp);
@@ -1318,6 +1322,48 @@ static task_manager * g_task_manager = nullptr;
 
 static unsigned get_num_std_workers() {
     return g_task_manager ? g_task_manager->get_max_std_workers() : 0;
+}
+
+/* lean-perf: `Lean.getNumStdWorkers : BaseIO Nat` (BaseIO externs return the value directly) */
+extern "C" LEAN_EXPORT lean_obj_res lean_io_get_num_std_workers() {
+    return lean_unsigned_to_nat(get_num_std_workers());
+}
+
+/* lean-perf: `Lean.ParallelImport.markPersistentSeq (a : α) : BaseIO α`: the single-threaded walk, for
+   use inside tasks (the result is then neither marked MT on task completion nor walked again by the
+   final `markPersistent` of the environment). */
+extern "C" LEAN_EXPORT lean_obj_res lean_runtime_mark_persistent_seq(lean_obj_arg a) {
+    mark_persistent_seq(a);
+    return a;
+}
+
+/* lean-perf: `Lean.ParallelImport.gatherBuckets`: result[i] := arrs[i & (2^log2k - 1)][i >> log2k] */
+extern "C" LEAN_EXPORT lean_obj_res lean_import_gather_buckets(b_lean_obj_arg arrs, b_lean_obj_arg b, b_lean_obj_arg log2k) {
+    size_t n = lean_unbox(b);
+    unsigned sh = lean_unbox(log2k);
+    size_t mask = ((size_t)1 << sh) - 1;
+    lean_object * r = lean_alloc_array(n, n);
+    lean_object ** out = lean_array_cptr(r);
+    auto gather = [&](size_t lo, size_t hi) {
+        for (size_t i = lo; i < hi; i++) {
+            lean_object * inner = lean_array_get_core(arrs, i & mask);
+            lean_object * o = lean_array_get_core(inner, i >> sh);
+            lean_inc(o);
+            out[i] = o;
+        }
+    };
+    unsigned nt = mark_persistent_num_threads();
+    if (nt <= 1 || n < 65536) {
+        gather(0, n);
+    } else {
+        size_t chunk = (n + nt - 1) / nt;
+        std::vector<std::unique_ptr<lthread>> threads;
+        for (unsigned t = 1; t < nt; t++)
+            threads.push_back(std::make_unique<lthread>([&, t]() { gather(t * chunk, std::min(n, (t + 1) * chunk)); }));
+        gather(0, std::min(n, chunk));
+        for (auto & th : threads) th->join();
+    }
+    return r;
 }
 
 extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {

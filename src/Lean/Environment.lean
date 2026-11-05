@@ -1965,6 +1965,8 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   -/
   exportEntriesFn : Environment → σ → OLeanEntries (Array α)
   statsFn         : σ → Format
+  /-- See `PersistentEnvExtensionDescrCore.parallelImport`. -/
+  parallelImport  : Bool := false
 
 instance {α σ} [Inhabited σ] : Inhabited (PersistentEnvExtensionState α σ) :=
   ⟨{importedEntries := #[], state := default }⟩
@@ -2061,6 +2063,14 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   trackGen          : Bool := false
   /-- See `EnvExtension.logWrites`. -/
   logWrites         : Bool := false
+  /--
+  lean-perf: `addImportedFn` is a pure function of its entries (it does not read the environment or
+  any other extension's state and has no side effects), so `finalizeImport` may run it on another
+  thread, concurrently with the other such extensions. Set by the registration helpers whose
+  descriptor types enforce this (`registerSimplePersistentEnvExtension`,
+  `registerSimpleScopedEnvExtension`, `mkMapDeclarationExtension`, `mkTagDeclarationExtension`).
+  -/
+  parallelImport    : Bool := false
 
 attribute [inherit_doc PersistentEnvExtension.exportEntriesFn]
   PersistentEnvExtensionDescrCore.exportEntriesFnEx
@@ -2102,7 +2112,8 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     addImportedFn   := descr.addImportedFn,
     addEntryFn      := descr.addEntryFn,
     exportEntriesFn := descr.exportEntriesFnEx,
-    statsFn         := descr.statsFn
+    statsFn         := descr.statsFn,
+    parallelImport  := descr.parallelImport
   }
   persistentEnvExtensionsRef.modify fun pExts => pExts.push (unsafeCast pExt)
   return pExt
@@ -2330,25 +2341,128 @@ set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_run_init_attrs"]
 private opaque runInitAttrs (env : Environment) (opts : Options) : IO Unit
 
+/-!
+lean-perf (perf/parallel-import): parallel construction of the imported constant maps and parallel
+initialization of pure persistent extension states. Design and invariants:
+docs/levers/L01b-parallel-import.md of the lean-perf repository.
+
+Thread budget: the task manager's worker count (`lean -j`), capped by `LEAN_IMPORT_THREADS`.
+`LEAN_IMPORT_PAR_CONSTMAP=0` / `LEAN_IMPORT_PAR_EXTS=0` disable the two parts; `LEAN_IMPORT_CHECK=1`
+also runs the sequential constant-map construction and verifies that the parallel result is
+structurally identical (same bucket arrays, same association lists).
+-/
+
+/-- Worker budget of the task manager (`lean -j`, `LEAN_NUM_THREADS`); 0 when there is none. -/
+@[extern "lean_io_get_num_std_workers"] opaque getNumStdWorkers : BaseIO Nat
+
+namespace ParallelImport
+open Std.DHashMap.Internal (AssocList scrambleHash)
+
+/-- A bucket of a `Std.HashMap Name α`. -/
+abbrev Bucket (α : Type) : Type := AssocList Name (fun _ => α)
+
+/-- Decimal parse (`String.toNat?` is not available in this module's prelude). -/
+private def parseNat? (s : String) : Option Nat :=
+  if s.isEmpty then none
+  else s.foldl (init := some 0) fun acc c => acc.bind fun n =>
+    if c.val ≥ 48 && c.val ≤ 57 then some (n * 10 + (c.toNat - 48)) else none
+
+def envNat? (var : String) : BaseIO (Option Nat) := do
+  return (← IO.getEnv var).bind parseNat?
+
+/-- `<var>=0` disables a part; anything else (or unset) keeps it enabled. -/
+def envEnabled (var : String) : BaseIO Bool := do
+  return (← envNat? var).getD 1 != 0
+
+/-- `result[i] := arrs[i &&& (2^log2k - 1)][i >>> log2k]` for `i < b`: interleaves the shards' bucket
+arrays into the bucket array of the final map. -/
+@[extern "lean_import_gather_buckets"]
+opaque gatherBuckets {α : Type} (arrs : @& Array (Array α)) (b : @& Nat) (log2k : @& Nat) : Array α
+
+/-- `Runtime.markPersistent` with the single-threaded walk; used inside tasks so that their results
+are neither marked MT on completion nor walked again by the environment's final `markPersistent`. -/
+@[extern "lean_runtime_mark_persistent_seq"]
+unsafe def markPersistentSeq (a : α) : BaseIO α := return a
+
+def debugEnabled : BaseIO Bool := do
+  return (← envNat? "LEAN_IMPORT_DEBUG").getD 0 != 0
+
+def elapsedMs (t0 t1 : Nat) : String :=
+  let us := (t1 - t0) / 1000
+  s!"{us / 1000}.{(us % 1000) / 100} ms"
+
+/-- Threads for the import phase: `min (worker budget) LEAN_IMPORT_THREADS cap`, at least 1. -/
+def numThreads (cap : Nat := 8) : BaseIO Nat := do
+  let n ← getNumStdWorkers
+  let n := match (← envNat? "LEAN_IMPORT_THREADS") with
+    | some k => min n k
+    | none => n
+  return max 1 (min n cap)
+
+end ParallelImport
+
 private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
   let extGens ← EnvExtension.ensureGensArraySize env.base.private.extGens
   return env.modifyCheckedAsync ({ · with extensions := exts, extGens })
 
-private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options) : IO Environment := do
-  loop 0 env
+/-- lean-perf: the pending `addImportedFn` task of a `parallelImport` extension (state, start, end). -/
+private abbrev ExtTask := Task (Except IO.Error (EnvExtensionState × Nat × Nat))
+
+private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options)
+    (par : Bool := false) : IO Environment := do
+  let tasks ← if par then spawnTasks env 0 #[] else pure #[]
+  loop 0 env tasks
 where
-  loop (i : Nat) (env : Environment) : IO Environment := do
+  /-- lean-perf: spawns the `addImportedFn` of every `parallelImport` extension with index `≥ start` on
+  the current environment: such a function is pure in its imported entries (see
+  `PersistentEnvExtensionDescrCore.parallelImport`), so it does not observe which other extension
+  states are already finalized. Called at the start and after `setImportedEntries` has supplied the
+  entries of extensions registered by `runInitAttrs`. -/
+  spawnTasks (env : Environment) (start : Nat) (tasks : Array (Option ExtTask)) : IO (Array (Option ExtTask)) := do
+    let pExtDescrs ← persistentEnvExtensionsRef.get
+    let mut tasks := tasks
+    for i in [start:pExtDescrs.size] do
+      let d := pExtDescrs[i]!
+      if d.parallelImport then
+        let s := d.toEnvExtension.getState (asyncMode := .sync) env
+        let t ← IO.asTask (prio := .default) (do
+          let ta ← IO.monoNanosNow
+          let st : EnvExtensionState ← d.addImportedFn s.importedEntries { env := env, opts := opts }
+          -- `par` implies `leakEnv`: the state ends up persistent anyway, do it on the task's thread
+          let st : EnvExtensionState ← unsafe (ParallelImport.markPersistentSeq st : BaseIO EnvExtensionState)
+          let tb ← IO.monoNanosNow
+          pure (st, ta, tb) : IO (EnvExtensionState × Nat × Nat))
+        tasks := tasks.push (some t)
+      else
+        tasks := tasks.push none
+    return tasks
+  loop (i : Nat) (env : Environment) (tasks : Array (Option ExtTask)) : IO Environment := do
     -- Recall that the size of the array stored `persistentEnvExtensionRef` may increase when we import user-defined environment extensions.
     let pExtDescrs ← persistentEnvExtensionsRef.get
     if h : i < pExtDescrs.size then
       let extDescr := pExtDescrs[i]
+      if let some (some t) := tasks[i]? then
+        -- lean-perf: state computed on a task; a `parallelImport` extension registers no extensions
+        -- or attributes, so the growth check below is not needed here.
+        let (newState, ta, tb) ← IO.ofExcept t.get
+        let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
+        let env := extDescr.toEnvExtension.setState (asyncMode := .sync) (log := .unlogged) env
+          { s with state := newState }
+        if (← ParallelImport.debugEnabled) && tb - ta ≥ 2000000 then
+          IO.eprintln s!"[par-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs ta tb} (task)"
+        return (← loop (i + 1) env tasks)
       -- Use `sync` to avoid `async` checks; there is only one environment branch at this point
       -- anyway.
       let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
       let prevSize := (← persistentEnvExtensionsRef.get).size
       let prevAttrSize ← getNumBuiltinAttributes
+      let t0 ← IO.monoNanosNow
       let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+      if par && (← ParallelImport.debugEnabled) then
+        let t1 ← IO.monoNanosNow
+        if t1 - t0 ≥ 2000000 then
+          IO.eprintln s!"[seq-ext] {i} {extDescr.name}: {ParallelImport.elapsedMs t0 t1}"
       -- unlogged: nothing has been recorded against this environment yet
       let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) (log := .unlogged) env
         { s with state := newState }
@@ -2358,6 +2472,7 @@ where
         -- extensions further down in `pExtDescrs` so they can access initialized declarations.
         runInitAttrs env opts
       env ← ensureExtensionsArraySize env
+      let mut tasks := tasks
       if (← persistentEnvExtensionsRef.get).size > prevSize || (← getNumBuiltinAttributes) > prevAttrSize then
         -- This branch is executed when `pExtDescrs[i]` is the extension associated with the `init` attribute, and
         -- a user-defined persistent extension is imported.
@@ -2365,7 +2480,10 @@ where
         env := env.setCheckedSync { env.base.private with extensions := (← setImportedEntries env.base.private.extensions mods prevSize) }
         -- See comment at `updateEnvAttributesRef`
         env ← updateEnvAttributes env
-      loop (i + 1) env
+        -- lean-perf: the new extensions now have their imported entries
+        if par then
+          tasks ← spawnTasks env prevSize tasks
+      loop (i + 1) env tasks
     else
       return env
 
@@ -2664,6 +2782,272 @@ where
       p := body
     p.isProp
 
+namespace ParallelImport
+open Std.DHashMap.Internal (AssocList scrambleHash)
+
+/-- The bits of a name's hash that determine its bucket in any `Std.HashMap` keyed by `Name`
+(`mkIdx` masks the scrambled hash with `buckets.size - 1`, a power of two). -/
+@[inline] def nameBits (n : Name) : UInt32 := (scrambleHash (hash n)).toUInt32
+
+/-- Number of buckets of `Std.HashMap.emptyWithCapacity capacity`. -/
+def numBuckets (capacity : Nat) : Nat := (capacity * 4 / 3).nextPowerOfTwo
+
+/--
+Index pass over the modules `lo ≤ modIdx < hi`: for every module the `nameBits` of its constants
+followed by those of its IR `extraConstNames` (positions `≥ constNames.size`), and for every shard the
+`(modIdx, position)` pairs that belong to it, in scan order. One cache miss per name, paid once.
+-/
+private def indexRange (moduleData irData : Array ModuleData) (lo hi k : Nat) (mask : UInt32) :
+    Array (Array UInt32) × Array (Array UInt32) := Id.run do
+  let mut hs : Array (Array UInt32) := Array.mkEmpty (hi - lo)
+  let mut per : Array (Array UInt32) := Array.replicate k #[]
+  for modIdx in [lo:hi] do
+    if h : modIdx < moduleData.size then
+      let names := moduleData[modIdx].constNames
+      let extra := if h' : modIdx < irData.size then irData[modIdx].extraConstNames else #[]
+      let mut bits : Array UInt32 := Array.mkEmpty (names.size + extra.size)
+      for n in names do
+        let b := nameBits n
+        bits := bits.push b
+        per := per.modify (b &&& mask).toNat fun a => (a.push modIdx.toUInt32).push bits.size.toUInt32
+      for n in extra do
+        let b := nameBits n
+        bits := bits.push b
+        per := per.modify (b &&& mask).toNat fun a => (a.push modIdx.toUInt32).push bits.size.toUInt32
+      hs := hs.push bits
+  return (hs, per)
+
+/-- `indexRange` over all modules on `numTasks` tasks (module ranges): `(hashes, index)` with
+`index[t][j]` the pairs of range `t` that shard `j` processes (ranges in module order). The pair
+positions are stored as `bits.size` after the push, i.e. `position + 1`. -/
+def computeIndex (moduleData irData : Array ModuleData) (numTasks k : Nat) (mask : UInt32) :
+    Array (Array UInt32) × Array (Array (Array UInt32)) :=
+  let numTasks := max 1 (min numTasks (moduleData.size / 64))
+  let chunk := (moduleData.size + numTasks - 1) / numTasks
+  let tasks := (Array.range numTasks).map fun t =>
+    Task.spawn fun _ => indexRange moduleData irData (t * chunk) (min moduleData.size ((t + 1) * chunk)) k mask
+  let parts := tasks.map (·.get)
+  (parts.foldl (init := Array.mkEmpty moduleData.size) fun acc p => acc ++ p.1, parts.map (·.2))
+
+inductive DeferredKind where
+  /-- `subsumesInfo` needs the map (axiom/axiom pair): decided on the merged map. -/
+  | axiomPair (cinfoPrev : ConstantInfo)
+  /-- Neither direction of `subsumesInfo` holds: `throwAlreadyImported`. -/
+  | error
+
+structure Deferred where
+  /-- `modIdx <<< 32 ||| position`: decisions are replayed in scan order. -/
+  seq    : Nat
+  modIdx : Nat
+  cname  : Name
+  cinfo  : ConstantInfo
+  kind   : DeferredKind
+
+/-- The buckets `≡ shardIdx (mod 2^log2k)` of the two constant maps, plus the deferred decisions. -/
+structure Shard where
+  buckets    : Array (Bucket ConstantInfo)
+  size       : Nat
+  modBuckets : Array (Bucket ModuleIdx)
+  modSize    : Nat
+  deferred   : Array Deferred
+
+inductive Decision where
+  | replace | keep | defer | error
+
+/-- Upstream's `subsumesInfo cinfo cinfoPrev` (→ `replace`) / `subsumesInfo cinfoPrev cinfo` (→ `keep`)
+decision without the map; `defer` when both are axioms (upstream needs `isPropCheap`'s lookup). -/
+def decide (cinfo cinfoPrev : ConstantInfo) : Decision :=
+  if !(cinfo.name == cinfoPrev.name && cinfo.type == cinfoPrev.type &&
+      cinfo.levelParams == cinfoPrev.levelParams) then
+    .error
+  else
+    match cinfo, cinfoPrev with
+    | .thmInfo t₁, .thmInfo t₂ => if t₁.all == t₂.all then .replace else .error
+    | .thmInfo t₁, .axiomInfo a₂ => if t₁.all == [a₂.name] && !a₂.isUnsafe then .replace else .error
+    | .axiomInfo a₁, .thmInfo t₂ => if t₂.all == [a₁.name] && !a₁.isUnsafe then .keep else .error
+    | .axiomInfo _, .axiomInfo _ => .defer
+    | _, _ => .error
+
+/-- Processes the pairs `entries[2p], entries[2p+1]` (module, position + 1) of one index range for one
+shard, tail recursively, with exactly the operations the sequential loop performs on these buckets
+(`cons` for a new key, in-place `replace` for a subsuming duplicate; positions past `constNames`
+are IR `extraConstNames`, which only enter `const2ModIdx`). -/
+private partial def shardEntries (moduleData irData : Array ModuleData) (hashes : Array (Array UInt32))
+    (entries : Array UInt32) (m1 m2 sh : UInt32) (p : Nat)
+    (buckets : Array (Bucket ConstantInfo)) (modBuckets : Array (Bucket ModuleIdx))
+    (deferred : Array Deferred) (size modSize : Nat) :
+    Array (Bucket ConstantInfo) × Array (Bucket ModuleIdx) × Array Deferred × Nat × Nat :=
+  if h : p + 1 < entries.size then
+    let modIdx := entries[p].toNat
+    let i := entries[p + 1].toNat - 1
+    let data := moduleData[modIdx]!
+    let hbits := hashes[modIdx]![i]!
+    if h' : i < data.constNames.size then
+      let cname := data.constNames[i]
+      let cinfo := data.constants[i]!
+      let bi := ((hbits &&& m1) >>> sh).toNat
+      let bkt := buckets[bi]!
+      let (buckets, deferred, size) :=
+        match bkt.get? cname with
+        | none => (buckets.set! bi (.cons cname cinfo bkt), deferred, size + 1)
+        | some cinfoPrev =>
+          match decide cinfo cinfoPrev with
+          | .replace =>
+            -- make `bkt` unshared first so that `replace` works in place like upstream's `insert`
+            ((buckets.set! bi .nil).set! bi (bkt.replace cname cinfo), deferred, size)
+          | .keep => (buckets, deferred, size)
+          | .defer =>
+            (buckets, deferred.push { seq := (modIdx <<< 32) ||| i, modIdx, cname, cinfo, kind := .axiomPair cinfoPrev }, size)
+          | .error => (buckets, deferred.push { seq := (modIdx <<< 32) ||| i, modIdx, cname, cinfo, kind := .error }, size)
+      let bi := ((hbits &&& m2) >>> sh).toNat
+      let bkt := modBuckets[bi]!
+      let (modBuckets, modSize) :=
+        if bkt.contains cname then (modBuckets, modSize)
+        else (modBuckets.set! bi (.cons cname (modIdx : ModuleIdx) bkt), modSize + 1)
+      shardEntries moduleData irData hashes entries m1 m2 sh (p + 2) buckets modBuckets deferred size modSize
+    else
+      let cname := (irData[modIdx]!).extraConstNames[i - data.constNames.size]!
+      let bi := ((hbits &&& m2) >>> sh).toNat
+      let bkt := modBuckets[bi]!
+      let (modBuckets, modSize) :=
+        if bkt.contains cname then (modBuckets, modSize)
+        else (modBuckets.set! bi (.cons cname (modIdx : ModuleIdx) bkt), modSize + 1)
+      shardEntries moduleData irData hashes entries m1 m2 sh (p + 2) buckets modBuckets deferred size modSize
+  else
+    (buckets, modBuckets, deferred, size, modSize)
+
+/-- Builds shard `shardIdx` of `2^log2k` from its index lists (ranges in module order). -/
+def buildShard (moduleData irData : Array ModuleData) (hashes : Array (Array UInt32))
+    (index : Array (Array (Array UInt32))) (b1 b2 log2k shardIdx : Nat) : Shard := Id.run do
+  let m1 : UInt32 := (b1 - 1).toUInt32
+  let m2 : UInt32 := (b2 - 1).toUInt32
+  let sh := log2k.toUInt32
+  let mut buckets : Array (Bucket ConstantInfo) := Array.replicate (b1 >>> log2k) .nil
+  let mut modBuckets : Array (Bucket ModuleIdx) := Array.replicate (b2 >>> log2k) .nil
+  let mut deferred : Array Deferred := #[]
+  let mut size := 0
+  let mut modSize := 0
+  for part in index do
+    let (b, mb, d, sz, msz) :=
+      shardEntries moduleData irData hashes part[shardIdx]! m1 m2 sh 0 buckets modBuckets deferred size modSize
+    buckets := b
+    modBuckets := mb
+    deferred := d
+    size := sz
+    modSize := msz
+  return { buckets, size, modBuckets, modSize, deferred }
+
+/-- `Std.HashMap` from its raw parts. The well-formedness proof is omitted (`lcProof`): the parts are
+produced by the same operations `Std.HashMap` itself performs, bucket by bucket. -/
+unsafe def mkHashMapUnsafe (size : Nat) (buckets : Array (Bucket α)) : Std.HashMap Name α :=
+  ⟨⟨⟨size, buckets⟩, lcProof⟩⟩
+
+/-- The sequential (upstream) construction of `privateConstantMap` and `const2ModIdx`. -/
+def mkConstantMapsSeq (s : ImportState) (moduleData irData : Array ModuleData)
+    (numPrivateConsts numAllConsts : Nat) :
+    IO (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx) := do
+  let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numAllConsts)
+  let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts)
+  for h : modIdx in *...moduleData.size do
+    let data := moduleData[modIdx]
+    for cname in data.constNames, cinfo in data.constants do
+      match privateConstantMap.getThenInsertIfNew? cname cinfo with
+      | (cinfoPrev?, constantMap') =>
+        privateConstantMap := constantMap'
+        if let some cinfoPrev := cinfoPrev? then
+          -- Recall that the map has not been modified when `cinfoPrev? = some _`.
+          if subsumesInfo privateConstantMap cinfo cinfoPrev then
+            privateConstantMap := privateConstantMap.insert cname cinfo
+          else if !subsumesInfo privateConstantMap cinfoPrev cinfo then
+            throwAlreadyImported s const2ModIdx modIdx cname
+      const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+    if let some data := irData[modIdx]? then
+      for cname in data.extraConstNames do
+        const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+  return (privateConstantMap, const2ModIdx)
+
+private unsafe def sameList (eqv : α → α → Bool) : Bucket α → Bucket α → Bool
+  | .nil, .nil => true
+  | .cons k v t, .cons k' v' t' => k == k' && eqv v v' && sameList eqv t t'
+  | _, _ => false
+
+/-- Structural comparison of two maps' raw buckets (`LEAN_IMPORT_CHECK=1`). -/
+unsafe def sameRaw (eqv : α → α → Bool) (m₁ m₂ : Std.HashMap Name α) : Except String Unit := do
+  let r₁ := m₁.inner.inner
+  let r₂ := m₂.inner.inner
+  if r₁.size != r₂.size then throw s!"size {r₁.size} vs {r₂.size}"
+  if r₁.buckets.size != r₂.buckets.size then throw s!"buckets {r₁.buckets.size} vs {r₂.buckets.size}"
+  for i in *...r₁.buckets.size do
+    unless sameList eqv r₁.buckets[i]! r₂.buckets[i]! do
+      throw s!"bucket {i} differs"
+
+/-- Parallel construction of `privateConstantMap` and `const2ModIdx` on `numThreads` threads; the
+result is structurally identical to `mkConstantMapsSeq` for every import the latter accepts. -/
+def mkConstantMaps (s : ImportState) (moduleData irData : Array ModuleData) (numThreads : Nat)
+    (numPrivateConsts numAllConsts : Nat) (leakEnv : Bool) :
+    IO (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx) := do
+  let dbg ← debugEnabled
+  let t0 ← IO.monoNanosNow
+  let b1 := numBuckets numPrivateConsts
+  let b2 := numBuckets numAllConsts
+  let log2k := min (Nat.log2 numThreads) (min (Nat.log2 b1) (Nat.log2 b2))
+  let k := 1 <<< log2k
+  let mask : UInt32 := (1 <<< log2k.toUInt32) - 1
+  /- Spawning a task marks its closure MT, i.e. walks every captured object graph that is not yet
+     MT or persistent: for the 55k-entry module arrays that is 55k cold cache lines per spawn. With
+     `leakEnv` the arrays end up persistent anyway (`header.moduleData`), so mark them now and every
+     spawn stops at the array header. -/
+  let (moduleData, irData) ←
+    if leakEnv then unsafe markPersistentSeq (moduleData, irData) else pure (moduleData, irData)
+  let (hashes, index) := computeIndex moduleData irData (numThreads * 4) k mask
+  let (hashes, index) ←
+    if leakEnv then unsafe markPersistentSeq (hashes, index) else pure (hashes, index)
+  let t1 ← IO.monoNanosNow
+  let shards ← (Array.range k).mapM fun j => IO.asTask (prio := .default) do
+    let ts ← IO.monoNanosNow
+    let shard := buildShard moduleData irData hashes index b1 b2 log2k j
+    let tb ← IO.monoNanosNow
+    -- with `leakEnv` the shard's objects end up persistent anyway: do it here, on the task's thread
+    let shard ← if leakEnv then unsafe markPersistentSeq shard else pure shard
+    let te ← IO.monoNanosNow
+    pure (shard, ts, tb, te)
+  let shards ← shards.mapM fun t => IO.ofExcept t.get
+  let t2 ← IO.monoNanosNow
+  if dbg then
+    for (_, ts, tb, te) in shards, j in Array.range k do
+      IO.eprintln s!"[par-constmap]   shard {j}: start +{elapsedMs t1 ts}, build {elapsedMs ts tb}, persist {elapsedMs tb te}"
+  let shards := shards.map (·.1)
+  let size := shards.foldl (· + ·.size) 0
+  let modSize := shards.foldl (· + ·.modSize) 0
+  let buckets := gatherBuckets (shards.map (·.buckets)) b1 log2k
+  let modBuckets := gatherBuckets (shards.map (·.modBuckets)) b2 log2k
+  let mut privateConstantMap : Std.HashMap Name ConstantInfo := unsafe mkHashMapUnsafe size buckets
+  let const2ModIdx : Std.HashMap Name ModuleIdx := unsafe mkHashMapUnsafe modSize modBuckets
+  let t3 ← IO.monoNanosNow
+  if dbg then
+    IO.eprintln s!"[par-constmap] threads={numThreads} shards={k} consts={size} buckets={b1}: index {elapsedMs t0 t1}, shards {elapsedMs t1 t2}, gather {elapsedMs t2 t3}"
+  -- decisions upstream takes with the map-so-far, replayed in scan order on the merged map
+  let deferred := (shards.flatMap (·.deferred)).qsort (·.seq < ·.seq)
+  for d in deferred do
+    match d.kind with
+    | .error => throwAlreadyImported s const2ModIdx d.modIdx d.cname
+    | .axiomPair cinfoPrev =>
+      if subsumesInfo privateConstantMap d.cinfo cinfoPrev then
+        privateConstantMap := privateConstantMap.insert d.cname d.cinfo
+      else if !subsumesInfo privateConstantMap cinfoPrev d.cinfo then
+        throwAlreadyImported s const2ModIdx d.modIdx d.cname
+  if (← envNat? "LEAN_IMPORT_CHECK").getD 0 != 0 then
+    let (seqMap, seqMod) ← mkConstantMapsSeq s moduleData irData numPrivateConsts numAllConsts
+    match unsafe sameRaw (fun a b => ptrEq a b) privateConstantMap seqMap with
+    | .error e => throw <| IO.userError s!"LEAN_IMPORT_CHECK: constant map differs from sequential construction: {e}"
+    | .ok _ => pure ()
+    match unsafe sameRaw (fun (a b : ModuleIdx) => a.toNat == b.toNat) const2ModIdx seqMod with
+    | .error e => throw <| IO.userError s!"LEAN_IMPORT_CHECK: const2ModIdx differs from sequential construction: {e}"
+    | .ok _ => IO.eprintln s!"LEAN_IMPORT_CHECK: constant maps identical ({size} constants, {k} shards, {b1} buckets)"
+  return (privateConstantMap, const2ModIdx)
+
+end ParallelImport
+
 /--
 Constructs environment from `importModulesCore` results.
 
@@ -2691,25 +3075,14 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     if !mod.isExported then numPublicConsts else
       let some data := mod.publicModule? | numPublicConsts
       numPublicConsts + data.constants.size
-  let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts)
-  let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts)
   let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts)
-  for h : modIdx in *...moduleData.size do
-    let data := moduleData[modIdx]
-    for cname in data.constNames, cinfo in data.constants do
-      match privateConstantMap.getThenInsertIfNew? cname cinfo with
-      | (cinfoPrev?, constantMap') =>
-        privateConstantMap := constantMap'
-        if let some cinfoPrev := cinfoPrev? then
-          -- Recall that the map has not been modified when `cinfoPrev? = some _`.
-          if subsumesInfo privateConstantMap cinfo cinfoPrev then
-            privateConstantMap := privateConstantMap.insert cname cinfo
-          else if !subsumesInfo privateConstantMap cinfoPrev cinfo then
-            throwAlreadyImported s const2ModIdx modIdx cname
-      const2ModIdx := const2ModIdx.insertIfNew cname modIdx
-    if let some data := irData[modIdx]? then
-      for cname in data.extraConstNames do
-        const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+  -- lean-perf: the constant maps are built on `importThreads` shards (see `ParallelImport`)
+  let importThreads ← ParallelImport.numThreads
+  let (privateConstantMap, const2ModIdx) ←
+    if importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_CONSTMAP") then
+      ParallelImport.mkConstantMaps s moduleData irData importThreads numPrivateConsts (numPrivateConsts + numExtraConsts) leakEnv
+    else
+      ParallelImport.mkConstantMapsSeq s moduleData irData numPrivateConsts (numPrivateConsts + numExtraConsts)
 
   if isModule then
     for mod in modules.filter (·.isExported) do
@@ -2771,7 +3144,10 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
   if loadExts then
-    env ← finalizePersistentExtensions env moduleData opts
+    -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
+    -- already persistent then, so capturing it in task closures costs nothing)
+    let parExts := leakEnv && importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_EXTS")
+    env ← finalizePersistentExtensions env moduleData opts (par := parExts)
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.
