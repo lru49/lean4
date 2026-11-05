@@ -181,6 +181,19 @@ def fileName (p : FilePath) : Option String :=
   if lastPart.isEmpty || lastPart == "." || lastPart == ".." then none else some lastPart
 
 /--
+The byte offset of the last `'.'` among the first `i` bytes of `s`, if any: `'.'` is ASCII and an
+ASCII byte never occurs inside a multi-byte UTF-8 sequence, so this is the offset of the last `'.'`
+character, i.e. `(s.revFind? '.').map String.Pos.offset`, found by a plain backward byte scan.
+-/
+private def lastDotOffset? (s : String) : Nat → Option String.Pos.Raw
+  | 0 => none
+  | i + 1 =>
+    if h : (⟨i⟩ : String.Pos.Raw) < s.rawEndPos then
+      if s.getUTF8Byte ⟨i⟩ h == 46 then some ⟨i⟩ else lastDotOffset? s i
+    else
+      lastDotOffset? s i
+
+/--
 Extracts the stem (non-extension) part of `p.fileName`.
 
 If the filename contains multiple extensions, then only the last one is removed. Returns `none` if
@@ -194,7 +207,7 @@ Examples:
 -/
 def fileStem (p : FilePath) : Option String :=
   p.fileName.map fun fname =>
-    match fname.revFind? '.' |>.map String.Pos.offset with
+    match lastDotOffset? fname fname.utf8ByteSize with
     | some ⟨0⟩ => fname
     | some pos => String.Pos.Raw.extract fname 0 pos
     | none     => fname
@@ -213,7 +226,7 @@ Examples:
 -/
 def extension (p : FilePath) : Option String :=
   p.fileName.bind fun fname =>
-    match fname.revFind? '.' |>.map String.Pos.offset with
+    match lastDotOffset? fname fname.utf8ByteSize with
     | some 0   => none
     | some pos => some <| String.Pos.Raw.extract fname (pos + '.') fname.rawEndPos
     | none     => none
