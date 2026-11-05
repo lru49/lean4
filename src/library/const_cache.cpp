@@ -59,6 +59,9 @@ struct entry {
     lean_object * m_key;
     // the cached `Option` result object
     lean_object * m_val;
+    // `m_val` without its module index (`Option.map (·.1) m_val`), multi-threaded, so that
+    // `findConstCached?` hits return it without allocating; built on insertion
+    lean_object * m_val_fst;
     // next entry inserted into the same cache, for freeing
     entry * m_next;
 };
@@ -137,6 +140,7 @@ void cache_finalize(void * p) {
         entry * next = e->m_next;
         lean_dec(e->m_key);
         lean_dec(e->m_val);
+        lean_dec(e->m_val_fst);
         delete e;
         e = next;
     }
@@ -161,6 +165,18 @@ lean_external_class * get_cache_class() {
 }
 }
 
+/* `Option.map (·.1) r` for a lookup result `r : Option (α × Nat)` (borrowed), multi-threaded. */
+static lean_object * fst_of(b_lean_obj_arg r) {
+    if (lean_is_scalar(r))
+        return lean_box(0);
+    lean_object * v = lean_ctor_get(lean_ctor_get(r, 0), 0);
+    lean_inc(v);
+    lean_object * o = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(o, 0, v);
+    lean_mark_mt(o);
+    return o;
+}
+
 /* The module index stored in a lookup result `Option (α × Nat)`, plus one, or zero for `none`. */
 static inline lean_object * mod_idx_of(b_lean_obj_arg r) {
     if (lean_is_scalar(r))
@@ -170,12 +186,13 @@ static inline lean_object * mod_idx_of(b_lean_obj_arg r) {
 
 template <bool owned>
 static lean_obj_res find_cached_miss(cache & c, table * t, uint64_t h, size_t empty,
-        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg));
+        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg),
+        lean_object ** fst_out);
 
 /* Specialized per `owned` and inlined into `find_cached`: a shared out-of-line copy measurably slows
    down the hot path. With `idx_only`, returns `mod_idx_of` the result instead, so that hits need no
-   reference counting. */
-template <bool owned, bool idx_only>
+   reference counting. With `fst_only`, returns `fst_of` the result, which hits take from the entry. */
+template <bool owned, bool idx_only, bool fst_only = false>
 static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache & c,
         b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg)) {
     table * t = c.m_table.load();
@@ -193,12 +210,22 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
         if (e->m_root == root && lean_name_eq(e->m_key, n)) {
             if (idx_only)
                 return mod_idx_of(e->m_val);
+            if (fst_only) {
+                lean_inc(e->m_val_fst);
+                return e->m_val_fst;
+            }
             // the value is pinned by the entry and multi-threaded
             lean_inc(e->m_val);
             return e->m_val;
         }
     }
-    lean_object * r = find_cached_miss<owned>(c, t, h, empty, root, n, core);
+    if (fst_only) {
+        lean_object * f;
+        lean_object * r = find_cached_miss<owned>(c, t, h, empty, root, n, core, &f);
+        lean_dec(r);
+        return f;
+    }
+    lean_object * r = find_cached_miss<owned>(c, t, h, empty, root, n, core, nullptr);
     if (idx_only) {
         lean_object * i = mod_idx_of(r);
         lean_dec(r);
@@ -209,19 +236,29 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
 
 template <bool owned>
 static lean_obj_res find_cached_miss(cache & c, table * t, uint64_t h, size_t empty,
-        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg)) {
+        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg),
+        lean_object ** fst_out) {
     lean_inc(root); lean_inc(n);
     // Whether a lookup misses depends on other threads using the same cache, so the miss path must
-    // not count toward the heartbeats of the current thread.
+    // not count toward the heartbeats of the current thread (this includes building `fst`, which a
+    // hit takes from the entry).
     uint64_t heartbeats = get_num_heartbeats();
     lean_object * r = core(root, n);
+    lean_object * fst = fst_of(r);
     set_heartbeats(heartbeats);
+    if (fst_out) {
+        // one reference for the caller, one for the entry (released below if not inserted)
+        lean_inc(fst);
+        *fst_out = fst;
+    }
     // Marked even when it is not cached, so that the result is never exclusive: whether it is
     // cached depends on other threads, and an exclusive result would let the caller save
     // allocations, making heartbeats nondeterministic.
     lean_mark_mt(r);
-    if (empty == t->m_num_slots)
+    if (empty == t->m_num_slots) {
+        lean_dec(fst);
         return r;
+    }
     // Pin the key, and the root unless it owns the cache; hits only compare them. An owned cache
     // releases its keys from whichever thread frees it, so they must be multi-threaded.
     if (!owned)
@@ -229,13 +266,14 @@ static lean_obj_res find_cached_miss(cache & c, table * t, uint64_t h, size_t em
     else
         lean_mark_mt(n);
     lean_inc(n);
-    entry * ne = new entry{h, root, n, r, nullptr};
+    entry * ne = new entry{h, root, n, r, fst, nullptr};
     entry * expected = nullptr;
     if (!t->m_slots[empty].compare_exchange_strong(expected, ne)) {
         // lost an insertion race; drop the new entry rather than probing on
         if (!owned)
             lean_dec(root);
         lean_dec(n);
+        lean_dec(ne->m_val_fst);
         delete ne;
         return r;
     }
@@ -251,14 +289,14 @@ static lean_obj_res find_cached_miss(cache & c, table * t, uint64_t h, size_t em
     return r;
 }
 
-template <bool idx_only>
+template <bool idx_only, bool fst_only = false>
 static lean_obj_res find_cached(b_lean_obj_arg opt, b_lean_obj_arg root, b_lean_obj_arg n,
         lean_object * (*core)(lean_obj_arg, lean_obj_arg)) {
     if (!lean_is_scalar(opt)) {
         cache * c = static_cast<cache *>(lean_get_external_data(lean_ctor_get(opt, 0)));
-        return find_cached_in<true, idx_only>(*c, root, n, core);
+        return find_cached_in<true, idx_only, fst_only>(*c, root, n, core);
     }
-    return find_cached_in<false, idx_only>(g_global_cache, root, n, core);
+    return find_cached_in<false, idx_only, fst_only>(g_global_cache, root, n, core);
 }
 
 /* ImportedConsts.findConstEntryCachedImpl (cache? : @& Option LookupCache)
@@ -273,6 +311,13 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_extra_consts_find_entry_cached(
         b_lean_obj_arg cache, b_lean_obj_arg root, b_lean_obj_arg n) {
     return find_cached<false>(cache, root, n, lean_imported_extra_consts_find_entry_core);
+}
+
+/* ImportedConsts.findConstCachedImpl (cache? : @& Option LookupCache)
+     (t : @& ImportedConsts ConstantInfo) (n : @& Name) : Option ConstantInfo */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_cached(
+        b_lean_obj_arg cache, b_lean_obj_arg root, b_lean_obj_arg n) {
+    return find_cached<false, true>(cache, root, n, lean_imported_consts_find_entry_core);
 }
 
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(
