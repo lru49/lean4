@@ -85,7 +85,94 @@ extern "C" LEAN_EXPORT obj_res lean_replace_expr(b_obj_arg f, b_obj_arg e) {
     return r.steal();
 }
 
-extern "C" object * lean_level_instantiate_params(obj_arg u, obj_arg ps, obj_arg us);
+/* Native port of the Lean-side `Level.substParams` with `Level.getParamSubst` (src/Lean/Level.lean), used by
+   `Expr.instantiateLevelParams` below; it previously called the exported `Level.instantiateParams` for every
+   level that is neither parameter-free nor a parameter (a cross-module call, a closure for `getParamSubst`,
+   reference-count traffic on the parameter lists). Every case mirrors the Lean definition, including the
+   cheap simplifications of `mkLevelMax'` / `mkLevelIMax'` (applied when a child changed) and `simpLevelMax'` /
+   `simpLevelIMax'` (applied with the original node as default when no child changed), so the result is the
+   same level, with the same sharing. `==` on levels is `lean_level_eq` on both sides. */
+namespace level_subst {
+// `Level.isExplicit`: `zero`, or `succ u` with `u` free of metavariables and parameters and explicit
+static bool sp_is_explicit(level const & l) {
+    level const * p = &l;
+    while (is_succ(*p)) {
+        level const & c = succ_of(*p);
+        if (has_mvar(c) || has_param(c)) return false;
+        p = &c;
+    }
+    return is_zero(*p);
+}
+static unsigned sp_get_offset(level const & l) {
+    unsigned k = 0;
+    level const * p = &l;
+    while (is_succ(*p)) { p = &succ_of(*p); k++; }
+    return k;
+}
+static level const & sp_get_level_offset(level const & l) {
+    level const * p = &l;
+    while (is_succ(*p)) p = &succ_of(*p);
+    return *p;
+}
+// `subsumes` inside `mkLevelMaxCore`
+static bool sp_subsumes(level const & u, level const & v) {
+    if (sp_is_explicit(v) && sp_get_offset(u) >= sp_get_offset(v)) return true;
+    if (is_max(u)) return v == max_lhs(u) || v == max_rhs(u);
+    return false;
+}
+// `mkLevelMaxCore u v elseK`; `d` = the `elseK ()` result (`none`: `mkLevelMax u v`)
+static level sp_max_core(level const & u, level const & v, level const * d) {
+    if (u == v) return u;
+    if (is_zero(u)) return v;
+    if (is_zero(v)) return u;
+    if (sp_subsumes(u, v)) return u;
+    if (sp_subsumes(v, u)) return v;
+    if (sp_get_level_offset(u) == sp_get_level_offset(v))
+        return sp_get_offset(u) >= sp_get_offset(v) ? u : v;
+    return d ? *d : mk_max_core(u, v);
+}
+// `mkLevelIMaxCore u v elseK` (`Level.isNeverZero` = `is_not_zero`)
+static level sp_imax_core(level const & u, level const & v, level const * d) {
+    if (is_not_zero(v)) return sp_max_core(u, v, nullptr);
+    if (is_zero(v)) return v;
+    if (is_zero(u)) return v;
+    if (u == v) return u;
+    return d ? *d : mk_imax_core(u, v);
+}
+// `Level.substParams.go` with `s := getParamSubst ps us`
+static level sp_subst(level const & u, b_obj_arg ps0, b_obj_arg us0) {
+    switch (kind(u)) {
+    case level_kind::Zero: case level_kind::MVar:
+        return u;
+    case level_kind::Param: {
+        b_obj_arg ps = ps0;
+        b_obj_arg us = us0;
+        while (!lean_is_scalar(ps) && !lean_is_scalar(us)) {
+            if (lean_name_eq(lean_ctor_get(ps, 0), param_id(u).raw()))
+                return level(lean_ctor_get(us, 0), true);
+            ps = lean_ctor_get(ps, 1);
+            us = lean_ctor_get(us, 1);
+        }
+        return u;
+    }
+    case level_kind::Succ: {
+        if (!has_param(u)) return u;
+        level n = sp_subst(succ_of(u), ps0, us0);
+        return is_eqp(succ_of(u), n) ? u : mk_succ(n);
+    }
+    case level_kind::Max: case level_kind::IMax: {
+        if (!has_param(u)) return u;
+        level n1 = sp_subst(level_lhs(u), ps0, us0);
+        level n2 = sp_subst(level_rhs(u), ps0, us0);
+        bool same = is_eqp(level_lhs(u), n1) && is_eqp(level_rhs(u), n2);
+        if (is_max(u))
+            return sp_max_core(n1, n2, same ? &u : nullptr);
+        else
+            return sp_imax_core(n1, n2, same ? &u : nullptr);
+    }}
+    lean_unreachable();
+}
+}
 
 /* `Expr.instantiateLevelParams`: `replace_fn` with `Expr.instantiateLevelParamsCore.replaceFn`
    inlined, so that the traversal and the result are the same as with `Expr.replace`. Levels are
@@ -103,7 +190,7 @@ class instantiate_level_params_fn {
 
     level instantiate(level const & l) {
         // `Level.instantiateParams` returns a level without parameters unchanged and replaces a
-        // parameter by its `getParamSubst` value, so only the remaining levels need the call
+        // parameter by its `getParamSubst` value; the remaining levels go through `level_subst::sp_subst`
         if (!has_param(l))
             return l;
         if (is_param(l)) {
@@ -117,9 +204,7 @@ class instantiate_level_params_fn {
             }
             return l;
         }
-        lean_inc(m_ps);
-        lean_inc(m_us);
-        return level(lean_level_instantiate_params(l.to_obj_arg(), m_ps, m_us));
+        return level_subst::sp_subst(l, m_ps, m_us);
     }
 
     // Keep the level buffer out of the recursive traversal's stack frame.
