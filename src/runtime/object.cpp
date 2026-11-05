@@ -1152,7 +1152,10 @@ class task_manager {
     void resolve_core(unique_lock<mutex> & lock, lean_task_object * t, object * v) {
         mark_mt(v);
         t->m_value = v;
-        lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_relaxed);
+        /* lean-perf: release, so that a thread that sees `m_imp == nullptr` without the lock (the lock-free
+           fast paths of `deactivate_task` and `get_task_state`) also sees `m_value`. After this exchange
+           `t` itself is not dereferenced again by the task manager. */
+        lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_acq_rel);
         handle_finished(lock, t, imp);
         /* After the task has been finished and we propagated
            dependencies, we can release `imp` and keep just the value */
@@ -1288,6 +1291,17 @@ public:
     }
 
     void deactivate_task(lean_task_object * t) {
+        /* lean-perf: a finished task (`m_imp == nullptr`, published by `resolve_core` after `m_value`) is
+           no longer referenced by the task manager: free it without taking the global mutex. Dropping the
+           last reference to finished tasks is the common case (every `Task.map`/`bind`/`spawn` result
+           that has been read). */
+        if (t->m_imp.load(std::memory_order_acquire) == nullptr) {
+            object * v = t->m_value;
+            lean_assert(v != nullptr);
+            lean_dec(v);
+            free_task(t);
+            return;
+        }
         unique_lock<mutex> lock(m_mutex);
         if (object * v = t->m_value) {
             lean_assert(t->m_imp.load(std::memory_order_relaxed) == nullptr);
@@ -1302,6 +1316,8 @@ public:
     }
 
     void cancel(lean_task_object * t) {
+        if (t->m_imp.load(std::memory_order_acquire) == nullptr)
+            return; // finished: nothing to cancel (lean-perf: no lock needed)
         unique_lock<mutex> lock(m_mutex);
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
         if (imp)
@@ -1313,6 +1329,8 @@ public:
     }
 
     uint8_t get_task_state(lean_task_object * t) {
+        if (t->m_imp.load(std::memory_order_acquire) == nullptr)
+            return 2; // finished (lean-perf: no lock needed)
         unique_lock<mutex> lock(m_mutex);
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
         if (imp) {
