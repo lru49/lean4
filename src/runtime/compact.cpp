@@ -265,10 +265,27 @@ void * object_compactor::alloc(size_t sz) {
     return r;
 }
 
+/*
+  An object whose reference count is exactly one (single-threaded `1` or multi-threaded `-1`) is
+  referenced by at most one field of the object graph being compacted (every heap field holds a
+  counted reference), so it is reached at most once: its only parent is compacted at most once,
+  because a parent with several references is found in `m_obj_table` on every later visit, and the
+  same holds by induction up to the root. Recording such an object in `m_obj_table` is therefore
+  never used, and looking it up always misses; both are skipped. Objects without a reference count
+  (persistent, e.g. mmapped imports) are always recorded. Chained saves (`saveModuleDataParts`) keep
+  every part alive until the last save, so their counts include the references from all parts.
+  The buffer contents do not depend on this: a skipped entry is never queried.
+*/
+static inline bool compactor_single_ref(object * o) {
+    int rc = lean_internal_get_rc(o);
+    return rc == 1 || rc == -1;
+}
+
 object_offset object_compactor::save(object * o, object * new_o) {
     lean_assert(m_begin <= new_o && new_o < m_end);
     object_offset off = reinterpret_cast<object_offset>(reinterpret_cast<char*>(new_o) - reinterpret_cast<char*>(m_begin) + reinterpret_cast<size_t>(m_base_addr));
-    m_obj_table->insert(o, off);
+    if (!compactor_single_ref(o))
+        m_obj_table->insert(o, off);
     return off;
 }
 
@@ -286,6 +303,8 @@ object_offset object_compactor::to_offset(object * o) {
     if (lean_is_scalar(o)) {
         return o;
     } else {
+        if (compactor_single_ref(o))
+            return compact(o);
         if (object_offset const * v = m_obj_table->find(o)) {
             return *v;
         }
