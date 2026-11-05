@@ -733,6 +733,14 @@ LEAN_EXPORT void lean_dec_ref_cold(lean_object * o);
 // sync with tests/elab/rc_model.lean (`decRef`)
 static inline LEAN_ALWAYS_INLINE void lean_dec_ref(lean_object * o) {
     if (LEAN_LIKELY(lean_internal_get_rc(o) > 1)) {
+        /* Compiler-only fence (no instruction): accesses to `o` before this drop are not moved after the count
+           update. The runtime's release thread may free an object as soon as it sees the count drop (after a
+           process-wide `membarrier`, which orders the hardware side); see `defer_dec` in runtime/object.cpp. */
+#ifdef __cplusplus
+        std::atomic_signal_fence(std::memory_order_release);
+#else
+        atomic_signal_fence(memory_order_release);
+#endif
         lean_internal_sub_rc(o, 1);
     } else if (lean_internal_get_rc(o) != 0) {
         lean_dec_ref_cold(o);
