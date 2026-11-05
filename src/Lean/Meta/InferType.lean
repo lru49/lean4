@@ -290,6 +290,13 @@ because it overrides unrelated configurations.
     else
       withConfig (fun cfg => { cfg with beta := true, iota := true, zeta := true, zetaHave := true, zetaDelta := true, proj := .yesWithDelta, etaStruct := .all }) x
 
+/-- The recursion-depth check of `withIncRecDepth`, without entering the deeper context. -/
+@[inline] private def checkInferTypeLeafDepth : MetaM Unit := do
+  let curr ← MonadRecDepth.getRecDepth
+  let max  ← MonadRecDepth.getMaxRecDepth
+  if max != 0 && curr == max then
+    throwMaxRecDepthAt (← getRef)
+
 set_option compiler.ignoreBorrowAnnotation true in
 @[export lean_infer_type]
 def inferTypeImp (e : Expr) : MetaM Expr :=
@@ -308,7 +315,55 @@ def inferTypeImp (e : Expr) : MetaM Expr :=
     | .forallE ..    => checkInferTypeCache e (inferForallType e)
     | .lam ..        => checkInferTypeCache e (inferLambdaType e)
     | .letE ..       => checkInferTypeCache e (inferLambdaType e)
-  withIncRecDepth <| withInferTypeConfig (infer e)
+  -- Leaves whose type does not depend on the configuration or transparency (local and metavariable
+  -- declarations, literals, sorts, constants without universe arguments) keep only the depth-limit check.
+  match e with
+  | .fvar fvarId   => do checkInferTypeLeafDepth; inferFVarType fvarId
+  | .mvar mvarId   => do checkInferTypeLeafDepth; inferMVarType mvarId
+  | .const c []    => do checkInferTypeLeafDepth; inferConstType c []
+  | .lit v         => do checkInferTypeLeafDepth; return v.type
+  | .sort lvl      => do checkInferTypeLeafDepth; return mkSort (mkLevelSucc lvl)
+  | _ =>
+  -- Cacheable kinds under a configuration that `withInferTypeConfig` leaves unchanged: the cache is
+  -- consulted before entering the deeper recursion-depth context (a hit allocates no context).
+  if e.hasMVar || !isInferTypeCacheable e then
+    withIncRecDepth <| withInferTypeConfig (infer e)
+  else do
+    let ctx ← read
+    if !ctx.cacheInferType || !isInferTypeConfig ctx.config then
+      withIncRecDepth <| withInferTypeConfig (infer e)
+    else
+      checkInferTypeLeafDepth
+      let key ← mkExprConfigCacheKey e
+      let (cached?, exhausted) ← (← get).cache.inferType.findOrExhausted? key
+      match cached? with
+      | some type => return type
+      | none =>
+        withIncRecDepth do
+          Core.checkInterrupted
+          let type ← inferUncached e
+          if !type.hasMVar then
+            modifyInferTypeCache fun c => c.insert key type
+          else if exhausted then
+            modifyInferTypeCache fun c => c.erase key
+          return type
+where
+  /-- The kinds `infer` caches. -/
+  isInferTypeCacheable : Expr → Bool
+    | .const _ (_ :: _) | .proj .. | .app .. | .forallE .. | .lam .. | .letE .. => true
+    | _ => false
+  /-- `withInferTypeConfig` leaves the context unchanged under this configuration. -/
+  isInferTypeConfig (cfg : Config) : Bool :=
+    !cfg.transparency.lt .default && cfg.beta && cfg.iota && cfg.zeta && cfg.zetaHave && cfg.zetaDelta &&
+      cfg.proj == .yesWithDelta && cfg.etaStruct == .all
+  /-- The uncached computation `infer` runs for a cacheable kind. -/
+  inferUncached (e : Expr) : MetaM Expr :=
+    match e with
+    | .const c us    => inferConstType c us
+    | .proj n i s    => inferProjType n i s
+    | .app f ..      => inferAppType f.getAppFn e.getAppArgs
+    | .forallE ..    => inferForallType e
+    | _              => inferLambdaType e
 
 /--
 Return `LBool.true` if given level is always equivalent to universe level zero.
