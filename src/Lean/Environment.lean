@@ -1591,6 +1591,45 @@ def isGenTracked (ext : EnvExtension σ) : Bool :=
 private builtin_initialize envExtensionsRef : IO.Ref (Array (EnvExtension EnvExtensionState)) ← IO.mkRef #[]
 private builtin_initialize numTrackedExtsRef : IO.Ref Nat ← IO.mkRef 0
 
+/--
+Names of the environment extensions whose writes never change the result of a `Meta`-level computation
+(`whnf`, `inferType`, `isDefEq`, function information, type class resolution, instantiated constant
+types and values): bookkeeping that elaboration does not consult. A fixed list compared against
+`EnvExtension.name` (after removing a private prefix), so no layout, signature or initializer changes.
+-/
+private def metaCacheSafeExtNames : List Name :=
+  [`Lean.docStringExt, `Lean.versoDocStringExt, `Lean.inheritDocStringExt, `Lean.declRangeExt,
+   `Lean.extraModUses]
+
+/-- Every slot `i` of the two extension-state arrays is the same object, or is skipped (`skip i`: the caller
+compares it), or belongs to an extension in `metaCacheSafeExtNames`. -/
+private unsafe def extensionsSameExcept (oe ne : Array EnvExtensionState)
+    (exts : Array (EnvExtension EnvExtensionState)) (skip : Nat → Bool) : Bool :=
+  oe.size == ne.size && (List.range oe.size).all fun i =>
+    ptrEq oe[i]! ne[i]! || skip i ||
+      (i < exts.size && metaCacheSafeExtNames.contains (privateToUserName exts[i]!.name))
+
+end EnvExtension
+
+/--
+Whether the `Core`/`Meta` caches computed under `old` are valid under `new`, except for the extension
+slots selected by `skip`, which the caller must compare itself: the constant maps of both views are the
+very same objects, no constant was announced (`constGen`), and every other extension state that changed
+belongs to an extension elaboration never consults (`EnvExtension.metaCacheSafeExtNames`).
+-/
+unsafe def Environment.cachesValidExceptUnsafe (old new : Environment) (skip : Nat → Bool) : Bool :=
+  ptrEq old.base.private.constants new.base.private.constants &&
+  ptrEq old.base.public.constants new.base.public.constants &&
+  old.constGen == new.constGen &&
+  (let exts := unsafeBaseIO (EnvExtension.envExtensionsRef.get : BaseIO _)
+   EnvExtension.extensionsSameExcept old.base.private.extensions new.base.private.extensions exts skip &&
+   EnvExtension.extensionsSameExcept old.base.public.extensions new.base.public.extensions exts skip)
+
+@[implemented_by Environment.cachesValidExceptUnsafe, inherit_doc Environment.cachesValidExceptUnsafe]
+opaque Environment.cachesValidExcept (old new : Environment) (skip : Nat → Bool) : Bool
+
+namespace EnvExtension
+
 /-- Pads `gens` with initial generations for the generation-tracked extensions registered since. -/
 private def ensureGensArraySize (gens : Array Nat) : IO (Array Nat) := do
   let n ← numTrackedExtsRef.get
