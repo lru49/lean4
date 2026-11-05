@@ -6,6 +6,8 @@ Author: Leonardo de Moura
 */
 #include <vector>
 #include <memory>
+#include <cstdlib>
+#include <cstring>
 #include "runtime/alloc.h"
 #include "runtime/interrupt.h"
 #include "runtime/thread.h"
@@ -14,6 +16,64 @@ Author: Leonardo de Moura
 #include "util/alloc.h"
 
 namespace lean {
+/** \brief Set of pointer pairs already under comparison. Open addressing, linear probing, power-of-two capacity,
+    load factor <= 1/2, 32 inline slots (512 B) so the common case allocates nothing. The pointers are borrowed: both
+    expressions are held by the caller for the whole comparison, so no reference counting is needed. This replaces a
+    heap-allocated `std::unordered_set<std::pair<lean_object *, lean_object *>>` (one node allocation per shared pair). */
+class ptr_pair_set {
+    struct entry { lean_object * m_a; lean_object * m_b; };  // m_a == nullptr: empty
+    static constexpr size_t INLINE_CAP = 32;
+    entry   m_inline[INLINE_CAP];
+    entry * m_tab = nullptr;
+    size_t  m_mask = 0;
+    size_t  m_size = 0;
+
+    static size_t hash(lean_object * a, lean_object * b) {
+        uint64_t h = ((uint64_t)(uintptr_t)a >> 3) * 0x9E3779B97F4A7C15ull;
+        h ^= ((uint64_t)(uintptr_t)b >> 3) * 0xC2B2AE3D27D4EB4Full;
+        h ^= h >> 29;
+        h *= 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+        return (size_t)h;
+    }
+    void grow() {
+        size_t new_cap  = (m_mask + 1) * 2;
+        entry * new_tab = static_cast<entry *>(std::calloc(new_cap, sizeof(entry)));
+        if (new_tab == nullptr) lean_internal_panic_out_of_memory();
+        size_t new_mask = new_cap - 1;
+        for (size_t i = 0; i <= m_mask; i++) {
+            entry const & e = m_tab[i];
+            if (e.m_a == nullptr) continue;
+            size_t j = hash(e.m_a, e.m_b) & new_mask;
+            while (new_tab[j].m_a != nullptr) j = (j + 1) & new_mask;
+            new_tab[j] = e;
+        }
+        if (m_tab != m_inline) std::free(m_tab);
+        m_tab = new_tab; m_mask = new_mask;
+    }
+public:
+    ptr_pair_set() {}
+    ptr_pair_set(ptr_pair_set const &) = delete;
+    ptr_pair_set & operator=(ptr_pair_set const &) = delete;
+    ~ptr_pair_set() { if (m_tab != nullptr && m_tab != m_inline) std::free(m_tab); }
+    /** \brief Insert `(a, b)`; return true iff it was already present. */
+    bool check_and_insert(lean_object * a, lean_object * b) {
+        if (m_tab == nullptr) {
+            std::memset(m_inline, 0, sizeof(m_inline));
+            m_tab = m_inline; m_mask = INLINE_CAP - 1; m_size = 0;
+        } else if ((m_size + 1) * 2 > m_mask + 1) {
+            grow();
+        }
+        size_t i = hash(a, b) & m_mask;
+        while (true) {
+            entry & e = m_tab[i];
+            if (e.m_a == nullptr) { e.m_a = a; e.m_b = b; m_size++; return false; }
+            if (e.m_a == a && e.m_b == b) return true;
+            i = (i + 1) & m_mask;
+        }
+    }
+};
+
 /**
 \brief Functional object for comparing expressions.
 
@@ -22,24 +82,12 @@ binder information attached to lambda and Pi expressions
 */
 template<bool CompareBinderInfo>
 class expr_eq_fn {
-    struct key_hasher {
-        std::size_t operator()(std::pair<lean_object *, lean_object *> const & p) const {
-            return hash((size_t)p.first >> 3, (size_t)p.second >> 3);
-        }
-    };
-    typedef lean::unordered_set<std::pair<lean_object *, lean_object *>, key_hasher> cache;
-    cache * m_cache = nullptr;
+    ptr_pair_set m_cache;
     size_t m_counter = 0;
     bool check_cache(expr const & a, expr const & b) {
         if (!is_shared(a) || !is_shared(b))
             return false;
-        if (!m_cache)
-            m_cache = new cache();
-        std::pair<lean_object *, lean_object *> key(a.raw(), b.raw());
-        if (m_cache->find(key) != m_cache->end())
-            return true;
-        m_cache->insert(key);
-        return false;
+        return m_cache.check_and_insert(a.raw(), b.raw());
     }
     bool apply(expr const & a, expr const & b, bool root = false) {
         if (is_eqp(a, b))          return true;
@@ -114,7 +162,6 @@ class expr_eq_fn {
 public:
     expr_eq_fn() {}
     ~expr_eq_fn() {
-        if (m_cache) delete m_cache;
         if (m_counter > 0) add_heartbeats(m_counter);
     }
     bool operator()(expr const & a, expr const & b) { return apply(a, b, true); }
