@@ -175,10 +175,28 @@ private def tryTheoremCore (lhs : Expr) (xs : Array Expr) (bis : Array BinderInf
       return none
     r.addExtraArgs extraArgs
 
+/--
+lean-perf (cr): `let val ← thm.getValue; let type ← inferType val` with one constant lookup when the
+proof is a global constant (every `@[simp]` declaration). `inferType` of a constant `c us` is
+`instantiateTypeLevelParams (← getConstVal c) us` (not cached when `us` are fresh level metavariables),
+so this returns the same `val` and `type`, creating the same level metavariables in the same order;
+it skips the second `getConstVal` and `inferType`'s wrappers and cache probe.
+-/
+private def getValueAndType (thm : SimpTheorem) : MetaM (Expr × Expr) := do
+  if thm.proof.isConst && thm.levelParams.isEmpty && thm.proof.constLevels!.isEmpty then
+    let info ← getConstVal thm.proof.constName!
+    if info.levelParams.isEmpty then
+      return (thm.proof, ← instantiateTypeLevelParams info [])
+    else
+      let us ← info.levelParams.mapM fun _ => mkFreshLevelMVar
+      return (thm.proof.updateConst! us, ← instantiateTypeLevelParams info us)
+  else
+    let val ← thm.getValue
+    return (val, ← inferType val)
+
 def tryTheoremWithExtraArgs? (e : Expr) (thm : SimpTheorem) (numExtraArgs : Nat) : SimpM (Option Result) :=
   withNewMCtxDepth do
-    let val  ← thm.getValue
-    let type ← inferType val
+    let (val, type) ← getValueAndType thm
     let (xs, bis, type) ← forallMetaTelescopeReducing type
     let type ← whnf (← instantiateMVars type)
     let lhs := type.appFn!.appArg!
@@ -186,8 +204,7 @@ def tryTheoremWithExtraArgs? (e : Expr) (thm : SimpTheorem) (numExtraArgs : Nat)
 
 def tryTheorem? (e : Expr) (thm : SimpTheorem) : SimpM (Option Result) := do
   withNewMCtxDepth do
-    let val  ← thm.getValue
-    let type ← inferType val
+    let (val, type) ← getValueAndType thm
     let (xs, bis, type) ← forallMetaTelescopeReducing type
     let type ← whnf (← instantiateMVars type)
     let lhs := type.appFn!.appArg!
@@ -260,8 +277,7 @@ where
         checkSystem "simp"
         unless inErasedSet thm || (rflOnly && !(thm.rfl || (useBackward && thm.backwardRfl))) do
           let result? ← withNewMCtxDepth do
-            let val  ← thm.getValue
-            let type ← inferType val
+            let (val, type) ← getValueAndType thm
             let (xs, bis, type) ← forallMetaTelescopeReducing type
             let type ← whnf (← instantiateMVars type)
             let lhs := type.appFn!.appArg!
