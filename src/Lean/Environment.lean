@@ -2421,6 +2421,10 @@ def envNat? (var : String) : BaseIO (Option Nat) := do
 def envEnabled (var : String) : BaseIO Bool := do
   return (← envNat? var).getD 1 != 0
 
+/-- lean-perf (L02 race #2 probe, variant f): marks the values stored into global refs during initialization
+multi-threaded now (idempotent), before the import spawns any thread. -/
+@[extern "lean_runtime_flush_deferred_ref_marks"] opaque flushDeferredRefMarks : BaseIO Unit
+
 def debugEnabled : BaseIO Bool := do
   return (← envNat? "LEAN_IMPORT_DEBUG").getD 0 != 0
 
@@ -3164,6 +3168,9 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   -- the grouping of all modules' root-level children, ~35 ms for a Mathlib import), which the first
   -- constant lookup would otherwise pay on whichever thread makes it; forcing a thunk twice is safe
   -- (the runtime serializes it) and the value is the same.
+  -- lean-perf (L02 race #2 probe, variant f): no thread spawned by the import may read a single-threaded value
+  -- out of a global ref that initialization filled: flush the deferred marks first
+  ParallelImport.flushDeferredRefMarks
   let importThreads ← ParallelImport.numThreads
   let parConflicts := importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_CONFLICTS")
   unless parConflicts do

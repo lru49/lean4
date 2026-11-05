@@ -1381,6 +1381,14 @@ extern "C" LEAN_EXPORT lean_obj_res lean_io_get_num_std_workers() {
 /* lean-perf: `Lean.ParallelImport.markPersistentSeq (a : α) : BaseIO α`: the single-threaded walk, for
    use inside tasks (the result is then neither marked MT on task completion nor walked again by the
    final `markPersistent` of the environment). */
+/* lean-perf (L02 race #2 probe, variant f): `Lean.ParallelImport.flushDeferredRefMarks : BaseIO Unit` marks the values that
+   initialization stored into global refs multi-threaded NOW (idempotent), so that no thread the import spawns can read a
+   single-threaded value out of a global ref. */
+extern "C" LEAN_EXPORT lean_obj_res lean_runtime_flush_deferred_ref_marks(lean_obj_arg) {
+    flush_deferred_ref_marks();
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
 extern "C" LEAN_EXPORT lean_obj_res lean_runtime_mark_persistent_seq(lean_obj_arg a) {
     mark_persistent_seq(a);
     return a;
