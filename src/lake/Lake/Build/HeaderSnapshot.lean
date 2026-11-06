@@ -62,7 +62,36 @@ public structure Plan where
   loadArgs : Array String := #[]
   /-- The background save to spawn, if any. -/
   save? : Option IO.Process.SpawnArgs := none
+  /--
+  Inline save (`LAKE_HEADER_SNAPSHOT_INLINE=1`): the run itself writes the snapshot to the first
+  file (`--incr-header-save`, see `inlineArgs`), and `publishInline` moves it to the second.
+  -/
+  inline? : Option (FilePath × FilePath) := none
   deriving Inhabited
+
+/-- Extra Lean arguments of an inline save. -/
+public def Plan.inlineArgs (p : Plan) : Array String :=
+  match p.inline? with
+  | some (tmp, _) => #[s!"--incr-header-save={tmp}"]
+  | none => #[]
+
+/--
+Publishes an inline save (`ok`: the run succeeded and printed no message about its header) or
+discards it.
+-/
+public def Plan.publishInline (p : Plan) (ok : Bool) : BaseIO Unit := do
+  let some (tmp, fin) := p.inline? | return
+  discard <| (show IO Unit from do
+    if ok && (← tmp.pathExists) && (← (tmp.addExtension "deps").pathExists) then
+      IO.FS.rename (tmp.addExtension "deps") (fin.addExtension "deps")
+      IO.FS.rename tmp fin
+    else
+      removeFileIfExists tmp
+      removeFileIfExists (tmp.addExtension "deps")).toBaseIO
+
+/-- Whether inline saves are enabled (they need a `lean` whose `--incr-header-save` works on a full module). -/
+public def inlineEnabled : BaseIO Bool := do
+  return (← IO.getEnv "LAKE_HEADER_SNAPSHOT_INLINE") == some "1"
 
 /-- Lean arguments that do not change the post-header state, or only via the key. -/
 def isSafeArg (a : String) : Bool :=
@@ -111,6 +140,20 @@ public def nonEmptyLines (s : String) : List String :=
   let (cur, acc) := s.foldl (init := ("", ([] : List String))) fun (cur, acc) c =>
     if c == '\n' then ("", if cur.isEmpty then acc else cur :: acc) else (cur.push c, acc)
   (if cur.isEmpty then acc else cur :: acc).reverse
+
+/--
+The line number of a message `<pfx><line>:<col>: ...` (`none` if it does not start with `pfx`).
+Prelude-only, like `nonEmptyLines`.
+-/
+public def messageLine? (msg pfx : String) : Option Nat :=
+  if !msg.startsWith pfx then none else
+  let n := pfx.length
+  -- (index, digits so far, still reading digits)
+  let (_, acc, _) := msg.foldl (init := (0, (none : Option Nat), true)) fun (i, acc, reading) c =>
+    if i < n || !reading then (i + 1, acc, reading)
+    else if c.isDigit then (i + 1, some ((acc.getD 0) * 10 + (c.toNat - '0'.toNat)), true)
+    else (i + 1, acc, false)
+  acc
 
 /-- Number of lines of `s`. -/
 public def lineCount (s : String) : Nat :=
@@ -201,7 +244,7 @@ Never throws: any problem means "no snapshot".
 public def planWith
   (dir : FilePath) (srcText : String) (si : SetupInfo) (importHash : Hash)
   (leanArgs : Array String) (lean : FilePath) (leanGithash : String)
-  (env : Array (String × Option String)) (allowSave := true)
+  (env : Array (String × Option String)) (allowSave := true) (inlineTag? : Option String := none)
 : BaseIO Plan := do
   let r ← (go).toBaseIO
   match r with
@@ -237,6 +280,13 @@ where
     if (← snap.pathExists) && (← (snap.addExtension "deps").pathExists) then
       logEvent dir s!"load {key}"
       return {loadArgs := #[s!"--incr-load={snap}"]}
+    -- inline save: the module's own run writes the snapshot as a by-product (no extra import)
+    if (← inlineEnabled) && inlineTag?.isSome then
+      let capMb := (← envNat? "LAKE_HEADER_SNAPSHOT_MAX_MB").getD 8192
+      try evict dir (capMb * 1024 * 1024) catch _ => pure ()
+      logEvent dir s!"inline {key}"
+      let tmp := dir / s!"{key}.{inlineTag?.getD ""}.tmp.hsnap"
+      return {inline? := some (tmp, snap)}
     unless allowSave do return {}
     let minUses := (← envNat? "LAKE_HEADER_SNAPSHOT_MIN_USES").getD 2
     if prevUses + 1 < minUses then return {}
@@ -287,9 +337,9 @@ where
 public def plan
   (dir : FilePath) (srcText : String) (setup : ModuleSetup) (importHash : Hash)
   (leanArgs : Array String) (lean : FilePath) (leanGithash : String)
-  (env : Array (String × Option String)) (allowSave := true)
+  (env : Array (String × Option String)) (allowSave := true) (inlineTag? : Option String := none)
 : BaseIO Plan :=
-  planWith dir srcText (.ofSetup setup) importHash leanArgs lean leanGithash env allowSave
+  planWith dir srcText (.ofSetup setup) importHash leanArgs lean leanGithash env allowSave inlineTag?
 
 /-- Starts the planned background save (if any) without waiting for it. -/
 public def Plan.startSave (p : Plan) : BaseIO Unit := do
