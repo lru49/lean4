@@ -460,7 +460,9 @@ The `lean` command line driver. With `heldEnv? := some env` (lean-perf chain bat
 `lean --chain-server`), `env` is the imported environment of the file's header (see
 `Elab.runFrontendCore`), and the exit code is returned instead of exiting the process.
 -/
-def shellMainCore (args : List String) (opts : ShellOptions) (heldEnv? : Option Environment) :
+def shellMainCore (args : List String) (opts : ShellOptions) (heldEnv? : Option Environment)
+    -- lean-perf (prestart, lane DY): the setup to use in place of loading `opts.setupFileName?`
+    (setupOverride? : Option ModuleSetup := none) :
     IO UInt32 := do
   let opts := { opts with leanOpts := opts.leanOpts.mergeBy (fun _ _ v => v) (Internal.getOptionOverrides ()) }
   if opts.printPrefix then
@@ -533,7 +535,8 @@ def shellMainCore (args : List String) (opts : ShellOptions) (heldEnv? : Option 
       pure (contents.sliceFrom endLinePos).copy
     else
       pure contents
-  let setup? ← opts.setupFileName?.mapM ModuleSetup.load
+  let setup? ← if setupOverride?.isSome then pure setupOverride?
+    else opts.setupFileName?.mapM ModuleSetup.load
   let mainModuleName ←
     if let some setup := setup? then
       pure setup.name
@@ -589,8 +592,226 @@ where
         IO.FS.removeFile tempName
       throw e
 
+/-!
+lean-perf (prestart, lane DY): `LEAN_PRESTART_STDIN=1`.
+
+A build tool (Lake with `LAKE_PRESTART=1`) may start the `lean` of a module before the last of its
+imports are built, to overlap the process start, the setup parse and the import of everything else
+with the build of the late imports. Such a `lean` gets the environment variable
+`LEAN_PRESTART_STDIN=1`, a setup file without the late imports' `importArts` entries, and a pipe on
+stdin carrying one compact JSON object per line:
+
+* first `{"pending":[names],"imports":{name:[Import...]}}`: the late ("pending") modules, and
+  optionally the direct imports of each pending module in header order;
+* then one `{"ready":name,"arts":ImportArtifacts}` per pending module once its artifacts are final;
+* EOF or `{"abort":true}` before all pending modules are ready: exit code 3, no output written.
+
+The pending modules' files are never read before their `ready` line. Outputs are those of a plain
+`lean` with the complete setup:
+
+* speculative path: the PREFIX of the header before its first pending import, followed by that
+  pending import's direct imports if they are known (rule proposed by lane DT2), is imported with
+  `importModulesExtend` (mapped, initializers run, environment computed); when all pending modules
+  are ready, the held import is continued with the real header. The DFS module order of the
+  pre-import is by construction a prefix of the real header's (the late module and everything after
+  it in the header come later), so `importModulesExtend`'s prefix property holds and initializers
+  run in the real order; if the final continuation is refused anyway (e.g. a pending module's
+  `.olean` imports differ from the announced list), a plain `lean` with the complete setup is run in
+  a fresh process (`/proc/self/cmdline`, Linux only, so the speculative path is used only there);
+* otherwise (not eligible, see `chainServerPrepare` for the same conditions): wait for the ready
+  lines, then run the ordinary driver with the complete setup in this process.
+
+`LEAN_PRESTART_TIMEOUT_MS` (default 0 = none): a gap of more than this many milliseconds between
+lines on stdin is treated like EOF (exit 3). `LEAN_PRESTART_DEBUG` prints decisions on stderr.
+-/
+
+namespace Prestart
+
+/-- Exits with the prestart abort code (no output has been written). -/
+def abortExit : IO α := IO.Process.exit 3
+
+/-- Reads one line of `stdin` without its line terminator; `none` at EOF or when no line arrived
+within `budgetMs` milliseconds (0: no limit). -/
+def readLine (stdin : IO.FS.Stream) (budgetMs : Nat) : IO (Option String) := do
+  let t ← IO.asTask (prio := .dedicated) stdin.getLine
+  let r? ← if budgetMs == 0 then
+      some <$> IO.wait t
+    else do
+      let timer ← IO.asTask (prio := .dedicated) (IO.sleep budgetMs.toUInt32)
+      IO.waitAny [t.map (sync := true) some, timer.map (sync := true) fun _ => none]
+  let some r := r? | return none
+  let line ← IO.ofExcept r
+  if line.isEmpty then
+    return none
+  return some ((line.replace "\n" "").replace "\r" "")
+
+/-- A line after the first one. -/
+inductive Msg where
+  | ready (mod : Name) (arts : ImportArtifacts)
+  | abort
+
+def parseMsg (line : String) : Except String Msg := do
+  let j ← Json.parse line
+  if (j.getObjValAs? Bool "abort").toOption == some true then
+    return .abort
+  return .ready (← j.getObjValAs? Name "ready") (← j.getObjValAs? ImportArtifacts "arts")
+
+/-- Reads ready lines until every module of `pending` has artifacts in the result (starting from
+`acc`); exits with code 3 on EOF, timeout, abort or a malformed line. -/
+partial def waitReady (stdin : IO.FS.Stream) (budgetMs : Nat) (pending : Array Name)
+    (acc : NameMap ImportArtifacts) : IO (NameMap ImportArtifacts) := do
+  if pending.all acc.contains then
+    return acc
+  let some line ← readLine stdin budgetMs | abortExit
+  match parseMsg line with
+  | .ok (.ready n a) => waitReady stdin budgetMs pending (acc.insert n a)
+  | _ => abortExit
+
+/-- `setup` with the artifacts `arts` added. -/
+def complete (setup : ModuleSetup) (arts : NameMap ImportArtifacts) : ModuleSetup :=
+  { setup with importArts := arts.foldl (init := setup.importArts) fun m n a => m.insert n a }
+
+/-- The arguments of this process (without `argv[0]`), from `/proc/self/cmdline`. -/
+def procArgs : IO (Option (Array String)) := do
+  let b ← match (← (IO.FS.readBinFile "/proc/self/cmdline").toBaseIO) with
+    | .ok b => pure b
+    | .error _ => return none
+  let mut out : Array String := #[]
+  let mut start := 0
+  for i in 0...b.size do
+    if b[i]! == 0 then
+      out := out.push (String.fromUTF8Lossy (b.extract start i))
+      start := i + 1
+  if out.isEmpty then
+    return none
+  return some (out.extract 1 out.size)
+
+/-- Runs a plain `lean` (this executable) with the arguments `argv` of this process, the setup file
+replaced by one with `setup`, and without `LEAN_PRESTART_STDIN`; exits with its exit code. -/
+def execPlain (argv : Array String) (setupFile : System.FilePath) (setup : ModuleSetup) :
+    IO UInt32 := do
+  let (h, tmp) ← IO.FS.createTempFile
+  h.putStr (toJson setup).compress
+  h.flush
+  let sf := setupFile.toString
+  let args := argv.map fun a =>
+    if a == sf || a.endsWith ("=" ++ sf) then a.replace sf tmp.toString else a
+  let child ← IO.Process.spawn {
+    cmd := (← IO.appPath).toString, args, env := #[("LEAN_PRESTART_STDIN", none)]
+    stdin := .null }
+  let rc ← child.wait
+  try IO.FS.removeFile tmp catch _ => pure ()
+  IO.Process.exit rc.toUInt8
+
+end Prestart
+
+open Prestart in
+/-- The `lean` driver under `LEAN_PRESTART_STDIN=1`; see above. -/
+def prestartMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
+  let debug := (← IO.getEnv "LEAN_PRESTART_DEBUG").isSome
+  let budgetMs := ((← IO.getEnv "LEAN_PRESTART_TIMEOUT_MS").bind (·.toNat?)).getD 0
+  let stdin ← IO.getStdin
+  let some first ← readLine stdin budgetMs | abortExit
+  let .ok j := Json.parse first | abortExit
+  if (j.getObjValAs? Bool "abort").toOption == some true then
+    abortExit
+  let .ok pending := j.getObjValAs? (Array Name) "pending" | abortExit
+  let pendImports := (j.getObjValAs? (NameMap (Array Import)) "imports").toOption.getD {}
+  let setupE ← (opts.setupFileName?.mapM ModuleSetup.load).toBaseIO
+  -- the ordinary driver with the complete setup, after all ready lines
+  let plain (why : String) : IO UInt32 := do
+    if debug then IO.eprintln s!"[prestart] plain: {why}"
+    let arts ← waitReady stdin budgetMs pending {}
+    -- (`withImporting` of a refused pre-import cleared the flag that `lean` sets at startup)
+    unsafe enableInitializersExecution
+    match setupE with
+    | .ok (some setup) => shellMainCore args opts none (setupOverride? := some (complete setup arts))
+    | _ => shellMainCore args opts none
+  let .ok (some setup) := setupE | return ← plain "no setup"
+  let some setupFile := opts.setupFileName? | return ← plain "no setup"
+  let some argv ← procArgs | return ← plain "no /proc/self/cmdline"
+  let sf := setupFile.toString
+  unless argv.any (fun a => a == sf || a.endsWith ("=" ++ sf)) do
+    return ← plain "setup file not found in the arguments"
+  let leanOpts := opts.leanOpts.mergeBy (fun _ _ v => v) (Internal.getOptionOverrides ())
+  if opts.run || opts.incrSaveFileName?.isSome || opts.incrLoadFileName?.isSome ||
+      opts.incrHeaderSaveFileName?.isSome ||
+      -- (process options such as `-R`, `-j`, `-t`, `-D` apply to both paths alike: same process)
+      !setup.dynlibs.isEmpty || !setup.plugins.isEmpty then
+    return ← plain "options"
+  let [fileName] := args | return ← plain "arguments"
+  let r ← (do
+    let contents ← String.fromUTF8Lossy <$> IO.FS.readBinFile fileName
+    if contents.startsWith "#lang" then
+      return none
+    let inputCtx := Parser.mkInputContext contents fileName
+    let (stx, _, msgs) ← Parser.parseHeader inputCtx
+    if msgs.hasErrors then
+      return none
+    let res := Elab.frontendSetupImports stx (Elab.frontendOpts leanOpts) setup.name
+      opts.trustLevel #[] (some setup)
+    if res.isModule || !res.plugins.isEmpty then
+      return none
+    pure (some res) : IO (Option Language.Lean.SetupImportsResult)).toBaseIO
+  let some res := (match r with | .ok r => r | .error _ => none) | return ← plain "header"
+  let header := res.imports
+  unless pending.all (fun p => header.any (·.module == p)) do
+    return ← plain "a pending module is not a direct import"
+  let mut pre : Array Import := #[]
+  for i in header do
+    if pending.contains i.module then
+      if let some imps := pendImports.find? i.module then
+        pre := pre ++ imps
+      break
+    pre := pre.push i
+  if pre.isEmpty then
+    return ← plain "nothing to import before the pending modules"
+  let foldStore? ← if (← IO.getEnv "LEAN_CHAIN_FOLD") == some "0" then pure none
+    else some <$> (IO.mkRef {} : IO ImportFoldStore)
+  let mkStateFn? := foldStore?.map fun r => ScopedEnvExtension.mkImportStateFn r
+  unsafe enableInitializersExecution
+  let t0 ← IO.monoNanosNow
+  match (← (importModulesExtend default pre res.opts res.trustLevel res.importArts
+      (mkStateFn? := mkStateFn?)).toBaseIO) with
+  | .ok none => plain "pre-import refused"
+  | .error e =>
+    -- initializers may have run: a fresh process
+    if debug then IO.eprintln s!"[prestart] pre-import failed ({e}): plain lean in a new process"
+    let arts ← waitReady stdin budgetMs pending {}
+    execPlain argv setupFile (complete setup arts)
+  | .ok (some (env₁, s₁)) =>
+    let t1 ← IO.monoNanosNow
+    let arts ← waitReady stdin budgetMs pending {}
+    let t2 ← IO.monoNanosNow
+    let full := complete setup arts
+    -- (cleared by the pre-import's `withImporting`)
+    unsafe enableInitializersExecution
+    match (← (importModulesExtend s₁ header res.opts res.trustLevel full.importArts
+        (prevEnv? := some env₁) (mkStateFn? := mkStateFn?)).toBaseIO) with
+    | .ok (some (env, _)) =>
+      if debug then
+        let t3 ← IO.monoNanosNow
+        IO.eprintln s!"[prestart] served: pre-import {(t1 - t0).toFloat / 1e9} s ({env₁.header.moduleNames.size} modules), \
+          wait {(t2 - t1).toFloat / 1e9} s, extend {(t3 - t2).toFloat / 1e9} s ({env.header.moduleNames.size} modules)"
+      let rc ← shellMainCore args opts (some env) (setupOverride? := some full)
+      if Internal.hasAddressSanitizer () then
+        return rc
+      IO.Process.exit rc.toUInt8
+    | .ok none =>
+      if debug then IO.eprintln "[prestart] continuation refused: plain lean in a new process"
+      execPlain argv setupFile full
+    | .error e =>
+      if debug then IO.eprintln s!"[prestart] continuation failed ({e}): plain lean in a new process"
+      execPlain argv setupFile full
+
 @[export lean_shell_main]
-def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 :=
+def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
+  -- (only for a module compile with a setup file, as Lake starts them: other `lean` processes that
+  -- inherit the variable keep their stdin)
+  if (opts.component matches .frontend) && opts.setupFileName?.isSome && !opts.useStdin &&
+      !opts.onlyDeps && !opts.onlySrcDeps && !opts.printPrefix && !opts.printLibDir &&
+      (← IO.getEnv "LEAN_PRESTART_STDIN") == some "1" then
+    return ← prestartMain args opts
   shellMainCore args opts none
 
 /-!
