@@ -2,7 +2,7 @@ lean.profdata.tar.xz: LLVM IR instrumentation profile (llvm-profdata merge --spa
 src/CMakeLists.txt (LEAN_PGO_PROFILE) for profile-guided optimization of the C++ runtime/kernel and the
 core library's C code.
 
-Recorded on x86_64 Linux with a Release stage1 configured with
+Recorded on x86_64 Linux (stack head 80bd9bef4c, 2026-11-06, -DLEAN_LTO=OFF) with a Release stage1 configured with
   -DLEAN_EXTRA_CXX_FLAGS=-fprofile-generate=<dir> -DLEANC_EXTRA_CC_FLAGS=-fprofile-generate=<dir>
   -DLEAN_EXTRA_LINKER_FLAGS="-fuse-ld=lld -fprofile-generate=<dir>" -DLEAN_PGO_PROFILE=
 and the training workload: elaborating 23 Mathlib modules with `lean -j 4` (Algebra/Group/Basic,
