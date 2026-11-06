@@ -237,6 +237,8 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
     memcpy(&n, p, sizeof(n));
     p += sizeof(n);
     if (n == 0) return relocs;
+    // a snapshot with closures: no automatic native-cache bundle choice afterwards (native_cache.cpp)
+    native_cache_snapshot_loaded();
     std::vector<lib_info> current_libs = get_loaded_libs();
     for (uint32_t i = 0; i < n; i++) {
         size_t old_base;
@@ -254,6 +256,17 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
                 new_base = lib.base_addr;
                 found = true;
                 break;
+            }
+        }
+        if (!found && native_cache_load_recorded_bundle(id)) {
+            // the snapshot was saved with a native-cache bundle loaded: load that exact bundle
+            current_libs = get_loaded_libs();
+            for (lib_info const & lib : current_libs) {
+                if (lib.id == id) {
+                    new_base = lib.base_addr;
+                    found = true;
+                    break;
+                }
             }
         }
         if (!found)
