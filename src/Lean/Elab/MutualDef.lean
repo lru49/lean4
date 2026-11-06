@@ -1192,6 +1192,78 @@ register_builtin_option warn.redundantExpose : Bool := {
   descr    := "warn about redundant `@[expose]`/`@[no_expose]` attributes"
 }
 
+
+/-!
+lean-perf (lane DT, prototype): speculative elaboration of `Prop`-typed `example`s across a module boundary.
+
+A module `D` whose chain predecessor `P` is still being compiled can be elaborated early, in the environment it has
+without `P`, by a process run with `LEAN_SPEC_OUT=<dir>`: every `Prop`-typed `example` without attributes that elaborates
+without any message stores a record `<dir>/<key>.spec` (its elaborated statement, the constants its proof added, in
+dependency order, and the name-generator / macro-scope / auxiliary-name counters before and after it); the key hashes the
+example's syntax. The counters are replayed by their consumption: the fresh-name and macro-scope counters advance by the
+recorded difference (the speculative and the real elaboration of the proof take the same path when the record is valid, so
+they consume the same number of names), and the auxiliary-name generator must match exactly.
+The real compilation of `D` (after `P` landed) with `LEAN_SPEC_IN=<dir>` elaborates the statement as usual and, when a record
+with that key exists and its statement is structurally equal (`Expr.equal`), adds the recorded constants through `addDecl`
+(so the kernel checks the reused proof in the real environment) and sets the counters to the recorded values instead of
+running the proof; anything else (no record, different statement, kernel rejection) elaborates as before. Which records may
+be offered at all (the read-set validation against `P`'s new entries) is decided outside this prototype.
+-/
+namespace SpecExample
+
+structure Rec where
+  type       : Expr
+  consts     : Array ConstantInfo
+  ngenBefore : NameGenerator
+  ngenAfter  : NameGenerator
+  msBefore   : Nat
+  msAfter    : Nat
+  dngBefore  : DeclNameGenerator
+  dngAfter   : DeclNameGenerator
+  deriving Inhabited
+
+/-- Whether either side of the prototype is switched on (`LEAN_SPEC_OUT` / `LEAN_SPEC_IN`). -/
+def enabled : IO Bool := do
+  return (← IO.getEnv "LEAN_SPEC_OUT").isSome || (← IO.getEnv "LEAN_SPEC_IN").isSome
+
+def key (src : String) : String :=
+  toString (hash src)
+
+def sameDNG (a b : DeclNameGenerator) : Bool :=
+  a.namePrefix == b.namePrefix && a.idx == b.idx && a.parentIdxs == b.parentIdxs
+
+/-- The constants reachable from `n` that are not in `envBefore`, dependencies first. -/
+partial def collect (envBefore env : Environment) (n : Name) (acc : Array ConstantInfo × NameSet) :
+    Array ConstantInfo × NameSet :=
+  if acc.2.contains n || envBefore.contains n then acc else
+  match env.find? n with
+  | none => acc
+  | some ci =>
+    let acc := (acc.1, acc.2.insert n)
+    let deps := ci.type.getUsedConstants ++
+      ((ci.value? (allowOpaque := true)).map (·.getUsedConstants) |>.getD #[])
+    let acc := deps.foldl (fun acc d => collect envBefore env d acc) acc
+    (acc.1.push ci, acc.2)
+
+def toDecl? : ConstantInfo → Option Declaration
+  | .thmInfo v    => some (.thmDecl v)
+  | .defnInfo v   => some (.defnDecl v)
+  | .opaqueInfo v => some (.opaqueDecl v)
+  | .axiomInfo v  => some (.axiomDecl v)
+  | _             => none
+
+def save (f : System.FilePath) (r : Rec) : IO Unit := do
+  let tmp : System.FilePath := f.toString ++ ".tmp"
+  let _ ← unsafe CompactedRegion.save (α := Rec) tmp `_specExample r #[] none
+  IO.FS.rename tmp f
+
+def read (f : System.FilePath) : IO Rec := do
+  -- the region is never freed: the record's objects stay referenced by the environment
+  let (r, _) ← unsafe CompactedRegion.read (α := Rec) f #[]
+  return r
+
+end SpecExample
+
 def elabMutualDef (vars : Array Expr) (sc : Command.Scope) (views : Array DefView) : TermElabM Unit :=
   if isExample views then
     withoutModifyingEnv do
@@ -1242,6 +1314,7 @@ where
           -- holes in theorem types is not a fatal error, but it does make parallelism impossible
           !headers[0]!.type.hasMVar then
         elabAsync headers[0]! view declId
+      else if view.kind.isExample && (← SpecExample.enabled) then specExample view headers
       else if Elab.async.get (← getOptions) && view.kind.isExample && !Elab.inServer.get (← getOptions) &&
           !deprecated.oldSectionVars.get (← getOptions) && view.modifiers.attrs.isEmpty &&
           !headers[0]!.type.hasMVar && (← isProp headers[0]!.type) then
@@ -1300,6 +1373,54 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
           let ctx ← CommandContextInfo.save
           infoPromise.resolve <| .context (.commandCtx ctx) <| .node info (← getInfoTrees)
     Core.logSnapshotTask { stx? := none, task := (← BaseIO.asTask (act ())), cancelTk? := cancelTk }
+  specExample (view : DefView) (headers : Array DefViewElabHeader) : TermElabM Unit := do
+    let out? ← IO.getEnv "LEAN_SPEC_OUT"
+    let in? ← IO.getEnv "LEAN_SPEC_IN"
+    let header := headers[0]!
+    if (out?.isNone && in?.isNone) || !view.modifiers.attrs.isEmpty || header.type.hasMVar then
+      return ← elabSync headers
+    unless ← isProp header.type do
+      return ← elabSync headers
+    let type ← instantiateMVars header.type
+    let s ← getThe Core.State
+    let k := SpecExample.key (toString view.ref)
+    if let some dir := in? then
+      let f := System.FilePath.mk dir / (k ++ ".spec")
+      if ← f.pathExists then
+        let r ← SpecExample.read f
+        if r.type.equal type && r.consts.all (SpecExample.toDecl? · |>.isSome) &&
+            r.ngenBefore.namePrefix == s.ngen.namePrefix && r.ngenAfter.namePrefix == s.ngen.namePrefix &&
+            r.ngenBefore.idx ≤ r.ngenAfter.idx && r.msBefore ≤ r.msAfter &&
+            SpecExample.sameDNG r.dngBefore s.auxDeclNGen then
+          let ok ← try
+              for ci in r.consts do
+                addDecl (SpecExample.toDecl? ci).get!
+              pure true
+            catch _ => pure false
+          if ok then
+            modifyThe Core.State fun s' =>
+              { s' with ngen := { s'.ngen with idx := s.ngen.idx + (r.ngenAfter.idx - r.ngenBefore.idx) }
+                        nextMacroScope := s.nextMacroScope + (r.msAfter - r.msBefore)
+                        auxDeclNGen := r.dngAfter }
+            return
+    if out?.isNone then
+      -- no record used: the example elaborates as without this lever (asynchronously where eligible)
+      if Elab.async.get (← getOptions) && !Elab.inServer.get (← getOptions) &&
+          !deprecated.oldSectionVars.get (← getOptions) then
+        return ← elabExampleAsync header
+      return ← elabSync headers
+    let envBefore ← getEnv
+    let nMsgs := s.messages.reportedPlusUnreported.size
+    elabSync headers
+    if let some dir := out? then
+      let s' ← getThe Core.State
+      if s'.messages.reportedPlusUnreported.size == nMsgs then
+        let env ← getEnv
+        let (consts, _) := SpecExample.collect envBefore env header.declName (#[], {})
+        if consts.any (·.name == header.declName) then
+          SpecExample.save (System.FilePath.mk dir / (k ++ ".spec"))
+            { type, consts, ngenBefore := s.ngen, ngenAfter := s'.ngen, msBefore := s.nextMacroScope,
+              msAfter := s'.nextMacroScope, dngBefore := s.auxDeclNGen, dngAfter := s'.auxDeclNGen }
   elabAsync header view declId := do
     assert! view.kind.isTheorem
     let env ← getEnv
