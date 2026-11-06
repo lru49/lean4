@@ -417,13 +417,42 @@ static object * lean_del_core_other(object * o, uint8 tag, object * todo) {
     return todo;
 }
 
+/* lean-perf (DS): the constructor case decrements its single-threaded children without branching on the
+   outcome. Whether a child dies (count 1) or survives (count >= 2) is data-dependent and was the cascade's
+   main branch misprediction; each child is now decremented unconditionally and appended to a local list of
+   dying children with a branch-free conditional append (`dying[k] = c; k += rc == 1`, i.e. stream
+   compaction), and the dying children are linked onto the worklist after the loop. Unlike selecting the
+   new worklist head per child, this keeps the children's count loads independent of each other (no data
+   dependency through the worklist head), so their cache misses still overlap. Persistent and thread-shared
+   children keep the branchy path. Same count updates and the same set of queued objects; only the order
+   in which the dying children are queued changes. */
 static object * lean_del_core(object * o, object * todo) {
     uint8 tag = lean_ptr_tag(o);
     if (LEAN_LIKELY(tag <= LeanMaxCtorTag)) {
         object ** it  = lean_ctor_obj_cptr(o);
         object ** end = it + lean_ctor_num_objs(o);
+#if !defined(LEAN_TSAN)
+        object * dying[256];  // a constructor has at most 255 object fields (`m_other` is 8 bits)
+        unsigned k = 0;
+        for (; it != end; ++it) {
+            object * c = *it;
+            if (lean_is_scalar(c))
+                continue;
+            int rc = lean_internal_get_rc(c);
+            if (LEAN_LIKELY(rc > 0)) {
+                lean_internal_set_rc(c, rc - 1);
+                dying[k] = c;
+                k += (unsigned)(rc == 1);
+            } else {
+                dec(c, todo);
+            }
+        }
+        lean_free_small_object(o);
+        for (unsigned i = 0; i < k; i++) push_back(todo, dying[i]);
+#else
         for (; it != end; ++it) dec(*it, todo);
         lean_free_small_object(o);
+#endif
         return todo;
     } else {
         return lean_del_core_other(o, tag, todo);
