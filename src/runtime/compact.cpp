@@ -8,6 +8,8 @@ Author: Leonardo de Moura
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <lean/lean.h>
 #include "runtime/hash.h"
 #include "runtime/compact.h"
@@ -231,11 +233,66 @@ object_offset object_compactor::to_offset(object * o) {
     }
 }
 
+
+// DEBUG (lane DR): LEAN_COMPACT_TRACE=1 prints the object path to every unfinished task reached by the compactor.
+static thread_local std::vector<lean_object *> g_dr_path;
+static bool dr_trace_on() { static int v = getenv("LEAN_COMPACT_TRACE") ? 1 : 0; return v; }
+static void dr_print_path(lean_object * leaf) {
+    static int printed = 0;
+    if (printed++ >= 4) return;
+    fprintf(stderr, "COMPACT_TRACE unfinished task %p, depth %zu\n", (void*)leaf, g_dr_path.size());
+    for (size_t k = 0; k < g_dr_path.size(); k++) {
+        lean_object * p = g_dr_path[k];
+        lean_object * child = k + 1 < g_dr_path.size() ? g_dr_path[k+1] : leaf;
+        unsigned tag = lean_ptr_tag(p);
+        fprintf(stderr, "  [%zu] ", k);
+        if (tag <= LeanMaxCtorTag) {
+            unsigned n = lean_ctor_num_objs(p); int idx = -1;
+            for (unsigned i = 0; i < n; i++) if (lean_ctor_get(p, i) == child) idx = i;
+            fprintf(stderr, "ctor tag=%u objs=%u -> field %d", tag, n, idx);
+            for (unsigned i = 0; i < n; i++) {
+                lean_object * c = lean_ctor_get(p, i);
+                if (!lean_is_scalar(c) && lean_ptr_tag(c) == LeanString)
+                    fprintf(stderr, " str%u=\"%.60s\"", i, lean_string_cstr(c));
+                else if (!lean_is_scalar(c) && lean_ptr_tag(c) <= LeanMaxCtorTag && lean_ctor_num_objs(c) == 2) {
+                    // Name.str prefix s
+                    lean_object * s2 = lean_ctor_get(c, 1);
+                    if (!lean_is_scalar(s2) && lean_ptr_tag(s2) == LeanString && lean_ptr_tag(c) == 1)
+                        fprintf(stderr, " name%u=..%.60s", i, lean_string_cstr(s2));
+                }
+            }
+        } else if (tag == LeanArray) {
+            size_t n = lean_array_size(p); long idx = -1;
+            for (size_t i = 0; i < n; i++) if (lean_array_get_core(p, i) == child) { idx = i; break; }
+            fprintf(stderr, "array size=%zu -> elem %ld", n, idx);
+        } else if (tag == LeanRef) { fprintf(stderr, "REF %p", (void*)p);
+        } else if (tag == LeanTask) { fprintf(stderr, "task");
+        } else if (tag == LeanPromise) { fprintf(stderr, "promise");
+        } else if (tag == LeanClosure) {
+            unsigned n = lean_closure_num_fixed(p); int idx = -1;
+            for (unsigned i = 0; i < n; i++) if (lean_closure_arg_cptr(p)[i] == child) idx = i;
+            fprintf(stderr, "closure fn=%p fixed=%u -> arg %d", lean_closure_fun(p), n, idx);
+        } else if (tag == LeanThunk) { fprintf(stderr, "thunk");
+        } else fprintf(stderr, "tag %u", tag);
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
 object_offset object_compactor::compact(object * o) {
     lean_assert(!lean_is_scalar(o));
 #ifdef LEAN_TAG_COUNTERS
     g_tag_counters[lean_ptr_tag(o)]++;
 #endif
+    if (dr_trace_on()) {
+        g_dr_path.push_back(o);
+        object_offset r = compact_core(o);
+        g_dr_path.pop_back();
+        return r;
+    }
+    return compact_core(o);
+}
+
+object_offset object_compactor::compact_core(object * o) {
     switch (lean_ptr_tag(o)) {
     case LeanClosure:         return insert_closure(o);
     case LeanArray:           return insert_array(o);
@@ -346,6 +403,7 @@ object_offset object_compactor::insert_ref(object * o) {
 }
 
 object_offset object_compactor::insert_task(object * o) {
+    if (dr_trace_on() && lean_to_task(o)->m_value == nullptr) dr_print_path(o);
     object_offset c = to_offset(lean_task_get(o));
     size_t sz = sizeof(lean_task_object);
     object * r = copy_object(o, sz);

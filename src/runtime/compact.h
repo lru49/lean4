@@ -66,6 +66,7 @@ class LEAN_EXPORT object_compactor {
     // Compacts a not-yet-seen heap object (and, recursively, its children),
     // returning its offset. Dispatches on the object's tag.
     object_offset compact(object * o);
+    object_offset compact_core(object * o);
     void insert_terminator(object * o);
     object * copy_object(object * o, size_t sz = 0);
     object_offset insert_constructor(object * o);
