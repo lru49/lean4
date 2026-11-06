@@ -3141,23 +3141,6 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     -- If true, prefer loading `.ir.sig` over `.ir` unless `import all`ed; used by leanir
     (loadIRSig := false) :
     IO Environment := do
-  /- lean-perf (race #2 fix, L-race2fix-opts-persistent): make `opts` persistent BEFORE any other thread can
-     hold a reference to it. Every import-time task closure captures `opts` (the parallel extension-state
-     tasks of `finalizePersistentExtensions` build the `ImportM` context `{ env, opts }` on their thread, and
-     every interpreter stub closure created by an `evalConst` on either side copies `m_opts` into the
-     closure: `ir_interpreter.cpp` `mk_stub_closure`), so the task threads reference-count `opts` atomically
-     (it is marked thread-shared by `alloc_task`'s `lean_mark_mt` of the closure) while the import thread runs
-     `runInitAttrs`. There, `interpreter::run_init` marks the result of every named `initialize` PERSISTENT
-     with plain `rc := 0` stores, and such a result reaches `opts` through the stub closures of the descriptor
-     it returns. A plain store that lands between a task's atomic read-modify-write leaves `opts` (or a node of
-     its tree) with a single counted reference, and the next decrement frees it while the import thread and,
-     later, the whole frontend still use it (cores: options tree node garbage in `runInitAttrForMod`'s
-     `Option.get` and in `reparseOptions` right after `importModules`; later heap corruption from the stale
-     references). Upstream runs no other thread during `runInitAttrs` and makes `opts` persistent through
-     exactly that walk anyway, so marking it here (single-threaded, before the first task spawn) changes
-     nothing observable: a persistent object is never counted, by any thread. Only with `leakEnv`, like the
-     environment itself. -/
-  let opts ← if leakEnv then unsafe Runtime.markPersistent opts else pure opts
   let modules := s.moduleNames.filterMap (s.moduleNameMap[·]?)
   let moduleData ← modules.mapM fun mod => do
     let some data := mod.mainModule? |
