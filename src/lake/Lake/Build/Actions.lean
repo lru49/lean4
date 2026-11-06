@@ -176,14 +176,11 @@ public def writeModulePartPacks (oleanFile : FilePath) : BaseIO Unit := do
     writePartPack stem ".ir" #[".ir.sig", ".ir"]
   let _ ← go.toBaseIO
 
-public def compileLeanModule
-  (leanFile relLeanFile : FilePath)
-  (setup : ModuleSetup) (setupFile : FilePath)
-  (arts : ModuleArtifacts)
-  (leanArgs : Array String := #[])
-  (leanPath : SearchPath := [])
-  (lean : FilePath := "lean")
-: LogIO Unit := do
+/-- The `lean` command line for building a module (the setup file is written separately). -/
+def leanModuleArgs
+  (leanFile : FilePath) (setup : ModuleSetup) (setupFile : FilePath) (arts : ModuleArtifacts)
+  (leanArgs : Array String)
+: IO (Array String) := do
   let mut args := leanArgs.push leanFile.toString
   if let some oleanFile := arts.olean? then
     createParentDirs oleanFile
@@ -201,17 +198,183 @@ public def compileLeanModule
     createParentDirs bcFile
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
-  IO.FS.writeFile setupFile (← renderModuleSetup setup)
   args := args ++ #["--setup", setupFile.toString]
-  args := args.push "--json"
-  withLogErrorPos do
-  let out ← rawProc {
-    args
-    cmd := lean.toString
-    env := #[
-      ("LEAN_PATH", leanPath.toString)
-    ]
+  return args.push "--json"
+
+/--
+A `lean` started before the last of its module's imports were built (`LAKE_PRESTART=1`, see
+`Module.maybePrestart`). It was given a setup without the late imports' `importArts` entries and
+receives them on stdin (one JSON line per import) when they are built.
+-/
+public structure PrestartedLean where
+  args : Array String
+  /-- The setup it was started with (without the late imports' entries). -/
+  setup : ModuleSetup
+  /-- The late imports' entries, once all of them were sent. -/
+  lateArts : Task (Except IO.Error (Array (Name × ImportArtifacts)))
+  /-- Its stdout, stderr and exit code, once it exits. -/
+  output : Task (Except IO.Error IO.Process.Output)
+  kill : IO Unit
+
+public inductive PrestartState where
+  /-- The module's `lean` was (or is being) started the normal way: never pre-start it. -/
+  | stock
+  | pre (p : PrestartedLean)
+
+/-- Pre-start state per module source file (`Name.mkSimple leanFile.toString`). -/
+builtin_initialize prestartRef : IO.Ref (NameMap PrestartState) ← IO.mkRef {}
+
+def prestartKey (leanFile : FilePath) : Name := .mkSimple leanFile.toString
+
+def prestartSetupFile (setupFile : FilePath) : FilePath := setupFile.addExtension "prestart"
+
+/-- Marks the module as started the normal way and returns its pre-started `lean`, if any. -/
+public def takePrestarted? (leanFile : FilePath) : BaseIO (Option PrestartedLean) :=
+  prestartRef.modifyGet fun m =>
+    let k := prestartKey leanFile
+    match m.find? k with
+    | some (.pre p) => (some p, m.insert k .stock)
+    | _ => (none, m.insert k .stock)
+
+/-- Kills a pre-started `lean` of the module that was not adopted (e.g. the module is up-to-date). -/
+public def killPrestarted (leanFile : FilePath) : BaseIO Unit := do
+  if let some p ← takePrestarted? leanFile then
+    discard <| p.kill.toBaseIO
+
+/-- The number of pre-started `lean`s not yet adopted or killed. -/
+public def prestartedCount : BaseIO Nat := do
+  return (← prestartRef.get).foldl (init := 0) fun n _ s => match s with | .pre _ => n + 1 | _ => n
+
+/--
+Starts `lean` for a module whose imports `late` are not built yet (see `PrestartedLean`). Does
+nothing (returns `false`) if the module was already started the normal way.
+-/
+public def prestartLeanModule
+  (leanFile : FilePath) (setup : ModuleSetup) (setupFile : FilePath) (arts : ModuleArtifacts)
+  (leanArgs : Array String) (leanPath : SearchPath) (lean : FilePath)
+  (late : Array (Name × Task (Except IO.Error ImportArtifacts)))
+: IO Bool := do
+  if let some .stock := (← prestartRef.get).find? (prestartKey leanFile) then return false
+  -- A separate setup file: the module may still be started the normal way concurrently.
+  let args ← leanModuleArgs leanFile setup (prestartSetupFile setupFile) arts leanArgs
+  IO.FS.writeFile (prestartSetupFile setupFile) (← renderModuleSetup setup)
+  let child ← IO.Process.spawn {
+    args, cmd := lean.toString
+    env := #[("LEAN_PATH", leanPath.toString), ("LEAN_PRESTART_STDIN", "1")]
+    stdin := .piped, stdout := .piped, stderr := .piped
   }
+  let (stdin, child) ← child.takeStdin
+  let pending := Json.arr (late.map fun (n, _) => toJson n)
+  stdin.putStrLn (Json.mkObj [("pending", pending)]).compress
+  stdin.flush
+  let lateArts ← IO.asTask (prio := .dedicated) do
+    let mut out := #[]
+    for (n, t) in late do
+      match t.get with
+      | .ok a =>
+        stdin.putStrLn (Json.mkObj [("ready", toJson n), ("arts", toJson a)]).compress
+        stdin.flush
+        out := out.push (n, a)
+      | .error e =>
+        stdin.putStrLn (Json.mkObj [("abort", true)]).compress
+        stdin.flush
+        throw e
+    return out
+  let output ← IO.asTask (prio := .dedicated) do
+    let stderr ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
+    let stdout ← child.stdout.readToEnd
+    let exitCode ← child.wait
+    let stderr ← IO.ofExcept stderr.get
+    return {exitCode, stdout, stderr : IO.Process.Output}
+  let p : PrestartedLean := {args, setup, lateArts, output, kill := child.kill}
+  let ok ← prestartRef.modifyGet fun m =>
+    let k := prestartKey leanFile
+    match m.find? k with
+    | some .stock => (false, m)
+    | _ => (true, m.insert k (.pre p))
+  unless ok do discard <| child.kill.toBaseIO
+  return ok
+
+public def prestartEnabled : BaseIO Bool := do
+  return (← IO.getEnv "LAKE_PRESTART") == some "1"
+
+/-- The number of module `lean`s started the normal way that are still running. -/
+builtin_initialize runningLeansRef : IO.Ref Nat ← IO.mkRef 0
+
+/--
+Whether another `lean` may be pre-started now: pre-started plus running module `lean`s stay below
+the job slots (`LAKE_PRESTART_MAX` if set, else `LEAN_NUM_THREADS`, else 16), so
+pre-starting never oversubscribes the schedule.
+-/
+public def prestartSlotFree : BaseIO Bool := do
+  let slots ← match (← IO.getEnv "LAKE_PRESTART_MAX").bind (·.toNat?) with
+    | some n => pure n
+    | none => match (← IO.getEnv "LEAN_NUM_THREADS").bind (·.toNat?) with
+      | some n => pure n
+      | none => pure 16
+  return (← prestartedCount) + (← runningLeansRef.get) < slots
+
+/-- Whether two setups are equal (`importArts` compared entry by entry). -/
+def sameSetup (a b : ModuleSetup) : Bool := Id.run do
+  let rest (s : ModuleSetup) := (toJson {s with importArts := {}}).compress
+  if rest a != rest b then return false
+  if Std.TreeMap.size a.importArts != Std.TreeMap.size b.importArts then return false
+  for (n, x) in a.importArts do
+    let some y := b.importArts.find? n | return false
+    unless x.toArrays == y.toArrays do return false
+  return true
+
+/-- The output of a `lean` started by `compileLeanModule` or adopted from `prestartLeanModule`. -/
+def runLeanModule
+  (leanFile : FilePath) (setup : ModuleSetup) (setupFile : FilePath) (args : Array String)
+  (leanPath : SearchPath) (lean : FilePath)
+: LogIO IO.Process.Output := do
+  if (← prestartEnabled) then
+    if let some p ← takePrestarted? leanFile then
+      let adopted? ← id do
+        let pre := (prestartSetupFile setupFile).toString
+        unless p.args.map (fun a => if a == pre then setupFile.toString else a) == args do return none
+        let .ok late := (← IO.wait p.lateArts) | return none
+        let full := late.foldl (init := p.setup) fun s (n, a) =>
+          {s with importArts := s.importArts.insert n a}
+        unless sameSetup full setup do return none
+        let write ← IO.asTask (prio := .dedicated) do
+          IO.FS.writeFile setupFile (← renderModuleSetup setup)
+        runningLeansRef.modify (· + 1)
+        let out? := (← IO.wait p.output).toOption
+        runningLeansRef.modify (· - 1)
+        discard <| IO.ofExcept (← IO.wait write)
+        return out?
+      if let some out := adopted? then
+        logVerbose s!"adopted the pre-started lean for {leanFile}"
+        return out
+      discard <| p.kill.toBaseIO
+      discard <| IO.wait p.output
+  IO.FS.writeFile setupFile (← renderModuleSetup setup)
+  let track ← prestartEnabled
+  if track then runningLeansRef.modify (· + 1)
+  try
+    rawProc {
+      args
+      cmd := lean.toString
+      env := #[
+        ("LEAN_PATH", leanPath.toString)
+      ]
+    }
+  finally
+    if track then runningLeansRef.modify (· - 1)
+
+public def compileLeanModule
+  (leanFile relLeanFile : FilePath)
+  (setup : ModuleSetup) (setupFile : FilePath)
+  (arts : ModuleArtifacts)
+  (leanArgs : Array String := #[])
+  (leanPath : SearchPath := [])
+  (lean : FilePath := "lean")
+: LogIO Unit := do
+  let args ← leanModuleArgs leanFile setup setupFile arts leanArgs
+  withLogErrorPos do
+  let out ← runLeanModule leanFile setup setupFile args leanPath lean
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
