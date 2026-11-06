@@ -28,10 +28,17 @@ set(LEAN_PLATFORM_TARGET "" CACHE STRING "LLVM triple of the target platform")
 if(NOT LEAN_PLATFORM_TARGET)
   # this may fail when the compiler is not clang, but this should only happen in local builds where
   # the value of the variable is not of immediate relevance
+  # `--print-target-triple` is clang-only; GCC (e.g. the `cc` of Linux distributions) reports the triple via `-dumpmachine`
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    set(LEAN_TARGET_TRIPLE_QUERY --print-target-triple)
+  else()
+    set(LEAN_TARGET_TRIPLE_QUERY -dumpmachine)
+  endif()
   execute_process(
-    COMMAND ${CMAKE_C_COMPILER} --print-target-triple
+    COMMAND ${CMAKE_C_COMPILER} ${LEAN_TARGET_TRIPLE_QUERY}
     OUTPUT_VARIABLE LEAN_PLATFORM_TARGET
     OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
   )
 endif()
 
@@ -217,7 +224,7 @@ string(APPEND LEAN_EXTRA_CXX_FLAGS " -ffp-contract=off")
 # without profile data, so a stale profile only loses benefit. Regenerate with `-fprofile-generate` (see
 # `src/pgo/README.txt`). Set `-DLEAN_PGO_PROFILE=` (empty) to build without it.
 set(LEAN_PGO_PROFILE_DEFAULT "")
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_C_COMPILER_ID MATCHES "Clang" AND EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
   set(LEAN_PGO_PROFILE_DEFAULT "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
 endif()
 set(LEAN_PGO_PROFILE "${LEAN_PGO_PROFILE_DEFAULT}" CACHE STRING "LLVM .profdata (or .tar.xz of one) for profile-guided optimization")
@@ -248,8 +255,8 @@ string(REGEX MATCH "^[0-9]+" LEAN_CC_MAJOR "${CMAKE_C_COMPILER_VERSION}")
 find_program(LEAN_LLVM_AR NAMES llvm-ar llvm-ar-${LEAN_CC_MAJOR} HINTS "${LEAN_CC_DIR}")
 find_program(LEAN_LLVM_RANLIB NAMES llvm-ranlib llvm-ranlib-${LEAN_CC_MAJOR} HINTS "${LEAN_CC_DIR}")
 set(LEAN_LTO_MISSING "")
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  string(APPEND LEAN_LTO_MISSING " compiler is not clang;")
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+  string(APPEND LEAN_LTO_MISSING " C or C++ compiler is not clang;")
 endif()
 if(NOT CMAKE_SYSTEM_NAME MATCHES "Linux")
   string(APPEND LEAN_LTO_MISSING " not Linux;")
