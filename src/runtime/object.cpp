@@ -792,11 +792,17 @@ static void defer_slot_finalizer(void * p) {
     delete sp;
 }
 
-/* Apply the decrements the release thread returned to this thread. */
+/* Apply the decrements the release thread returned to this thread. Called ONLY at safe points, where the thread
+   runs no runtime-internal code and holds no runtime lock (v2: v1 also drained inside cascades and handoffs, i.e.
+   possibly under the task manager's mutex or inside a finalizer): after each task body (`run_task`), at `Task.get`
+   entry, at the region barrier, and at thread exit. Runs under the shared runtime-alive lock and is skipped once
+   teardown has started (the owed decrements are then leaked: the process is ending). */
 extern "C" LEAN_EXPORT void lean_deferred_free_drain() {
     if (g_defer_slot == nullptr || g_defer_draining) return;
     deferred_owner_slot & s = **g_defer_slot;
     if (!s.m_has_pending.load(std::memory_order_acquire)) return;
+    std::shared_lock<std::shared_mutex> alive(*g_defer_rt_mutex);
+    if (!g_defer_rt_alive) return;
     g_defer_draining = true;
     while (s.m_has_pending.load(std::memory_order_acquire)) {
         std::vector<std::pair<lean_object *, size_t>> items;
@@ -831,8 +837,8 @@ extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {
 
 /* Common part of the two entry points: the caller holds `g_defer_mutex`; false = refused. */
 static bool defer_prepare(std::unique_lock<std::mutex> & lock) {
+    // no drain here: a handoff can happen inside any cascade, including one running under a runtime lock (v2)
     if (g_defer_draining || g_defer_is_release_thread) return false;
-    lean_deferred_free_drain();
     if (g_defer_slot == nullptr) {
         g_defer_slot = new std::shared_ptr<deferred_owner_slot>(std::make_shared<deferred_owner_slot>());
         register_thread_finalizer(defer_slot_finalizer, g_defer_slot);
@@ -934,11 +940,8 @@ extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
         if (todo == nullptr)
             return;
 #if defined(LEAN_MULTI_THREAD)
-        // lean-perf (CJ): a large cascade continues on the release thread (see `defer_handoff`); a medium one is
-        // also a drain point for decrements the release thread returned to this thread
-        ++n;
-        if (LEAN_UNLIKELY(n == 1024)) lean_deferred_free_drain();
-        if (LEAN_UNLIKELY(n == g_defer_min) && defer_handoff(todo) && todo == nullptr)
+        // lean-perf (CJ): a large cascade continues on the release thread (see `defer_handoff`)
+        if (LEAN_UNLIKELY(++n == g_defer_min) && defer_handoff(todo) && todo == nullptr)
             return;
 #endif
         o = pop_back(todo);
@@ -1995,6 +1998,7 @@ LEAN_EXPORT void (*g_lean_report_task_get_blocked_time)(std::chrono::nanoseconds
 extern "C" LEAN_EXPORT b_obj_res lean_task_get(b_obj_arg t) {
     if (object * v = lean_to_task(t)->m_value)
         return v;
+    lean_deferred_free_drain();  // lean-perf (CJ): safe point before blocking
     if (g_lean_report_task_get_blocked_time) {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         g_task_manager->wait_for(lean_to_task(t));
