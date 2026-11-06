@@ -132,7 +132,7 @@ public:
 kernel_state_pool * g_kernel_state_pool = nullptr;
 size_t g_pool_slots       = 8;
 size_t g_pool_max_entries = 1u << 24;
-bool   g_pool_enabled     = true;
+bool   g_pool_enabled     = false;  // race2fix diagnostic: pool off by default (= revert of 2011522de6 in behaviour; LEAN_KERNEL_CACHE_POOL=1 re-enables)
 void init_kernel_state_pool_config() {
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL")) g_pool_enabled = !(s[0] == '0' && s[1] == 0);
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_MAX_ENTRIES")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0) g_pool_max_entries = v; }
