@@ -80,6 +80,101 @@ def renderModuleSetup (setup : ModuleSetup) : IO String := do
     first := false
     out := out ++ (Json.str k).compress ++ ":" ++ (if k == "importArts" then arts else v.compress)
   return out.push '}'
+/-! ## Per-module part packs (optional artefact; see `lean_compacted_region_read` in src/library/module.cpp)
+A module's `.olean`/`.olean.server`/`.olean.private` (and its `.ir.sig`/`.ir`) are saved at consecutive 64 KiB-aligned base
+addresses. The pack `<stem>.olean.pack` (`<stem>.ir.pack`) stores the unchanged bytes of each part at offset
+`4096 + (part base - lowest base)` behind a 4 KiB header, so `lean` maps all parts of a family with one `mmap` at their own
+addresses. Packs are an optimisation only: `lean` ignores a missing pack and serves a part from a pack only while the part's
+size and mtime match the pack entry. `LAKE_OLEAN_PACK=0` turns writing off. -/
+
+def packU64At (b : ByteArray) (off : Nat) : UInt64 := Id.run do
+  let mut v : UInt64 := 0
+  for i in [0:8] do
+    v := v ||| ((b.get! (off + i)).toUInt64 <<< (8 * i).toUInt64)
+  return v
+
+def packPushU32 (b : ByteArray) (v : UInt32) : ByteArray := Id.run do
+  let mut b := b
+  for i in [0:4] do
+    b := b.push (v >>> (8 * i).toUInt32).toUInt8
+  return b
+
+def packPushU64 (b : ByteArray) (v : UInt64) : ByteArray := Id.run do
+  let mut b := b
+  for i in [0:8] do
+    b := b.push (v >>> (8 * i).toUInt64).toUInt8
+  return b
+
+def packPushZeros (b : ByteArray) (n : Nat) : ByteArray := Id.run do
+  let mut b := b
+  for _ in [0:n] do
+    b := b.push 0
+  return b
+
+/-- Writes the pack of one part family (`fam` = `".olean"` or `".ir"`) of the module whose part files are `stem ++ suffix`. -/
+def writePartPack (stem fam : String) (suffixes : Array String) : IO Unit := do
+  let mut parts : Array (String × UInt64 × ByteArray × IO.FS.SystemTime) := #[]
+  for suf in suffixes do
+    let f : FilePath := stem ++ suf
+    unless (← f.pathExists) do continue
+    let md ← f.metadata
+    let bytes ← IO.FS.readBinFile f
+    -- `olean` marker and a header that holds the base address
+    if bytes.size < 88 || bytes.size.toUInt64 != md.byteSize || bytes.extract 0 5 != "olean".toUTF8 then return
+    parts := parts.push (suf, packU64At bytes 80, bytes, md.modified)
+  if parts.isEmpty || parts.size > 8 then return
+  -- bubble sort by base address (at most 3 parts)
+  let mut sorted := parts
+  for _ in [0:sorted.size] do
+    for j in [1:sorted.size] do
+      if sorted[j-1]!.2.1 > sorted[j]!.2.1 then
+        sorted := sorted.swapIfInBounds (j-1) j
+  let groupBase := sorted[0]!.2.1
+  if groupBase % 4096 != 0 then return
+  let mut endAddr := groupBase
+  let mut total := 0
+  for (_, base, bytes, _) in sorted do
+    if base < endAddr then return
+    endAddr := base + bytes.size.toUInt64
+    total := total + bytes.size
+  let dataSize := endAddr - groupBase
+  -- the parts of one family are adjacent (64 KiB slots); anything else is not worth a pack
+  if dataSize.toNat > total + sorted.size * 65536 then return
+  let mut out := "leanpak1".toUTF8
+  out := packPushU32 out sorted.size.toUInt32
+  out := packPushU32 out 0
+  out := packPushU64 out groupBase
+  out := packPushU64 out 4096
+  out := packPushU64 out dataSize
+  for (suf, base, bytes, mtime) in sorted do
+    let s := suf.toUTF8
+    if s.size ≥ 16 then return
+    out := packPushZeros (out ++ s) (16 - s.size)
+    out := packPushU64 out base
+    out := packPushU64 out bytes.size.toUInt64
+    out := packPushU64 out mtime.sec.toNat.toUInt64
+    out := packPushU64 out mtime.nsec.toUInt64
+  out := packPushZeros out (4096 - out.size)
+  let mut addr := groupBase
+  for (_, base, bytes, _) in sorted do
+    out := packPushZeros out (base - addr).toNat
+    out := out ++ bytes
+    addr := base + bytes.size.toUInt64
+  let pack : FilePath := stem ++ fam ++ ".pack"
+  let tmp : FilePath := pack.toString ++ ".tmp"
+  IO.FS.writeBinFile tmp out
+  IO.FS.rename tmp pack
+
+/-- Writes `<stem>.olean.pack` and `<stem>.ir.pack` next to a freshly compiled module's parts (errors are ignored: the packs
+are optional). -/
+public def writeModulePartPacks (oleanFile : FilePath) : BaseIO Unit := do
+  let go : IO Unit := do
+    if (← IO.getEnv "LAKE_OLEAN_PACK") == some "0" then return
+    unless oleanFile.extension == some "olean" do return
+    let stem := (oleanFile.withExtension "").toString
+    writePartPack stem ".olean" #[".olean", ".olean.server", ".olean.private"]
+    writePartPack stem ".ir" #[".ir.sig", ".ir"]
+  let _ ← go.toBaseIO
 
 public def compileLeanModule
   (leanFile relLeanFile : FilePath)
@@ -145,6 +240,8 @@ public def compileLeanModule
     failure
   else if out.exitCode ≠ 0 || hasErrors then
     error s!"Lean exited with code {out.exitCode}"
+  else if let some oleanFile := arts.olean? then
+    writeModulePartPacks oleanFile
 
 public def compileO
   (oFile srcFile : FilePath)
