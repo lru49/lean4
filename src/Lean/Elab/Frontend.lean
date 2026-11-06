@@ -385,10 +385,13 @@ def runFrontend
   if hasErrors then
     return none
 
-  -- The `.ilean` contents only read the finished snapshots: compute them on a dedicated thread while the `.olean` is
-  -- serialized below. The file itself is still written after the `.olean`, as before, and any error is rethrown at the
-  -- same point.
-  let ileanTask? ← ileanFileName?.mapM fun _ => IO.asTask (prio := .dedicated) do
+  if let some oleanFileName := oleanFileName? then
+    profileitIO ".olean serialization" finalOpts do
+      let commandLints := collectCommandLints snaps none #[]
+      let env ← Linter.recordLints inputCtx.fileMap env commandLints
+      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+
+  if let some ileanFileName := ileanFileName? then
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
@@ -399,17 +402,7 @@ def runFrontend
       decls
       : Lean.Server.Ilean
     }
-    return Json.compress $ toJson ilean
-
-  if let some oleanFileName := oleanFileName? then
-    profileitIO ".olean serialization" finalOpts do
-      let commandLints := collectCommandLints snaps none #[]
-      let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-
-  if let some ileanFileName := ileanFileName? then
-    if let some ileanTask := ileanTask? then
-      IO.FS.writeFile ileanFileName (← IO.ofExcept (← IO.wait ileanTask))
+    IO.FS.writeFile ileanFileName $ Json.compress $ toJson ilean
 
   if let some out := trace.profiler.output.get? opts then
     let traceStates := snaps.getAll.map (·.traces)
