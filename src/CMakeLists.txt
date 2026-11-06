@@ -29,9 +29,11 @@ if(NOT LEAN_PLATFORM_TARGET)
   # this may fail when the compiler is not clang, but this should only happen in local builds where
   # the value of the variable is not of immediate relevance
   execute_process(
-    COMMAND ${CMAKE_C_COMPILER} --print-target-triple
+    # `-dumpmachine` is understood by both clang and GCC (`--print-target-triple` is clang-only)
+    COMMAND ${CMAKE_C_COMPILER} -dumpmachine
     OUTPUT_VARIABLE LEAN_PLATFORM_TARGET
     OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
   )
 endif()
 
@@ -217,19 +219,35 @@ string(APPEND LEAN_EXTRA_CXX_FLAGS " -ffp-contract=off")
 # without profile data, so a stale profile only loses benefit. Regenerate with `-fprofile-generate` (see
 # `src/pgo/README.txt`). Set `-DLEAN_PGO_PROFILE=` (empty) to build without it.
 set(LEAN_PGO_PROFILE_DEFAULT "")
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+if(CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
   set(LEAN_PGO_PROFILE_DEFAULT "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
 endif()
 set(LEAN_PGO_PROFILE "${LEAN_PGO_PROFILE_DEFAULT}" CACHE STRING "LLVM .profdata (or .tar.xz of one) for profile-guided optimization")
 set(LEAN_CORE_LEANC_FLAGS "")
 if(LEAN_PGO_PROFILE AND NOT STAGE EQUAL 0)
-  if(LEAN_PGO_PROFILE MATCHES "\\.tar\\.xz$")
+  # Re-run the configure when the profile changes, and give every profile content its own path: the path is part of
+  # the compile flags, so a new profile recompiles every C++ object and (via Lake's traced `moreLeancArgs`) every core C
+  # object. Without this an incremental build mixed objects compiled against the old and the new profile, which ThinLTO
+  # rejects ("linking module flags 'ProfileSummary': IDs have conflicting values").
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LEAN_PGO_PROFILE}")
+  file(SHA256 "${LEAN_PGO_PROFILE}" LEAN_PGO_SHA)
+  string(SUBSTRING "${LEAN_PGO_SHA}" 0 16 LEAN_PGO_SHA)
+  set(LEAN_PGO_DIR "${CMAKE_BINARY_DIR}/pgo/${LEAN_PGO_SHA}")
+  if(NOT EXISTS "${LEAN_PGO_DIR}/lean.profdata")
     file(REMOVE_RECURSE "${CMAKE_BINARY_DIR}/pgo")
-    file(ARCHIVE_EXTRACT INPUT "${LEAN_PGO_PROFILE}" DESTINATION "${CMAKE_BINARY_DIR}/pgo")
-    file(GLOB LEAN_PGO_PROFDATA "${CMAKE_BINARY_DIR}/pgo/*.profdata")
-  else()
-    set(LEAN_PGO_PROFDATA "${LEAN_PGO_PROFILE}")
+    if(LEAN_PGO_PROFILE MATCHES "\\.tar\\.xz$")
+      file(ARCHIVE_EXTRACT INPUT "${LEAN_PGO_PROFILE}" DESTINATION "${LEAN_PGO_DIR}")
+      file(GLOB LEAN_PGO_EXTRACTED "${LEAN_PGO_DIR}/*.profdata")
+      list(GET LEAN_PGO_EXTRACTED 0 LEAN_PGO_EXTRACTED)
+      if(NOT LEAN_PGO_EXTRACTED STREQUAL "${LEAN_PGO_DIR}/lean.profdata")
+        file(RENAME "${LEAN_PGO_EXTRACTED}" "${LEAN_PGO_DIR}/lean.profdata")
+      endif()
+    else()
+      file(MAKE_DIRECTORY "${LEAN_PGO_DIR}")
+      file(COPY_FILE "${LEAN_PGO_PROFILE}" "${LEAN_PGO_DIR}/lean.profdata")
+    endif()
   endif()
+  set(LEAN_PGO_PROFDATA "${LEAN_PGO_DIR}/lean.profdata")
   message(STATUS "Profile-guided optimization with ${LEAN_PGO_PROFDATA}")
   set(LEAN_PGO_FLAGS "-fprofile-use=${LEAN_PGO_PROFDATA} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin")
   string(APPEND LEAN_EXTRA_CXX_FLAGS " ${LEAN_PGO_FLAGS}")
@@ -248,8 +266,8 @@ string(REGEX MATCH "^[0-9]+" LEAN_CC_MAJOR "${CMAKE_C_COMPILER_VERSION}")
 find_program(LEAN_LLVM_AR NAMES llvm-ar llvm-ar-${LEAN_CC_MAJOR} HINTS "${LEAN_CC_DIR}")
 find_program(LEAN_LLVM_RANLIB NAMES llvm-ranlib llvm-ranlib-${LEAN_CC_MAJOR} HINTS "${LEAN_CC_DIR}")
 set(LEAN_LTO_MISSING "")
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  string(APPEND LEAN_LTO_MISSING " compiler is not clang;")
+if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  string(APPEND LEAN_LTO_MISSING " C compiler ${CMAKE_C_COMPILER_ID} / C++ compiler ${CMAKE_CXX_COMPILER_ID} (both must be Clang);")
 endif()
 if(NOT CMAKE_SYSTEM_NAME MATCHES "Linux")
   string(APPEND LEAN_LTO_MISSING " not Linux;")

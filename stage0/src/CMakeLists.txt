@@ -29,9 +29,11 @@ if(NOT LEAN_PLATFORM_TARGET)
   # this may fail when the compiler is not clang, but this should only happen in local builds where
   # the value of the variable is not of immediate relevance
   execute_process(
-    COMMAND ${CMAKE_C_COMPILER} --print-target-triple
+    # `-dumpmachine` is understood by both clang and GCC (`--print-target-triple` is clang-only)
+    COMMAND ${CMAKE_C_COMPILER} -dumpmachine
     OUTPUT_VARIABLE LEAN_PLATFORM_TARGET
     OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
   )
 endif()
 
