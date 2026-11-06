@@ -2732,21 +2732,22 @@ per module, not per import) and waking loaders when something was queued. -/
 private def prefetchModules (st : PrefetchState) (imports : Array Import) :
     BaseIO (Array PrefetchTask) := do
   st.mutex.lock
+  let mut m ← st.map.get
+  let mut q ← st.queue.get
   let mut ts : Array PrefetchTask := #[]
   let mut queued := false
   for i in imports do
-    match (← st.map.get).find? i.module with
+    match m.find? i.module with
     | some (t, _) => ts := ts.push t
     | none =>
       let p ← IO.Promise.new
       let t := prefetchResultTask p
-      -- `modify` keeps the queue array unshared, so the push is in place (a `get`/`set` pair would
-      -- copy the whole array per module)
-      let idx := (← st.queue.get).size
-      st.queue.modify (·.push (some (i, p)))
-      st.map.modify (·.insert i.module (t, idx))
+      m := m.insert i.module (t, q.size)
+      q := q.push (some (i, p))
       ts := ts.push t
       queued := true
+  st.map.set m
+  st.queue.set q
   st.mutex.unlock
   if queued then st.cond.notifyAll
   return ts
@@ -2782,7 +2783,7 @@ private partial def loaderLoop (st : PrefetchState) (arts : NameMap ImportArtifa
     while h < q.size && q[h]!.isNone do h := h + 1
     if h < q.size then
       item? := q[h]!
-      st.queue.modify (·.set! h none)   -- in place: `q` is dead here
+      st.queue.set (q.set! h none)
       st.head.set (h + 1)
       break
     st.head.set h
@@ -2821,7 +2822,7 @@ private def prefetchModule (st : PrefetchState) (arts : NameMap ImportArtifacts)
   let mut mine? : Option PrefetchItem := none
   if let some (_, idx) := m.find? i.module then
     if let some (some item) := q[idx]? then
-      st.queue.modify (·.set! idx none)
+      st.queue.set (q.set! idx none)
       mine? := some item
   st.mutex.unlock
   if let some item := mine? then
