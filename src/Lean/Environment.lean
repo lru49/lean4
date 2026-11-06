@@ -3233,6 +3233,14 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     importRealizationCtx? := none
     serverBaseExts
   }
+  -- lean-perf (crash fix): the conflict-sweep task reads `moduleData`, the module tries and the lazily merged
+  -- tries, all reachable from `env`; `markPersistent` below writes `rc := 0` into every object reachable from
+  -- `env` with plain stores, which races with the task's atomic reference counting on the same objects (a lost
+  -- update turns a persistent object into an ST object with `rc = 1`, freed by the next `dec`). Join the task
+  -- BEFORE the first `markPersistent`, so that its precondition ("no concurrent accesses to `env`") holds again.
+  if let some t := conflicts? then
+    let rootChildren ← IO.ofExcept (← IO.wait t)
+    ParallelImport.tick s!"import conflicts checked, trie roots expanded ({rootChildren} root children; task joined)"
   if leakEnv then
     /- Mark persistent a first time before `finalizePersistentExtensions`, which
        avoids costly MT markings when e.g. an interpreter closure (which
@@ -3248,9 +3256,6 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
     ParallelImport.tick "markPersistent 1"
-  if let some t := conflicts? then
-    let rootChildren ← IO.ofExcept (← IO.wait t)
-    ParallelImport.tick s!"import conflicts checked, trie roots expanded ({rootChildren} root children; task joined)"
   if loadExts then
     -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
     -- already persistent then, so capturing it in task closures costs nothing)
