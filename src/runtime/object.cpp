@@ -780,6 +780,8 @@ static bool mark_persistent_debug() {
     return g_debug == 1;
 }
 
+static void mark_persistent_par(object ** begin, object ** end, unsigned num_threads, size_t & claimed, size_t & donations);
+
 extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
     unsigned num_threads = mark_persistent_num_threads();
     bool dbg = mark_persistent_debug();
@@ -818,14 +820,25 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
         }
         return;
     }
-    /* Phase 2: `num_threads` walkers (this thread included) take ranges of unclaimed objects from a
-       shared pool; each range is marked depth-first with atomic claims. Large arrays met on the way
-       are split and their ranges pushed back to the pool, so one 2M-entry bucket array does not end
-       up on one thread. A walker stops when the pool is empty and no walker is still active. */
+    size_t claimed = 0, donations = 0;
+    mark_persistent_par(frontier.data() + i, frontier.data() + frontier.size(), num_threads, claimed, donations);
+    if (dbg) {
+        auto t2 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[mark_persistent] parallel: threads=%u expanded=%zu frontier=%zu claimed=%zu donations=%zu phase1 %.1f ms, phase2 %.1f ms\n",
+                     num_threads, i, frontier.size() - i, claimed, donations, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(t2 - t1).count());
+    }
+}
+
+/* Phase 2 of the parallel walk: `num_threads` walkers (the calling thread included) take ranges of
+   unclaimed objects from a shared pool, starting with `[begin, end)` (objects whose parents are
+   already marked); each range is marked depth-first with atomic claims. Large arrays met on the way
+   are split and their ranges pushed back to the pool, so one 2M-entry bucket array does not end up
+   on one thread. A walker stops when the pool is empty and no walker is still active. */
+static void mark_persistent_par(object ** begin, object ** end, unsigned num_threads, size_t & claimed, size_t & donations) {
     mark_persistent_pool pool;
     pool.num_threads = num_threads;
-    mark_persistent_pool_push(&pool, frontier.data() + i, frontier.data() + frontier.size());
-    size_t const end = frontier.size();
+    mark_persistent_pool_push(&pool, begin, end);
     auto worker = [&]() {
         std::vector<object*> todo;
         while (true) {
@@ -858,12 +871,8 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
         threads.push_back(std::make_unique<lthread>(worker));
     worker();
     for (auto & th : threads) th->join();
-    if (dbg) {
-        auto t2 = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[mark_persistent] parallel: threads=%u expanded=%zu frontier=%zu claimed=%zu donations=%zu phase1 %.1f ms, phase2 %.1f ms\n",
-                     num_threads, i, end - i, pool.claimed.load(), pool.donations.load(), std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                     std::chrono::duration<double, std::milli>(t2 - t1).count());
-    }
+    claimed = pool.claimed.load();
+    donations = pool.donations.load();
 }
 
 // =======================================
@@ -1381,8 +1390,38 @@ extern "C" LEAN_EXPORT lean_obj_res lean_io_get_num_std_workers() {
 /* lean-perf: `Lean.ParallelImport.markPersistentSeq (a : α) : BaseIO α`: the single-threaded walk, for
    use inside tasks (the result is then neither marked MT on task completion nor walked again by the
    final `markPersistent` of the environment). */
+/* lean-perf (DS): `ParallelImport.markPersistentSeq` marks an extension state persistent on the task
+   that computed it. Most states are small, but the largest ones of a Mathlib import are not (the simp
+   lemma discrimination tree: ~4.2 M visits, ~1.9 M objects, ~80 ms single-threaded, at the end of the
+   longest extension task, which the main thread then waits for). The walk now starts sequentially
+   (no threads for small states, which is most of them and keeps nested parallelism out of the many
+   concurrent extension tasks) and, if `MARK_PERSISTENT_SEQ_BUDGET` visits do not finish it, hands its
+   remaining depth-first stack (unclaimed objects whose parents are marked: a valid frontier) to the
+   parallel walkers of `lean_mark_persistent`. Same objects marked: the sequential prefix completes
+   before the walker threads are created (thread creation orders its plain stores before them), and
+   the walkers claim with atomic exchanges as in `lean_mark_persistent`. */
+#define MARK_PERSISTENT_SEQ_BUDGET 262144
 extern "C" LEAN_EXPORT lean_obj_res lean_runtime_mark_persistent_seq(lean_obj_arg a) {
-    mark_persistent_seq(a);
+    std::vector<object*> todo;
+    todo.push_back(a);
+    size_t budget = MARK_PERSISTENT_SEQ_BUDGET;
+    while (!todo.empty() && budget > 0) {
+        object * o = todo.back();
+        todo.pop_back();
+        budget--;
+        if (lean_is_scalar(o) || !lean_has_rc(o)) continue;
+        lean_internal_set_rc(o, 0);
+        mark_persistent_expand<false>(o, todo, nullptr);
+    }
+    if (!todo.empty()) {
+        unsigned num_threads = mark_persistent_num_threads();
+        if (num_threads <= 1) {
+            mark_persistent_core<false>(todo);
+        } else {
+            size_t claimed = 0, donations = 0;
+            mark_persistent_par(todo.data(), todo.data() + todo.size(), num_threads, claimed, donations);
+        }
+    }
     return a;
 }
 
