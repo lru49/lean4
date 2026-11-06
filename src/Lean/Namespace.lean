@@ -59,7 +59,9 @@ public def registerNamespace (env : Environment) (n : Name) : Environment :=
 
 /-- Return `true` if `n` is the name of a namespace in `env`. -/
 public def isNamespace (env : Environment) (n : Name) : Bool :=
-  namespacesExt.getState env |>.contains n
+  let r := namespacesExt.getState env |>.contains n
+  -- lean-perf (DT2): a namespace miss is part of the read set of a speculative command
+  if !r && env.isRecordingDeps then SpecRec.nsMissFalse n else r
 
 /-- Returns an iterator over all namespaces in `env`. -/
 public def getNamespaces (env : Environment) :=

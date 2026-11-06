@@ -92,6 +92,9 @@ def Instances.erase [Monad m] [MonadError m] (d : Instances) (declName : Name) :
     throwError "`{.ofConstName declName}` does not have [instance] attribute"
   return d.eraseCore declName
 
+/-- lean-perf (DT2): the instance queries (`DiscrTree.mkPath` of the query type) of the speculative command being recorded. -/
+builtin_initialize specInstQueriesRef : IO.Ref (Array (Array InstanceKey)) ← IO.mkRef #[]
+
 builtin_initialize instanceExtension : SimpleScopedEnvExtension InstanceEntry Instances ←
   registerSimpleScopedEnvExtension {
     initial  := {}
