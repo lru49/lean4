@@ -847,7 +847,7 @@ static unsigned imported_decl_generation(elab_environment const & env) {
 #endif
 #if LEAN_IR_DECODE
 
-enum class dop : uint8_t { Expr, Proj, TailSelf, Set, SetTag, USet, SSet, Inc, Dec, Del, Case, Ret, Jmp, Unreachable };
+enum class dop : uint8_t { Expr, Proj, FAp, Ctor, CtorBox, Ap, Box, Unbox, Reset, Reuse, IsShared, IsTaggedPtr, TailSelf, Set, SetTag, USet, SSet, Inc, Dec, Del, Case, Ret, Jmp, Unreachable };
 static constexpr uint32_t k_dirrelevant = 0xffffffffu;
 
 struct dinsn {
@@ -858,7 +858,11 @@ struct dinsn {
     uint32_t m_b    = 0;  // Proj, Set, USet: field index; SSet: byte offset; Case: #alts; Jmp, TailSelf: #arguments
     uint32_t m_c    = 0;  // Jmp: first parameter slot entry
     uint32_t m_next = 0;  // next instruction; Jmp: join point body
-    object * m_obj  = nullptr; // Expr: the IR expression
+    uint32_t m_d    = 0;  // Ctor, Reuse: #object fields; Box: boxed type
+    uint32_t m_e    = 0;  // Ctor, Reuse: scalar bytes (USize fields * sizeof(void *) + other scalar bytes)
+    uint32_t m_f    = 0;  // Reuse: reused object slot
+    uint8_t  m_flags = 0; // Reuse: 1 = update header, 2 = the fallback constructor has no data (tagged pointer)
+    object * m_obj  = nullptr; // Expr: the IR expression; FAp: the callee name
 };
 
 struct dalt {
@@ -891,6 +895,18 @@ class ir_decoder {
         uint32_t i = small32(v);
         if (i == 0) { m_ok = false; return 0; } // variables are 1-indexed
         return i - 1;
+    }
+    // constructor layout as `alloc_ctor` computes it: tag, #object fields, scalar bytes; flag 2 = no data (tagged pointer)
+    void ctor_layout(dinsn & ins, ctor_info const & ci) {
+        nat const & tag = ctor_info_tag(ci); nat const & size = ctor_info_size(ci);
+        nat const & usize = ctor_info_usize(ci); nat const & ssize = ctor_info_ssize(ci);
+        if (!tag.is_small() || !size.is_small() || !usize.is_small() || !ssize.is_small()) { m_ok = false; return; }
+        size_t t = tag.get_small_value(), n = size.get_small_value(), u = usize.get_small_value(), sc = ssize.get_small_value();
+        if (t >= k_dirrelevant || n >= k_dirrelevant || u >= (k_dirrelevant / sizeof(void *)) / 2 || sc >= k_dirrelevant / 2) { m_ok = false; return; }
+        ins.m_c = static_cast<uint32_t>(t);
+        ins.m_d = static_cast<uint32_t>(n);
+        ins.m_e = static_cast<uint32_t>(u * sizeof(void *) + sc);
+        if (n == 0 && u == 0 && sc == 0) ins.m_flags |= 2;
     }
     uint32_t arg_slot(arg const & a) { return arg_is_irrelevant(a) ? k_dirrelevant : slot(arg_var_id(a)); }
     uint32_t args(array_ref<arg> const & as) {
@@ -937,6 +953,48 @@ class ir_decoder {
                     ins.m_op = dop::Proj;
                     ins.m_a = slot(expr_proj_obj(e));
                     ins.m_b = small32(expr_proj_idx(e));
+                } else if (expr_tag(e) == expr_kind::FAp && expr_fap_args(e).size() > 0) {
+                    // saturated call (nullary `FAp`s are constant loads: `eval_expr`)
+                    ins.m_op = dop::FAp;
+                    ins.m_obj = expr_fap_fun(e).raw();
+                    ins.m_b = static_cast<uint32_t>(expr_fap_args(e).size());
+                    ins.m_a = args(expr_fap_args(e));
+                } else if (expr_tag(e) == expr_kind::Ctor) {
+                    ctor_info const & ci = expr_ctor_info(e);
+                    ctor_layout(ins, ci);
+                    ins.m_op = (ins.m_flags & 2) ? dop::CtorBox : dop::Ctor;
+                    ins.m_flags = 0;
+                    ins.m_b = static_cast<uint32_t>(expr_ctor_args(e).size());
+                    ins.m_a = args(expr_ctor_args(e));
+                } else if (expr_tag(e) == expr_kind::Reuse) {
+                    ins.m_op = dop::Reuse;
+                    ctor_layout(ins, expr_reuse_ctor(e));
+                    if (expr_reuse_update_header(e)) ins.m_flags |= 1;
+                    ins.m_f = slot(expr_reuse_obj(e));
+                    ins.m_b = static_cast<uint32_t>(expr_reuse_args(e).size());
+                    ins.m_a = args(expr_reuse_args(e));
+                } else if (expr_tag(e) == expr_kind::Reset) {
+                    ins.m_op = dop::Reset;
+                    ins.m_a = slot(expr_reset_obj(e));
+                    ins.m_b = small32(expr_reset_num_objs(e));
+                } else if (expr_tag(e) == expr_kind::Ap) {
+                    ins.m_op = dop::Ap;
+                    ins.m_c = slot(expr_ap_fun(e));
+                    ins.m_b = static_cast<uint32_t>(expr_ap_args(e).size());
+                    ins.m_a = args(expr_ap_args(e));
+                } else if (expr_tag(e) == expr_kind::Box) {
+                    ins.m_op = dop::Box;
+                    ins.m_a = slot(expr_box_obj(e));
+                    ins.m_d = static_cast<uint32_t>(expr_box_type(e));
+                } else if (expr_tag(e) == expr_kind::Unbox) {
+                    ins.m_op = dop::Unbox;
+                    ins.m_a = slot(expr_unbox_obj(e));
+                } else if (expr_tag(e) == expr_kind::IsShared) {
+                    ins.m_op = dop::IsShared;
+                    ins.m_a = slot(expr_is_shared_obj(e));
+                } else if (expr_tag(e) == expr_kind::IsTaggedPtr) {
+                    ins.m_op = dop::IsTaggedPtr;
+                    ins.m_a = slot(expr_is_tagged_ptr_obj(e));
                 } else {
                     ins.m_op = dop::Expr;
                     ins.m_obj = e.raw();
@@ -1597,6 +1655,104 @@ private:
                 m_arg_stack[bp + ins.m_x] = value(cnstr_get(m_arg_stack[bp + ins.m_a].m_obj, ins.m_b));
                 pc = ins.m_next;
                 break;
+            case dop::FAp: {
+                uint32_t const * as = dargs + ins.m_a;
+                value v = call_with(TO_REF(name, ins.m_obj), ins.m_b, [&](size_t i) { return eval_darg(bp, as[i]); });
+                // the stack may have been resized by the call: index it afterwards
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
+            case dop::CtorBox:
+                // a constructor without data is optimized to a tagged pointer
+                m_arg_stack[bp + ins.m_x] = value(box(ins.m_c));
+                pc = ins.m_next;
+                break;
+            case dop::Ctor: {
+                object * o = alloc_cnstr(ins.m_c, ins.m_d, ins.m_e);
+                for (uint32_t i = 0; i < ins.m_b; i++) {
+                    cnstr_set(o, i, eval_darg(bp, dargs[ins.m_a + i]).m_obj);
+                }
+                m_arg_stack[bp + ins.m_x] = value(o);
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Reset: { // release fields if unique reference in preparation for `Reuse`
+                object * o = m_arg_stack[bp + ins.m_a].m_obj;
+                value v;
+                if (is_exclusive(o)) {
+                    for (size_t i = 0; i < ins.m_b; i++) {
+                        cnstr_release(o, i);
+                    }
+                    v = value(o);
+                } else {
+                    dec_ref(o);
+                    v = value(box(0));
+                }
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Reuse: { // reuse dead allocation if possible
+                object * o = m_arg_stack[bp + ins.m_f].m_obj;
+                object * r;
+                if (is_scalar(o)) {
+                    // fall back to regular allocation (`alloc_ctor`)
+                    if (ins.m_flags & 2) {
+                        r = box(ins.m_c);
+                    } else {
+                        r = alloc_cnstr(ins.m_c, ins.m_d, ins.m_e);
+                        for (uint32_t i = 0; i < ins.m_b; i++) {
+                            cnstr_set(r, i, eval_darg(bp, dargs[ins.m_a + i]).m_obj);
+                        }
+                    }
+                } else {
+                    if (ins.m_flags & 1) {
+                        cnstr_set_tag(o, ins.m_c);
+                    }
+                    for (uint32_t i = 0; i < ins.m_b; i++) {
+                        cnstr_set(o, i, eval_darg(bp, dargs[ins.m_a + i]).m_obj);
+                    }
+                    r = o;
+                }
+                m_arg_stack[bp + ins.m_x] = value(r);
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Ap: {
+                object ** as = static_cast<object **>(LEAN_ALLOCA(ins.m_b * sizeof(object *))); // NOLINT
+                for (uint32_t i = 0; i < ins.m_b; i++) {
+                    as[i] = eval_darg(bp, dargs[ins.m_a + i]).m_obj;
+                }
+                object * r = apply_n(m_arg_stack[bp + ins.m_c].m_obj, ins.m_b, as);
+                m_arg_stack[bp + ins.m_x] = value(r);
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Box: {
+                value v = box_t(m_arg_stack[bp + ins.m_a].m_num, static_cast<type>(ins.m_d));
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
+            case dop::Unbox: {
+                value v = unbox_t(m_arg_stack[bp + ins.m_a].m_obj, ins.m_type);
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
+            case dop::IsShared: {
+                value v = !is_exclusive(m_arg_stack[bp + ins.m_a].m_obj);
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
+            case dop::IsTaggedPtr: {
+                value v = !is_scalar(m_arg_stack[bp + ins.m_a].m_obj);
+                m_arg_stack[bp + ins.m_x] = v;
+                pc = ins.m_next;
+                break;
+            }
             case dop::TailSelf: {
                 // argument and parameter slots may overlap, so first copy arguments to end of stack
                 size_t old_size = m_arg_stack.size();
@@ -1927,18 +2083,20 @@ private:
         return r;
     }
 
-    value call(name const & fn, array_ref<arg> const & args) {
+    /** \brief `call` with the arguments given by `eval_i(i)` (an IR argument list or decoded argument slots). */
+    template<class ArgFn>
+    value call_with(name const & fn, size_t nargs, ArgFn const & eval_i) {
         size_t old_size = m_arg_stack.size();
         value r;
         const symbol_cache_entry& e = lookup_symbol(fn);
         type t = decl_type(e.m_decl);
         if (e.m_native.m_addr) {
-            object ** args2 = static_cast<object **>(LEAN_ALLOCA(args.size() * sizeof(object *))); // NOLINT
+            object ** args2 = static_cast<object **>(LEAN_ALLOCA(nargs * sizeof(object *))); // NOLINT
             array_ref<param> const & params = decl_params(e.m_decl);
             bool const boxed = e.m_native.m_boxed;
-            for (size_t i = 0; i < args.size(); i++) {
+            for (size_t i = 0; i < nargs; i++) {
                 type t = param_type(params[i]);
-                args2[i] = box_t(eval_arg(args[i]), t);
+                args2[i] = box_t(eval_i(i), t);
                 if (boxed && param_borrow(params[i])) {
                     // NOTE: If we chose the boxed version where the IR chose the unboxed one, we need to manually increment
                     // originally borrowed parameters because the wrapper will decrement these after the call.
@@ -1952,7 +2110,7 @@ private:
             }
             push_frame(e.m_decl, old_size);
             lean_assert(!type_is_scalar(t) || e.m_native.m_boxed);
-            object * o = curry(e.m_native.m_addr, args.size(), args2);
+            object * o = curry(e.m_native.m_addr, nargs, args2);
             if (type_is_scalar(t)) {
                 // NOTE: this unboxing does not exist in the IR, so we should manually consume `o`
                 r = unbox_t(o, t);
@@ -1972,14 +2130,18 @@ private:
                                           << "in the relevant `lean_exe` statement in your `lakefile.lean`.");
             }
             // evaluate args in old stack frame
-            for (const auto & arg : args) {
-                m_arg_stack.push_back(eval_arg(arg));
+            for (size_t i = 0; i < nargs; i++) {
+                m_arg_stack.push_back(eval_i(i));
             }
             push_frame(e.m_decl, old_size);
             r = eval_decl_body(e.m_decl);
         }
         pop_frame(r, t);
         return r;
+    }
+
+    value call(name const & fn, array_ref<arg> const & args) {
+        return call_with(fn, args.size(), [&](size_t i) { return eval_arg(args[i]); });
     }
 
     // closure stub
