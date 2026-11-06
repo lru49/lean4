@@ -57,5 +57,30 @@ must retain this update. Hits, absent hashes, and definite inequality do not cal
     onEvict { map := c.map.erase key }
     return none
 
+/--
+Like `find?`, but when the comparison exhausts `budget` it retries once with `retryBudget` before evicting.
+A definite answer of the retry is used as in `find?`; on a retry hit the entry is replaced by `(key, value)`
+(the same value under the caller's key object, so later lookups with that object are decided by pointer
+equality within the first budget) and `onUpdate` receives the updated cache. A second exhaustion evicts the
+candidate as in `find?`. The caller must retain the update. The retry stays bounded, so lookups keep a
+constant worst case (no quadratic comparison work on chains of freshly rebuilt keys, #15985).
+-/
+@[inline] def findRetry? {β : Type} [BudgetedBEq α] {m : Type → Type w} [Monad m] [MonadLiftT BaseIO m]
+    (c : BudgetedCache α β) (key : α) (onUpdate : BudgetedCache α β → m Unit)
+    (budget : USize := 64) (retryBudget : USize := 1024) : m (Option β) := do
+  let some (stored, value) := c.map.findEntry? key | return none
+  match ← BudgetedBEq.beq key stored budget with
+  | .true => return some value
+  | .false => return none
+  | .undef =>
+    match ← BudgetedBEq.beq key stored retryBudget with
+    | .true =>
+      onUpdate { map := c.map.insert key value }
+      return some value
+    | .false => return none
+    | .undef =>
+      onUpdate { map := c.map.erase key }
+      return none
+
 end BudgetedCache
 end Lean
