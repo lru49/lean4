@@ -266,6 +266,21 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
+/--
+Saves `snapToSave` wrapped with the init-mod indices used by `runInitAttrsForModules` on load.
+Writes a `<incrFile>.deps` JSON helper alongside: the dep regions grouped per module (see
+`regionsToModuleArtifacts`), needed to map the snapshot back in before we can access `env`.
+-/
+private def saveIncrSnap (incrFile : System.FilePath) (snapToSave : Language.Lean.InitialSnapshot)
+    (env : Environment) : IO Unit := do
+  let toSave : IncrSnapshot :=
+    { snap := snapToSave, initModIdxs := getRegularInitAttrModIdxs env }
+  let compactor ← (unsafe CompactedRegion.save incrFile `_snap toSave
+    env.header.regions none (allowClosures := true))
+  let moduleArts := regionsToModuleArtifacts env.header.regions
+  IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
+  Runtime.forget compactor
+
 def runFrontend
     (input : String)
     (opts : Options)
@@ -334,6 +349,15 @@ def runFrontend
     return snap
   let processor := Language.Lean.process
   let snap ← processor setup old? ctx
+  -- The header-only snapshot depends only on the post-import state: take it on a dedicated thread
+  -- as soon as the header is processed, overlapping with elaboration and `.olean` serialization.
+  let headerSave? ← incrHeaderSaveFileName?.mapM fun incrFile =>
+    IO.asTask (prio := .dedicated) do
+      let some parsed := snap.result? | return
+      let some hps := parsed.processedSnap.get.result? | return
+      saveIncrSnap incrFile (← Language.Lean.truncateToHeader snap) hps.cmdState.env
+  let waitHeaderSave : IO Unit := do
+    if let some t := headerSave? then IO.ofExcept (← IO.wait t)
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
 
@@ -341,7 +365,7 @@ def runFrontend
   let hasErrors ← snaps.runAndReport opts jsonOutput severityOverrides
 
   let some cmdState := Language.Lean.waitForFinalCmdState? snap
-    | return none
+    | do waitHeaderSave; return none
 
   let mut env := cmdState.env
   let finalOpts := cmdState.scopes[0]!.opts
@@ -352,18 +376,9 @@ def runFrontend
   for task in codeQualityEntryTasks do
     env := Lean.Linter.codeQualityLogExt.modifyState env fun entries => entries ++ task.get
 
-  -- Saves `snapToSave` wrapped with the init-mod indices used by `runInitAttrsForModules` on load.
-  -- Writes a `<incrFile>.deps` JSON helper alongside: the dep regions grouped per module (see
-  -- `regionsToModuleArtifacts`), needed to map the snapshot back in before we can access `env`.
   let saveSnap (incrFile : System.FilePath) (snapToSave : Language.Lean.InitialSnapshot) :
-      IO Unit := do
-    let toSave : IncrSnapshot :=
-      { snap := snapToSave, initModIdxs := getRegularInitAttrModIdxs env }
-    let compactor ← (unsafe CompactedRegion.save incrFile `_snap toSave
-      env.header.regions none (allowClosures := true))
-    let moduleArts := regionsToModuleArtifacts env.header.regions
-    IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
-    Runtime.forget compactor
+      IO Unit :=
+    saveIncrSnap incrFile snapToSave env
 
   -- save full incremental snapshot for next invocation
   if let some incrFile := incrSaveFileName? then
@@ -374,15 +389,12 @@ def runFrontend
     resolveCancelTokensForSave (Language.toSnapshotTree snap)
     saveSnap incrFile snap
 
-  -- save header-only snapshot (skips elaborated command bodies)
-  if let some incrFile := incrHeaderSaveFileName? then
-    saveSnap incrFile (← Language.Lean.truncateToHeader snap)
-
   -- stats should be displayed even if there are (non-import) errors
   if printStats then
     env.displayStats
 
   if hasErrors then
+    waitHeaderSave
     return none
 
   -- The `.ilean` contents only read the finished snapshots: compute them on a dedicated thread while the `.olean` is
@@ -420,6 +432,8 @@ def runFrontend
     let profile ← Firefox.Profile.export mainModuleName.toString startTime traceStates opts
     Firefox.Profile.serve <| Json.compress <| toJson profile
 
+  -- header-only snapshot (started right after the header was processed)
+  waitHeaderSave
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps
   return some env
