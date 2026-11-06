@@ -703,6 +703,24 @@ def execPlain (argv : Array String) (setupFile : System.FilePath) (setup : Modul
   try IO.FS.removeFile tmp catch _ => pure ()
   IO.Process.exit rc.toUInt8
 
+/--
+The pre-import continuation of the announced imports `imps` of a pending module (multi-level
+pre-start): `imps` up to its first pending module, followed by that module's announced imports
+expanded the same way (at most `fuel` levels), and nothing after it (the flag: a pending module was
+reached). Its DFS order is the prefix of the real one up to the first module that is not built yet.
+-/
+partial def expandPending (pending : Array Name) (pendImports : NameMap (Array Import))
+    (fuel : Nat) (imps : Array Import) : Array Import × Bool := Id.run do
+  let mut out := #[]
+  for i in imps do
+    if pending.contains i.module then
+      if fuel > 0 then
+        if let some sub := pendImports.find? i.module then
+          out := out ++ (expandPending pending pendImports (fuel - 1) sub).1
+      return (out, true)
+    out := out.push i
+  return (out, false)
+
 end Prestart
 
 open Prestart in
@@ -755,13 +773,15 @@ def prestartMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
     pure (some res) : IO (Option Language.Lean.SetupImportsResult)).toBaseIO
   let some res := (match r with | .ok r => r | .error _ => none) | return ← plain "header"
   let header := res.imports
-  unless pending.all (fun p => header.any (·.module == p)) do
-    return ← plain "a pending module is not a direct import"
+  unless pending.all (fun p => header.any (·.module == p) ||
+      pendImports.any fun _ is => is.any (·.module == p)) do
+    return ← plain "a pending module is neither a direct import nor an announced import of a pending one"
   let mut pre : Array Import := #[]
   for i in header do
     if pending.contains i.module then
       if let some imps := pendImports.find? i.module then
-        pre := pre ++ imps
+        -- (multi-level: a pending import of a pending module is expanded the same way)
+        pre := pre ++ (expandPending pending pendImports (pending.size + 1) imps).1
       break
     pre := pre.push i
   if pre.isEmpty then
