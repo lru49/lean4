@@ -14,4 +14,8 @@ namespace lean {
    interpreter (which prefers native symbols) and `runModInit` use native code for those modules. */
 void native_cache_note_olean(std::string const & fn, struct stat const & st);
 void native_cache_load_once();
+/* `--incr-load`: load the bundle a snapshot was saved with (true on success; false if `path` is not an
+   existing native-cache bundle), and stop any later automatic bundle choice in this process. */
+bool native_cache_load_recorded_bundle(std::string const & path);
+void native_cache_snapshot_loaded();
 }
