@@ -7,6 +7,7 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 .olean serialization and deserialization.
 */
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 #include <utility>
 #include <string>
@@ -449,10 +450,172 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
 // root to be interpreted as — the C side does no type checking and the caller is responsible for
 // using a type compatible with what was saved (see `CompactedRegion.read`).
 // Supports both `v2` and `v3` formats.
+
+#if defined(LEAN_MMAP) && defined(__linux__)
+/* Per-module part packs (optional, written by Lake next to the parts).
+   A module's `.olean`, `.olean.server` and `.olean.private` are saved at consecutive 64 KiB-aligned base addresses, and so are
+   its `.ir.sig` and `.ir`. A pack `<stem>.olean.pack` (resp. `<stem>.ir.pack`) holds the unchanged bytes of each part at file
+   offset `data_off + (part base - group_base)`, so ONE `mmap` of the pack at `group_base` puts every part at exactly the address
+   its own mapping would have had: same bytes, same addresses, no relocation, downstream `.olean` files unaffected. An import
+   then does one open/mmap per part family instead of one open/fstat/read/mmap/close per part (the mmaps serialise on the
+   process' mmap_lock). A part is served from the pack only if its file's size and mtime still match the pack entry (a pack that
+   is stale for a part, absent, unreadable or not mappable at `group_base` means the unchanged per-part path below).
+   `LEAN_OLEAN_PACK=0` disables reading packs. */
+struct olean_pack_header {
+    char     magic[8];      // "leanpak1"
+    uint32_t num_parts;
+    uint32_t reserved;
+    uint64_t group_base;    // lowest part base address (page aligned)
+    uint64_t data_off;      // file offset of the byte that maps to `group_base` (page aligned)
+    uint64_t data_size;     // bytes from `group_base` to the end of the last part
+};
+struct olean_pack_entry {
+    char     suffix[16];    // part file name minus the family stem, e.g. ".olean.server", ".ir.sig"; '\0'-padded
+    uint64_t base_addr;
+    uint64_t size;
+    int64_t  mtime_sec;
+    int64_t  mtime_nsec;
+};
+static_assert(sizeof(olean_pack_header) == 40 && sizeof(olean_pack_entry) == 48, "olean pack layout");
+static constexpr uint32_t olean_pack_max_parts = 8;
+
+struct olean_pack_state {
+    bool ok = false;
+    olean_pack_entry entries[olean_pack_max_parts];
+    bool served[olean_pack_max_parts] = {};
+    uint32_t num_parts = 0;
+};
+// Sharded by pack name: the import's mapping threads read different modules at the same time.
+struct olean_pack_shard {
+    std::mutex mutex;
+    std::unordered_map<std::string, olean_pack_state> packs;
+};
+static constexpr size_t olean_pack_num_shards = 64;
+static olean_pack_shard * g_olean_pack_shards = new olean_pack_shard[olean_pack_num_shards];
+
+static bool olean_pack_enabled() {
+    static bool enabled = [] { char const * v = getenv("LEAN_OLEAN_PACK"); return !(v && strcmp(v, "0") == 0); }();
+    return enabled;
+}
+
+static bool ends_with(std::string const & s, char const * suf, size_t & stem_len) {
+    size_t n = strlen(suf);
+    if (s.size() < n || s.compare(s.size() - n, n, suf) != 0) return false;
+    stem_len = s.size() - n;
+    return true;
+}
+
+/* Pack file name for a part file name, and the part's suffix; false if the file is not a module part. */
+static bool olean_pack_name(std::string const & fn, std::string & pack, std::string & suffix) {
+    size_t stem;
+    char const * fam;
+    if (ends_with(fn, ".olean", stem) || ends_with(fn, ".olean.server", stem) || ends_with(fn, ".olean.private", stem)) fam = ".olean";
+    else if (ends_with(fn, ".ir", stem) || ends_with(fn, ".ir.sig", stem)) fam = ".ir";
+    else return false;
+    suffix = fn.substr(stem);
+    if (suffix.size() >= sizeof(olean_pack_entry::suffix)) return false;
+    pack = fn.substr(0, stem) + fam + ".pack";
+    return true;
+}
+
+static olean_pack_state load_olean_pack(std::string const & pack) {
+    olean_pack_state st;
+    int fd = open(pack.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return st;
+    // header + entries fit in the first 4 KiB (at most 8 entries): one read
+    char head[sizeof(olean_pack_header) + sizeof(olean_pack_entry) * olean_pack_max_parts];
+    olean_pack_header h;
+    bool good = readn(fd, head, sizeof(head)) == static_cast<ssize_t>(sizeof(head));
+    if (good) {
+        memcpy(&h, head, sizeof(h));
+        good = memcmp(h.magic, "leanpak1", 8) == 0 && h.num_parts >= 1 && h.num_parts <= olean_pack_max_parts &&
+            h.group_base % 4096 == 0 && h.data_off % 4096 == 0 && h.data_off >= sizeof(head) && h.data_size > 0;
+    }
+    if (good) memcpy(st.entries, head + sizeof(h), sizeof(olean_pack_entry) * h.num_parts);
+    for (uint32_t i = 0; good && i < h.num_parts; i++) {
+        olean_pack_entry const & e = st.entries[i];
+        good = e.suffix[sizeof(e.suffix) - 1] == '\0' && e.base_addr >= h.group_base && e.size >= sizeof(olean_header) &&
+            e.base_addr - h.group_base + e.size <= h.data_size;
+    }
+    if (good) {
+        void * want = reinterpret_cast<void *>(h.group_base);
+        void * got = mmap(want, h.data_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, h.data_off);
+        if (got == want) {
+            st.ok = true;
+            st.num_parts = h.num_parts;
+        } else if (got != MAP_FAILED) {
+            munmap(got, h.data_size);
+        }
+    }
+    close(fd);
+    return st;
+}
+
+/* Serve part `fn` from its module's pack: on success `buffer`/`size` frame the part inside the pack mapping (at its saved base
+   address) and `st` is the part file's own stat. Each pack entry is handed out at most once (a later request for the same part,
+   e.g. after its region was freed, takes the per-part path). */
+static bool olean_pack_get(std::string const & fn, struct stat & st, char * & buffer, size_t & size) {
+    if (!olean_pack_enabled()) return false;
+    std::string pack, suffix;
+    if (!olean_pack_name(fn, pack, suffix)) return false;
+    olean_pack_shard & shard = g_olean_pack_shards[std::hash<std::string>()(pack) % olean_pack_num_shards];
+    bool known;
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        known = shard.packs.find(pack) != shard.packs.end();
+    }
+    if (!known) {
+        // I/O and the mmap outside the lock; parts of one module are read in sequence, so racing on the same pack is rare and
+        // only costs the loser's unmap.
+        olean_pack_state fresh = load_olean_pack(pack);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        // A loser of a race on the same pack cannot have mapped it (MAP_FIXED_NOREPLACE on the winner's range fails), so
+        // dropping its state leaks nothing.
+        shard.packs.emplace(pack, fresh);
+    }
+    // Claim the entry under the lock; the stat and the checks run outside it (the import's mapping threads read
+    // different modules concurrently and must not serialise on this lock).
+    olean_pack_entry e;
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        olean_pack_state & ps = shard.packs.at(pack);
+        if (!ps.ok) return false;
+        uint32_t i = 0;
+        for (; i < ps.num_parts; i++)
+            if (!ps.served[i] && strncmp(ps.entries[i].suffix, suffix.c_str(), sizeof(ps.entries[i].suffix)) == 0) break;
+        if (i == ps.num_parts) return false;
+        ps.served[i] = true; // a part whose checks fail below takes the per-part path, also on any later request
+        e = ps.entries[i];
+    }
+    if (stat(fn.c_str(), &st) != 0) return false;
+    if (static_cast<uint64_t>(st.st_size) != e.size || st.st_mtim.tv_sec != e.mtime_sec || st.st_mtim.tv_nsec != e.mtime_nsec)
+        return false;
+    olean_header const * h = reinterpret_cast<olean_header const *>(e.base_addr);
+    if (memcmp(h->marker, "olean", 5) != 0 || h->base_addr != e.base_addr) return false;
+    buffer = reinterpret_cast<char *>(e.base_addr);
+    size = e.size;
+    return true;
+}
+#endif
+
 extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
     std::string olean_fn(lean_string_cstr(ofname));
     try {
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
+        char * buffer = nullptr;
+        bool is_mmap = false;
+        size_t size = 0;
+        olean_header default_header = {};
+        olean_header header;
+#if defined(LEAN_MMAP) && defined(__linux__)
+        struct stat pack_st;
+        if (olean_pack_get(olean_fn, pack_st, buffer, size)) {
+            (void)pack_st;
+            memcpy(&header, buffer, sizeof(header));
+            is_mmap = true;
+        }
+#endif
+        if (!buffer) {
 #ifdef LEAN_WINDOWS
         HANDLE h_file = CreateFile(olean_fn.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h_file == INVALID_HANDLE_VALUE) {
@@ -475,10 +638,8 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
         if (fstat(fd.get(), &st) == -1) {
             return io_result_mk_error((sstream() << "failed to stat file '" << olean_fn << "': " << strerror(errno)).str());
         }
-        size_t size = st.st_size;
+        size = st.st_size;
 
-        olean_header default_header = {};
-        olean_header header;
         ssize_t read_size = readn(fd.get(), &header, sizeof(header));
         if (read_size < 0) {
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "': " << strerror(errno)).str());
@@ -495,9 +656,6 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', incompatible header").str());
         }
         char * base_addr = reinterpret_cast<char *>(header.base_addr);
-
-        char * buffer = nullptr;
-        bool is_mmap = false;
 
         // Map file COW-writable. The fallback walk in `region_reader::read()` writes
         // fixed pointers back into the region's memory when any dep region didn't land at its
@@ -573,6 +731,16 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 #endif
 #endif
         }
+
+        } // end of the per-part path
+        if ((header.version != 2 && header.version != 3) || header.flags != default_header.flags
+#ifdef LEAN_CHECK_OLEAN_VERSION
+            || strncmp(header.githash, LEAN_GITHASH, sizeof(header.githash)) != 0
+#endif
+        ) {
+            return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', incompatible header").str());
+        }
+        char * base_addr = reinterpret_cast<char *>(header.base_addr);
 
         // v3 format, default data otherwise
         std::vector<std::pair<size_t, ptrdiff_t>> lib_relocs;
