@@ -12,7 +12,7 @@ for `--load-dynlib` / Lake's `precompileModules`. This file adds a cache lookup 
 
   $LEAN_NATIVE_CACHE (default $XDG_CACHE_HOME/lean/native, else ~/.cache/lean/native)
     /<githash>-<target>/bundles/<id>.so        shared object with the compiled C of a set S of modules
-    /<githash>-<target>/bundles/<id>.manifest  "lean-native-bundle 1 <githash>" then one line per module
+    /<githash>-<target>/bundles/<id>.manifest  "lean-native-bundle 2 <githash> <toolchain id>" then one line per module
                                                of S: "<st_dev> <st_ino> <size> <mtime_ns> <.olean path>"
 
 A bundle is produced by a populate step (compile the C that Lake already emits for every module, link
@@ -32,6 +32,7 @@ Limitation (as for `--load-dynlib`): a process that imports twice keeps the code
 import; the cmdline frontend and Lake's worker processes import once.
 */
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -94,6 +95,8 @@ struct native_cache_state {
     }
 };
 
+static std::once_flag g_load_once;  // the automatic bundle choice happens at most once per process
+
 static native_cache_state & get_state() {
     static native_cache_state * s = new native_cache_state();  // never destroyed: used until exit
     return *s;
@@ -104,14 +107,65 @@ static bool ends_with(std::string const & s, char const * suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
+/* Identity of the running toolchain's shared runtime: "<name>:<dev>:<ino>:<size>:<mtime_ns>" of every
+   libleanshared*.so next to the object that contains this code (sorted by name, ';'-separated), or of
+   that object itself when it is not a libleanshared (statically linked executable). Two builds that
+   share a githash (e.g. differently patched toolchains) have different files, so a bundle compiled
+   against another build's lean.h/runtime is a miss, never a mismatch. */
+static std::string file_key(std::string const & path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return "";
+#if defined(__APPLE__)
+    struct timespec const & mt = st.st_mtimespec;
+#else
+    struct timespec const & mt = st.st_mtim;
+#endif
+    return std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":" +
+        std::to_string(static_cast<unsigned long long>(st.st_ino)) + ":" + std::to_string(static_cast<long long>(st.st_size)) + ":" +
+        std::to_string(static_cast<long long>(mt.tv_sec) * 1000000000LL + mt.tv_nsec);
+}
+
+static std::string const & toolchain_id() {
+    static std::string * id = [] {
+        std::string r;
+        Dl_info info;
+        if (dladdr(reinterpret_cast<void *>(&file_key), &info) && info.dli_fname) {
+            std::string self = info.dli_fname;
+            size_t slash = self.rfind('/');
+            std::string dir = slash == std::string::npos ? "." : self.substr(0, slash);
+            std::string base = slash == std::string::npos ? self : self.substr(slash + 1);
+            std::vector<std::string> names;
+            if (base.compare(0, 13, "libleanshared") == 0) {
+                if (DIR * d = opendir(dir.c_str())) {
+                    while (struct dirent * e = readdir(d)) {
+                        std::string n = e->d_name;
+                        if (n.compare(0, 13, "libleanshared") == 0 && ends_with(n, ".so")) names.push_back(n);
+                    }
+                    closedir(d);
+                }
+                std::sort(names.begin(), names.end());
+            } else {
+                names.push_back(base);
+            }
+            for (std::string const & n : names) {
+                if (!r.empty()) r += ";";
+                r += n + ":" + file_key(dir + "/" + n);
+            }
+        }
+        return new std::string(r);
+    }();
+    return *id;
+}
+
 /* Returns the number of modules of the bundle if every module listed in `manifest` was imported from the
    same file, 0 otherwise. */
 static size_t check_manifest(native_cache_state & s, std::string const & manifest, std::string & why) {
     std::ifstream in(manifest);
     if (!in) { why = "unreadable"; return 0; }
-    std::string magic, githash; int version = 0;
-    in >> magic >> version >> githash;
-    if (magic != "lean-native-bundle" || version != 1 || githash != LEAN_GITHASH) { why = "bad header"; return 0; }
+    std::string magic, githash, tcid; int version = 0;
+    in >> magic >> version >> githash >> tcid;
+    if (magic != "lean-native-bundle" || version != 2 || githash != LEAN_GITHASH) { why = "bad header"; return 0; }
+    if (tcid != toolchain_id()) { why = "built for another toolchain build (" + tcid + " vs " + toolchain_id() + ")"; return 0; }
     size_t n = 0;
     unsigned long long dev, ino; long long size, mtime_ns; std::string path;
     while (in >> dev >> ino >> size >> mtime_ns) {
@@ -142,8 +196,7 @@ void native_cache_note_olean(std::string const & fn, struct stat const & st) {
 }
 
 void native_cache_load_once() {
-    static std::once_flag once;
-    std::call_once(once, [] {
+    std::call_once(g_load_once, [] {
         native_cache_state & s = get_state();
         if (!s.m_enabled) return;
         std::lock_guard<std::mutex> lock(s.m_mutex);
@@ -171,8 +224,33 @@ void native_cache_load_once() {
         }
     });
 }
+
+/* `--incr-load` snapshots (module.cpp) bake closures into the region and record the shared objects
+   their code pointers point into. A snapshot saved by a process that had loaded a bundle needs that
+   bundle: load exactly the recorded file (the path names a content-addressed bundle) before the
+   relocation. A process that starts from a snapshot must not choose a bundle on its own afterwards:
+   the snapshot already holds the initialized environment (native or interpreted), and loading a
+   bundle later would run module initializers a second time. */
+bool native_cache_load_recorded_bundle(std::string const & path) {
+    if (!ends_with(path, ".so")) return false;
+    std::string man = path.substr(0, path.size() - 3) + ".manifest";
+    struct stat st;
+    if (stat(man.c_str(), &st) != 0) return false;  // not a native-cache bundle (or evicted)
+    bool ok = false;
+    std::call_once(g_load_once, [] {});  // no automatic choice after this
+    if (void * h = dlopen(path.c_str(), RTLD_LAZY | RTLD_GLOBAL)) { (void)h; ok = true; }
+    if (get_state().m_verbose)
+        std::cerr << "[native-cache] snapshot needs " << path << ": " << (ok ? "loaded" : dlerror()) << "\n";
+    return ok;
+}
+
+void native_cache_snapshot_loaded() {
+    std::call_once(g_load_once, [] {});
+}
 #else
 void native_cache_note_olean(std::string const &, struct stat const &) {}
 void native_cache_load_once() {}
+bool native_cache_load_recorded_bundle(std::string const &) { return false; }
+void native_cache_snapshot_loaded() {}
 #endif
 }
