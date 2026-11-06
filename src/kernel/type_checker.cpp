@@ -162,7 +162,7 @@ bool   g_pool_enabled     = true;
    MT marking at all (the marking costs ~1.3 % wall on a kernel-heavy module); the price is a miss whenever the next
    check of a chain lands on another task-manager worker. The per-thread pool is never freed (a few states per worker
    thread, bounded by the slots). */
-bool   g_pool_tls         = false;
+bool   g_pool_tls         = true;   // default ON (perf-race2-kpool-tls-on-r2); LEAN_KERNEL_CACHE_POOL_TLS=0 = the process-wide pool with MT marking
 LEAN_THREAD_PTR(kernel_state_pool, g_tls_pool);
 static kernel_state_pool * current_pool() {
     if (!g_pool_tls) return g_kernel_state_pool;
@@ -171,7 +171,7 @@ static kernel_state_pool * current_pool() {
 }
 void init_kernel_state_pool_config() {
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL")) g_pool_enabled = !(s[0] == '0' && s[1] == 0);
-    if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_TLS")) g_pool_tls = (s[0] == '1' && s[1] == 0);
+    if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_TLS")) g_pool_tls = !(s[0] == '0' && s[1] == 0);
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_MAX_ENTRIES")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0) g_pool_max_entries = v; }
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_SLOTS")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0 && v > 0) g_pool_slots = v; }
 }
