@@ -3211,14 +3211,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   let publicFind? := (ImportedConsts.mergeModuleTreesLazy publicTrees).find?
   let publicImported ← withCache <|
     ImportedConsts.mergeModuleTreesLazy publicTrees (resolveImportedEntry publicFind?)
-  let conflicts? ←
-    if parConflicts then
-      some <$> IO.asTask do
-        checkImportConflicts s imports modules moduleData
-        return privImported.forceRoot + importedExtraConsts.forceRoot
-    else
-      pure none
-  ParallelImport.tick "import conflicts checked, constant tries set up (merged lazily)"
+  ParallelImport.tick "constant tries set up (merged lazily)"
 
   let exts ← mkInitialExtensionStates
   let privateBase : Kernel.Environment := {
@@ -3269,15 +3262,35 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
     ParallelImport.tick "markPersistent 1"
-  if let some t := conflicts? then
-    let rootChildren ← IO.ofExcept (← IO.wait t)
-    ParallelImport.tick s!"import conflicts checked, trie roots expanded ({rootChildren} root children; task joined)"
+  -- lean-perf (race2fix, sweep-late): the conflict-sweep task is spawned only AFTER `markPersistent 1`
+  -- and joined only before `markPersistent 2`. Everything it traverses is reachable from `env`, hence
+  -- persistent after the first walk (never counted by anyone), and the trie nodes it creates by forcing
+  -- the lazily merged roots are thunk values of persistent thunks, which the runtime marks thread-shared
+  -- when it stores them (`lean_thunk_get_core`), so the state tasks and the import thread count them
+  -- atomically; the second walk runs after the join. This keeps the rule "no plain-store persistent walk
+  -- while a task can reach the objects" (the first instance of its violation, L04's spawn-before-walk,
+  -- cost one crash per ~25k modules on a loaded x86 host) without putting the sweep on the critical path:
+  -- it now overlaps the extension states instead of the environment assembly. A real duplicate still
+  -- raises the same `IO.userError`, at the join: `resolveImportedEntry` picks a winner silently
+  -- meanwhile, so the only difference on that error path is wasted work before the message.
+  let conflicts? ←
+    if parConflicts then
+      some <$> IO.asTask do
+        checkImportConflicts s imports modules moduleData
+        return privImported.forceRoot + importedExtraConsts.forceRoot
+    else
+      pure none
+  let joinConflicts : IO Unit := do
+    if let some t := conflicts? then
+      let rootChildren ← IO.ofExcept (← IO.wait t)
+      ParallelImport.tick s!"import conflicts checked, trie roots expanded ({rootChildren} root children; task joined)"
   if loadExts then
     -- lean-perf: pure extension states are computed on tasks (only with `leakEnv`: the environment is
     -- already persistent then, so capturing it in task closures costs nothing)
     let parExts := leakEnv && importThreads > 1 && (← ParallelImport.envEnabled "LEAN_IMPORT_PAR_EXTS")
     env ← finalizePersistentExtensions env moduleData opts (par := parExts)
     ParallelImport.tick "extension states"
+    joinConflicts
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.
@@ -3286,6 +3299,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
         extensions' `addImportFn`s did not spawn any unbound tasks. -/
       env ← unsafe Runtime.markPersistent env
       ParallelImport.tick "markPersistent 2"
+  else
+    joinConflicts
   return { env with importRealizationCtx? := some {
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast env
