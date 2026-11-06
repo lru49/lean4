@@ -21,8 +21,6 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 // Linux include files
 #include <unistd.h> // NOLINT
 #include <sys/mman.h>
-#include <sched.h>
-#include <sys/syscall.h>
 #include <sys/file.h>
 #ifndef LEAN_EMSCRIPTEN
 #include <sys/random.h>
@@ -1698,58 +1696,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_wait_any(b_obj_arg task_list) {
     return v;
 }
 
-#if defined(__linux__) && !defined(LEAN_EMSCRIPTEN)
-/* Detached address-space teardown at exit (Linux).
-   When a process exits, the kernel unmaps its whole address space before the parent's `wait` returns: for a `lean`
-   process that imported a large library this is tens of thousands of olean mappings plus the heap. Before `exit`, we
-   start a helper that shares the address space (`clone(CLONE_VM)`, a separate process, not a thread of ours), closes
-   every inherited descriptor (so no pipe, file or lock stays open on our behalf) and blocks on a pipe whose write end
-   only we hold. Our own exit then only drops a reference to the address space; the parent sees our exit status at once,
-   and the helper, released by the pipe's EOF when our descriptors close, tears the address space down off the
-   critical path. Everything observable by the parent (exit code, files closed, stdout/stderr flushed by `exit`) is
-   unchanged; only the release of memory happens a moment later in the helper. Enabled by the `lean` driver
-   (`lean_enable_exit_detach`); `LEAN_EXIT_DETACH=0` disables it. Any failure falls back to a plain `exit`. */
-static bool g_exit_detach = false;
-extern "C" LEAN_EXPORT void lean_enable_exit_detach() {
-    char const * e = getenv("LEAN_EXIT_DETACH");
-    g_exit_detach = !(e && e[0] == '0');
-}
-static int exit_detach_helper(void * arg) {
-    // only raw system calls here: we run on a private stack inside the parent's address space
-    long rd = (long)(intptr_t)arg;
-    bool closed = false;
-#ifdef SYS_close_range
-    closed = syscall(SYS_close_range, 0, rd - 1, 0) == 0 && syscall(SYS_close_range, rd + 1, ~0U, 0) == 0;
-#endif
-    if (!closed) {
-        for (long fd = 0; fd < 65536; fd++)
-            if (fd != rd) syscall(SYS_close, fd);
-    }
-    char c;
-    while (syscall(SYS_read, rd, &c, 1) < 0) {}
-    syscall(SYS_exit, 0);
-    return 0;
-}
-static void exit_detach_start() {
-    int p[2];
-    if (pipe2(p, O_CLOEXEC) != 0) return;
-    size_t const sz = 64 * 1024;
-    void * stk = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    if (stk == MAP_FAILED) { close(p[0]); close(p[1]); return; }
-    int pid = clone(exit_detach_helper, static_cast<char *>(stk) + sz, CLONE_VM, (void *)(intptr_t)p[0]);
-    close(p[0]);
-    if (pid < 0) { close(p[1]); munmap(stk, sz); return; }
-    // p[1] stays open until our exit closes it, which releases the helper
-}
-#else
-extern "C" LEAN_EXPORT void lean_enable_exit_detach() {}
-#endif
-
 extern "C" LEAN_EXPORT obj_res lean_io_exit(uint8_t code) {
-#if defined(__linux__) && !defined(LEAN_EMSCRIPTEN)
-    if (g_exit_detach)
-        exit_detach_start();
-#endif
     exit(code);
 }
 
