@@ -15,6 +15,7 @@ import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
 import Lake.Build.HeaderSnapshot
+import Lake.Build.SetupCache
 import Init.Omega
 
 /-! # Module Build Definitions -/
@@ -1186,6 +1187,7 @@ def Module.buildLean
       | .ok srcText =>
         HeaderSnapshot.plan (mod.pkg.buildDir / "headers") srcText setup importHash args
           (← getLean) (← getLeanInstall).githash #[("LEAN_PATH", some leanPath.toString)]
+          (allowSave := (← IO.getEnv "LAKE_HEADER_SNAPSHOT_BUILD_SAVES") == some "1")
       | .error _ => pure {}
     | none => pure {}
   hsnap.startSave
@@ -1840,6 +1842,12 @@ where
       | some importHash => do
         match (← (IO.FS.readFile leanFile).toBaseIO) with
         | .ok srcText =>
+          -- record the preparation for the next `lake lean` (see `Lake.SetupCache`)
+          if let .ok header ← (Lean.parseImports' srcText leanFile.toString).toBaseIO then
+            let ws ← getWorkspace
+            let modName := (ws.findModuleBySrc? leanFile).map (·.name) |>.getD .anonymous
+            SetupCache.write ws (SetupCache.key ws modName header moreArgs) setup cfgArgs importHash
+              (buildDir / "headers")
           HeaderSnapshot.plan (buildDir / "headers") srcText setup importHash (cfgArgs ++ moreArgs)
             (← getLean) (← getLeanInstall).githash env
         | .error _ => pure {}

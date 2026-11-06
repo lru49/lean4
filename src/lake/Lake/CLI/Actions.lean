@@ -11,6 +11,7 @@ import Lake.Build.Run
 import Lake.Build.Actions
 import Lake.Build.Targets
 import Lake.Build.Module
+import Lake.Build.SetupCache
 import Lake.Util.Proc
 
 namespace Lake
@@ -109,7 +110,10 @@ public def Workspace.evalLeanFile
   (ws : Workspace) (leanFile : FilePath)
   (moreArgs : Array String := #[]) (buildConfig : BuildConfig := {})
 : IO UInt32 := do
-  let spawnArgs ← ws.runBuild (cfg := buildConfig) do
-    prepareLeanCommand leanFile moreArgs
+  -- fast path: a recorded preparation whose inputs are unchanged (see `Lake.SetupCache`)
+  let spawnArgs ← match (← SetupCache.tryFast ws leanFile moreArgs) with
+    | some spawnArgs => pure spawnArgs
+    | none => ws.runBuild (cfg := buildConfig) do
+      prepareLeanCommand leanFile moreArgs
   let child ← IO.Process.spawn spawnArgs
   child.wait
