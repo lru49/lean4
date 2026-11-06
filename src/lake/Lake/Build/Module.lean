@@ -1258,6 +1258,7 @@ def Module.maybePrestart (mod : Module) : FetchM Unit := do
   let dbg (why : String) : BaseIO Unit := do
     if (← IO.getEnv "LAKE_PRESTART_DEBUG") == some "1" then
       discard <| (IO.eprintln s!"[prestart] {mod.name}: {why}").toBaseIO
+  let inputs ← imps.mapM (·.input.fetch)
   discard <| BaseIO.asTask (prio := .dedicated) do
     let some i ← waitAllButOne flags | dbg "no single late import"
     let some late := imps[i]? | return
@@ -1312,8 +1313,12 @@ def Module.maybePrestart (mod : Module) : FetchM Unit := do
     let lateArts := jobs[i]!.task.map (sync := true) fun
       | .ok info _ => .ok info.allArts
       | .error .. => .error (IO.userError "late import failed")
+    let lateImports : NameMap (Array Import) := Id.run do
+      let some j := inputs[i]? | return {}
+      let .ok inp _ := j.task.get | return {}
+      return ({} : NameMap (Array Import)).insert late.name inp.header.imports
     let r ← (prestartLeanModule input.path {setup0 with importArts := closure} setupFile arts
-      args leanPath lean #[(late.name, lateArts)]).toBaseIO
+      args leanPath lean #[(late.name, lateArts)] (lateImports := lateImports)).toBaseIO
     dbg s!"prestart {late.name}: {repr (r.toOption)}"
 
 /--

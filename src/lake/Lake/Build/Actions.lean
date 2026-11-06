@@ -158,6 +158,9 @@ public def prestartLeanModule
   (leanFile : FilePath) (setup : ModuleSetup) (setupFile : FilePath) (arts : ModuleArtifacts)
   (leanArgs : Array String) (leanPath : SearchPath) (lean : FilePath)
   (late : Array (Name × Task (Except IO.Error ImportArtifacts)))
+  /- The direct imports of late imports (header order), sent as `"imports"` so that lean can
+  pre-import them in place of the late import (lane DY, see lean's `prestartMain`). -/
+  (lateImports : NameMap (Array Import) := {})
 : IO Bool := do
   if let some .stock := (← prestartRef.get).find? (prestartKey leanFile) then return false
   -- A separate setup file: the module may still be started the normal way concurrently.
@@ -170,7 +173,10 @@ public def prestartLeanModule
   }
   let (stdin, child) ← child.takeStdin
   let pending := Json.arr (late.map fun (n, _) => toJson n)
-  stdin.putStrLn (Json.mkObj [("pending", pending)]).compress
+  let imports := late.filterMap fun (n, _) => (lateImports.find? n).map fun is => (n.toString, toJson is)
+  let first := if imports.isEmpty then [("pending", pending)]
+    else [("pending", pending), ("imports", Json.mkObj imports.toList)]
+  stdin.putStrLn (Json.mkObj first).compress
   stdin.flush
   let lateArts ← IO.asTask (prio := .dedicated) do
     let mut out := #[]
