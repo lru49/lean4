@@ -335,6 +335,28 @@ static inline lean_object * pop_back(lean_object * & todo) {
 static inline void dec(lean_object * o, lean_object* & todo) {
     if (lean_is_scalar(o))
         return;
+#if !defined(LEAN_TSAN)
+    if (sizeof(void*) == 8) {
+        /* lean-perf (DS): branch-avoiding worklist update ("branch-avoiding graph algorithms", Green,
+           Dukhan & Vuduc, SPAA 2015). Whether a single-threaded child's count is 1 (it dies: link it onto
+           the worklist) or larger (decrement it) is data-dependent and was the cascade's main branch
+           misprediction. Both outcomes are now one 8-byte header store selected by a mask: for
+           `rc >= 2` the header minus 1 (only the low 32-bit count changes, no borrow), for `rc == 1`
+           the `set_next` encoding (upper 16 bits kept, low 48 bits = old worklist head). Same writes
+           as before for both cases; the other cases keep their branches. */
+        int rc = lean_internal_get_rc(o);
+        if (LEAN_LIKELY(rc > 0)) {
+            uint64_t h;
+            memcpy(&h, o, 8);
+            uint64_t last   = (uint64_t)0 - (uint64_t)(rc == 1);  // all ones iff the child dies
+            uint64_t linked = (h & 0xFFFF000000000000ull) | (uint64_t)(uintptr_t)todo;
+            uint64_t nh     = (linked & last) | ((h - 1) & ~last);
+            memcpy(o, &nh, 8);
+            todo = (lean_object *)(((uintptr_t)o & (uintptr_t)last) | ((uintptr_t)todo & ~(uintptr_t)last));
+            return;
+        }
+    }
+#endif
     if (LEAN_LIKELY(lean_internal_get_rc(o) > 1)) {
         lean_internal_sub_rc(o, 1);
     } else if (lean_internal_get_rc(o) == 1) {
