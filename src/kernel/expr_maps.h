@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #pragma once
+#include <vector>
 #include <functional>
 #include <cstdlib>
 #include "util/alloc.h"
@@ -30,6 +31,8 @@ class expr_flat_map {
     entry *  m_tab  = nullptr;
     size_t   m_mask = 0;
     size_t   m_size = 0;
+    // lean-perf (race #2, kernel pool): keys/values inserted since the last `mark_new_mt` (see type_checker::state::mark_new_mt)
+    std::vector<lean_object *> m_unmarked;
     // Small first table: a type_checker::state (and so its five caches) is created for every kernel call, most of which
     // touch a handful of terms; 64 initial slots (1.5 KB zeroed and scanned per cache) cost 1.4 % of cycles on a module
     // of many small declarations, 8 slots cost nothing measurable and the table doubles when needed.
@@ -82,6 +85,11 @@ public:
         free_block(m_tab);
     }
     size_t size() const { return m_size; }
+    /** \brief `lean_mark_mt` every key and value inserted since the last call (they are kept alive by the table). */
+    void mark_new_mt() {
+        for (lean_object * o : m_unmarked) lean_mark_mt(o);
+        m_unmarked.clear();
+    }
     /** \brief Release every entry and the table (the next `insert` starts from the initial capacity again). */
     void clear() {
         if (m_tab == nullptr) return;
@@ -91,6 +99,7 @@ public:
         }
         free_block(m_tab);
         m_tab = nullptr; m_mask = 0; m_size = 0;
+        m_unmarked.clear();
     }
     /** \brief Borrowed reference to the value stored for a key structurally equal to `k`, or nullptr. */
     lean_object * find(expr const & k) const {
@@ -116,6 +125,7 @@ public:
                 lean_inc(k.raw()); lean_inc(v.raw());
                 e.m_key = k.raw(); e.m_val = v.raw();
                 m_size++;
+                m_unmarked.push_back(e.m_key); m_unmarked.push_back(e.m_val);
                 return;
             }
             if (key_eq(e, k)) return;
