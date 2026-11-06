@@ -216,19 +216,32 @@ string(APPEND LEAN_EXTRA_CXX_FLAGS " -ffp-contract=off")
 # exists. Functions changed since the profile was recorded are detected by their control-flow hash and compiled
 # without profile data, so a stale profile only loses benefit. Regenerate with `-fprofile-generate` (see
 # `src/pgo/README.txt`). Set `-DLEAN_PGO_PROFILE=` (empty) to build without it.
+# A profile recorded on the target architecture (`src/pgo/lean-<CMAKE_SYSTEM_PROCESSOR>.profdata.tar.xz`, e.g. `aarch64`)
+# is preferred; otherwise the default `lean.profdata.tar.xz` (recorded on x86_64) is used, which clang applies to the
+# functions whose control flow matches.
 set(LEAN_PGO_PROFILE_DEFAULT "")
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
-  set(LEAN_PGO_PROFILE_DEFAULT "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  if(EXISTS "${LEAN_SOURCE_DIR}/pgo/lean-${CMAKE_SYSTEM_PROCESSOR}.profdata.tar.xz")
+    set(LEAN_PGO_PROFILE_DEFAULT "${LEAN_SOURCE_DIR}/pgo/lean-${CMAKE_SYSTEM_PROCESSOR}.profdata.tar.xz")
+  elseif(EXISTS "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+    set(LEAN_PGO_PROFILE_DEFAULT "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+  endif()
 endif()
 set(LEAN_PGO_PROFILE "${LEAN_PGO_PROFILE_DEFAULT}" CACHE STRING "LLVM .profdata (or .tar.xz of one) for profile-guided optimization")
+# Build directories configured before the per-architecture profiles cached the x86_64 default path; keep following the
+# default selection for them.
+set(LEAN_PGO_PROFILE_USE "${LEAN_PGO_PROFILE}")
+if(LEAN_PGO_PROFILE STREQUAL "${LEAN_SOURCE_DIR}/pgo/lean.profdata.tar.xz")
+  set(LEAN_PGO_PROFILE_USE "${LEAN_PGO_PROFILE_DEFAULT}")
+endif()
 set(LEAN_CORE_LEANC_FLAGS "")
-if(LEAN_PGO_PROFILE AND NOT STAGE EQUAL 0)
-  if(LEAN_PGO_PROFILE MATCHES "\\.tar\\.xz$")
+if(LEAN_PGO_PROFILE_USE AND NOT STAGE EQUAL 0)
+  if(LEAN_PGO_PROFILE_USE MATCHES "\\.tar\\.xz$")
     file(REMOVE_RECURSE "${CMAKE_BINARY_DIR}/pgo")
-    file(ARCHIVE_EXTRACT INPUT "${LEAN_PGO_PROFILE}" DESTINATION "${CMAKE_BINARY_DIR}/pgo")
+    file(ARCHIVE_EXTRACT INPUT "${LEAN_PGO_PROFILE_USE}" DESTINATION "${CMAKE_BINARY_DIR}/pgo")
     file(GLOB LEAN_PGO_PROFDATA "${CMAKE_BINARY_DIR}/pgo/*.profdata")
   else()
-    set(LEAN_PGO_PROFDATA "${LEAN_PGO_PROFILE}")
+    set(LEAN_PGO_PROFDATA "${LEAN_PGO_PROFILE_USE}")
   endif()
   message(STATUS "Profile-guided optimization with ${LEAN_PGO_PROFDATA}")
   set(LEAN_PGO_FLAGS "-fprofile-use=${LEAN_PGO_PROFDATA} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin")

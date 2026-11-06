@@ -15,3 +15,6 @@ NumberTheory/Padics/PadicVal/Basic, GroupTheory/Sylow, Data/Matrix/Basic, SetThe
 Combinatorics/SimpleGraph/Basic), one `import Mathlib` file with linarith/positivity/simp/omega/#eval at
 -j 8, and a no-op `lake build --no-build` of a Mathlib target. Raw profiles (LLVM_PROFILE_FILE=<dir>/lean-%8m.profraw)
 merged with: llvm-profdata merge --sparse -o lean.profdata <dir>/*.profraw; tar -cJf lean.profdata.tar.xz lean.profdata
+
+lean-aarch64.profdata.tar.xz: the same workload recorded on aarch64 (Graviton4 r8g, Neoverse V2, Ubuntu clang 18.1.3)
+on stack head 9bb3b436ec; selected automatically when CMAKE_SYSTEM_PROCESSOR is aarch64.
