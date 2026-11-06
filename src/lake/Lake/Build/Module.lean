@@ -1212,6 +1212,111 @@ inductive ModuleFetchState
 | incomplete (savedTrace : SavedTrace) (ltar? : Option Artifact)
 
 /--
+Waits until all but one of `tasks` are finished and returns the index of the unfinished one;
+`none` if all finish (nothing to pre-start) or one of the finished ones failed.
+-/
+partial def waitAllButOne (tasks : Array (Task Bool)) : BaseIO (Option Nat) :=
+  go (Array.range tasks.size).toList
+where
+  go : List Nat → BaseIO (Option Nat)
+    | [] => pure none
+    | [j] => pure (some j)
+    | j :: js => do
+      let t :: ts := (j :: js).map fun k => tasks[k]!.map (sync := true) fun ok => (k, ok)
+        | pure none
+      let (k, ok) ← IO.waitAny (t :: ts)
+      if ok then go ((j :: js).erase k) else pure none
+
+/--
+`LAKE_PRESTART=1`: start the module's `lean` as soon as all but one of its direct imports are
+built (see `prestartLeanModule`), giving it the import artifacts of the built ones now and the
+last one's on stdin when it is built. Only for non-`module` files, and only when the built
+imports' closures are known from setups computed in this process (`transImportArtsMemo`), so the
+pre-start setup is exactly the final setup minus the last import's entry. The process is adopted
+by `compileLeanModule` if the module is rebuilt with the same command line and setup, and killed
+otherwise. Must run after the module's `presetup` was fetched (all jobs used here are then in the
+build store).
+-/
+def Module.maybePrestart (mod : Module) : FetchM Unit := do
+  let input ← (← mod.input.fetch).await
+  if input.header.isModule then return
+  let imps := input.imports.filterMap (·.module?)
+  if imps.isEmpty then return
+  let jobs ← imps.mapM (·.fetchExportInfo)
+  let presetups ← imps.mapM (·.presetup.fetch)
+  let leanPath ← getLeanPath
+  let lean ← getLean
+  let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
+  let setup0 : ModuleSetup := {
+    name := mod.name, isModule := false, package? := mod.pkg.id?, imports? := none
+    dynlibs := #[], plugins := #[], options := mod.leanOptions ++ extra
+  }
+  let arts := mod.mkArtifacts input.path false
+  let args := mod.weakLeanArgs ++ mod.leanArgs
+  let setupFile := mod.setupFile
+  let flags := jobs.map fun j => j.task.map (sync := true) (· matches .ok ..)
+  let dbg (why : String) : BaseIO Unit := do
+    if (← IO.getEnv "LAKE_PRESTART_DEBUG") == some "1" then
+      discard <| (IO.eprintln s!"[prestart] {mod.name}: {why}").toBaseIO
+  discard <| BaseIO.asTask (prio := .dedicated) do
+    let some i ← waitAllButOne flags | dbg "no single late import"
+    let some late := imps[i]? | return
+    let some lateSetupJob := presetups[i]? | return
+    let .ok lp _ := lateSetupJob.task.get | return
+    if lp.isModule then
+      dbg "late import is a module"
+      return
+    -- Wait until the last import's own `lean` was started (its setup closure is memoized).
+    let key := transImportArtsMemoKey late lp.trace.hash
+    let rec waitStarted : Nat → BaseIO (Option (NameMap ImportArtifacts))
+      | 0 => return none
+      | n + 1 => do
+        if let some c := (← transImportArtsMemo.get).find? key then return some c
+        if (← IO.hasFinished jobs[i]!.task) then return none
+        IO.sleep 10
+        waitStarted n
+    let some lateClosure ← waitStarted 360000 | dbg "late import finished before its setup was seen"
+    let rec waitSlot : Nat → BaseIO Bool
+      | 0 => return false
+      | n + 1 => do
+        if (← prestartSlotFree) then return true
+        if (← IO.hasFinished jobs[i]!.task) then return false
+        IO.sleep 10
+        waitSlot n
+    unless (← waitSlot 360000) do
+      dbg "no free slot before the late import finished"
+      return
+    let memo ← transImportArtsMemo.get
+    let mut closure := lateClosure
+    let mut roots : Array (Name × ImportArtifacts) := #[]
+    let mut uncovered : Array Name := #[]
+    for h : k in [0:imps.size] do
+      if k == i then continue
+      let imp := imps[k]
+      let .ok info _ := jobs[k]!.task.get | return
+      let .ok pk _ := presetups[k]!.task.get | return
+      match (if pk.isModule then none else memo.find? (transImportArtsMemoKey imp pk.trace.hash)) with
+      | some c =>
+        for (n, a) in c do
+          unless closure.contains n do closure := closure.insert n a
+        roots := roots.push (imp.name, info.allArts)
+      | none => uncovered := uncovered.push imp.name
+    -- An import without a known closure must already be inside the (downward closed) union.
+    for n in uncovered do
+      unless closure.contains n do
+        dbg s!"uncovered import {n}"
+        return
+    for (n, a) in roots do
+      closure := closure.insert n a
+    if closure.contains late.name then return
+    let lateArts := jobs[i]!.task.map (sync := true) fun
+      | .ok info _ => .ok info.allArts
+      | .error .. => .error (IO.userError "late import failed")
+    let r ← (prestartLeanModule input.path {setup0 with importArts := closure} setupFile arts
+      args leanPath lean #[(late.name, lateArts)]).toBaseIO
+    dbg s!"prestart {late.name}: {repr (r.toOption)}"
+
+/--
 Recursively build a Lean module.
 Fetch its dependencies and then elaborate the Lean source file, producing
 all possible artifacts (e.g., `.olean`, `.ilean`, `.c`, `.bc`).
@@ -1224,9 +1329,11 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
+  if (← prestartEnabled) then mod.maybePrestart
   presetupJob.mapM fun presetup => do
     setTrace presetup.trace
     let arts ← fetchCore presetup
+    if (← prestartEnabled) then killPrestarted presetup.srcFile
     let arts ← adjustMTime arts mod.traceFile
     return arts
 where
