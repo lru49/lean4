@@ -60,6 +60,8 @@ public:
         /** Mark everything this state references that is not thread-shared yet as thread-shared (`lean_mark_mt`), before
             the state is published to the pool, where another thread may take it over (see `pooled_state::commit`). */
         void mark_new_mt();
+        /** Forget the log of unmarked entries without marking (per-thread pool: nothing crosses a thread). */
+        void drop_unmarked_log();
     };
     /** \brief A `state` borrowed from the process-wide pool of kernel states (see `kernel_state_pool` in
         type_checker.cpp). `environment::add_*` acquires one for the environment it checks against, so the
