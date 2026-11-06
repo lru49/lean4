@@ -7,7 +7,7 @@ OUT="$(lean "$F")" || fail "lean failed"
 printf '#eval (IO.Process.exit 7 : IO Unit)\n' > "$F"
 run_exit 7 lean "$F"
 LEAN_EXIT_DETACH=0 run_exit 7 lean "$F"
-OUT="$(LEAN_EXIT_DETACH=0 lean "${F%.lean}.nonexistent.lean" 2>&1)"; A=$?
-OUT2="$(lean "${F%.lean}.nonexistent.lean" 2>&1)"; B=$?
+OUT="$(LEAN_EXIT_DETACH=0 lean "${F%.lean}.nonexistent.lean" 2>&1)" && A=0 || A=$?
+OUT2="$(lean "${F%.lean}.nonexistent.lean" 2>&1)" && B=0 || B=$?
 [[ "$A" == "$B" && "$OUT" == "$OUT2" ]] || fail "exit status/output differ with and without the helper: $A/$B"
 rm -f "$F"
