@@ -234,7 +234,10 @@ private def inferFVarType (fvarId : FVarId) : MetaM Expr := do
     inferType
   else
     let key ← mkExprConfigCacheKey e
-    match ← (← get).cache.inferType.find? key (fun c => modifyInferTypeCache fun _ => c) with
+    -- A key whose budgeted comparison is exhausted (typically a structurally equal but unshared term) gets one
+    -- bounded retry with a larger budget: the stored type is the type of an equal term under the same configuration,
+    -- so recomputing it would only reproduce it.
+    match ← (← get).cache.inferType.findRetry? key (fun c => modifyInferTypeCache fun _ => c) with
     | some type => return type
     | none =>
       Core.checkInterrupted
