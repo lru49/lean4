@@ -44,6 +44,8 @@ public:
            keyed by `mk_app(rec_fn, rule_rhs)` (`rec_fn` = the recursor constant with its universe levels). A pure
            function of the rule object and the levels, as `m_unfold` is for definitions (see `instantiate_rec_rhs`). */
         expr_flat_map<expr>       m_rec_rhs;
+        /* lean-perf (race #2): expressions of the pairs inserted into `m_success`/`m_failure` since the last `mark_new_mt` */
+        std::vector<lean_object *> m_unmarked_pairs;
         friend type_checker;
     public:
         state(environment const & env);
@@ -55,6 +57,9 @@ public:
         /** Re-target a pooled state at `env` (a descendant of the environment it was built under) and drop the
             caches whose entries are not functions of the environment alone (see `pooled_state`). */
         void retarget(environment const & env);
+        /** Mark everything this state references that is not thread-shared yet as thread-shared (`lean_mark_mt`), before
+            the state is published to the pool, where another thread may take it over (see `pooled_state::commit`). */
+        void mark_new_mt();
     };
     /** \brief A `state` borrowed from the process-wide pool of kernel states (see `kernel_state_pool` in
         type_checker.cpp). `environment::add_*` acquires one for the environment it checks against, so the
