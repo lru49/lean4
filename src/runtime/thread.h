@@ -50,9 +50,7 @@ using std::memory_order_acq_rel;
 using std::memory_order_seq_cst;
 using std::atomic_thread_fence;
 namespace this_thread = std::this_thread;
-/* lean-perf: number of CPUs this process may run on (the affinity mask: taskset, cpusets, container CPU sets) on
-   Linux, else `std::thread::hardware_concurrency()` (which counts every online CPU and ignores the mask). */
-LEAN_EXPORT unsigned hardware_concurrency();
+inline unsigned hardware_concurrency() { return std::thread::hardware_concurrency(); }
 /** Simple thread class that allows us to set the thread stack size.
     We implement it using pthreads on OSX/Linux and WinThreads on Windows. */
 class LEAN_EXPORT lthread {
