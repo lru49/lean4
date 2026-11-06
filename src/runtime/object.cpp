@@ -660,6 +660,24 @@ static void defer_visit(object * o, defer_stack & stack, defer_tally & tally, ui
    v1 deleted them unconditionally and raced with `lean_finalize_task_manager` (lake deadlocked in exit on aarch64; the
    same race is a use-after-free). */
 static std::shared_mutex * g_defer_rt_mutex = nullptr;
+/* `lean_mark_persistent` stores count 0 with PLAIN writes into every object it reaches, thread-shared ones included, so
+   no other thread may update those counts meanwhile (upstream: the objects belong to the marking thread or are no longer
+   touched). The release thread breaks that by decrementing thread-shared counts (atomically) at arbitrary times: an
+   atomic +1 interleaved with the marker's plain store can leave a persistent object with count 1 (later freed) or lose
+   the marker's store. v2: the release thread holds `g_defer_pause` exclusively while it processes a batch and yields it
+   (every 4096 objects) whenever a marker is waiting; every `lean_mark_persistent` entry point holds it shared for the
+   whole walk (its parallel helpers run under the caller's hold). */
+static std::shared_mutex * g_defer_pause = nullptr;
+static std::atomic<int>    g_defer_markers_waiting{0};
+struct defer_marking_guard {
+    std::shared_lock<std::shared_mutex> m_lock;
+    defer_marking_guard() {
+        if (g_defer_pause == nullptr) return;
+        g_defer_markers_waiting.fetch_add(1, std::memory_order_relaxed);
+        m_lock = std::shared_lock<std::shared_mutex>(*g_defer_pause);
+        g_defer_markers_waiting.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
 static bool g_defer_rt_alive = true;
 static void defer_release(object * o) {
     uint8 tag = lean_ptr_tag(o);
@@ -726,6 +744,7 @@ static void defer_worker_main() {
         uint64_t n = 0, owned_st = 0;
         bool stopped = false;
         size_t next_ref = 0;
+        std::unique_lock<std::shared_mutex> pause(*g_defer_pause);  // no persistent-marking walk runs meanwhile
         stack.clear(); grace.clear();
         // the handed-over worklist: owned since before the handoff (the queue mutex orders the owner's accesses first)
         for (object * todo = b.m_todo; todo != nullptr; ) stack.push_back((uintptr_t)pop_back(todo));
@@ -747,7 +766,10 @@ static void defer_worker_main() {
             } else {
                 defer_release(o);
             }
-            if ((++n & 4095) == 0 && g_defer_stop.load(std::memory_order_relaxed)) { stopped = true; break; }
+            if ((++n & 4095) == 0) {
+                if (g_defer_stop.load(std::memory_order_relaxed)) { stopped = true; break; }
+                if (g_defer_markers_waiting.load(std::memory_order_relaxed) > 0) { pause.unlock(); pause.lock(); }
+            }
         }
         if (!stopped && !grace.empty()) { defer_grace_barrier(); for (object * g : grace) defer_release(g); }
         grace.clear();
@@ -901,6 +923,7 @@ __attribute__((noinline)) static bool defer_handoff(object * & todo) {
 static void initialize_deferred_free() {
     g_defer_mutex = new std::mutex();
     g_defer_rt_mutex = new std::shared_mutex();
+    g_defer_pause = new std::shared_mutex();
     g_defer_cv = new std::condition_variable();
     g_defer_idle_cv = new std::condition_variable();
     g_defer_queue = new std::deque<deferred_batch>();
@@ -917,6 +940,7 @@ static void initialize_deferred_free() {
 extern "C" LEAN_EXPORT void lean_deferred_free_drain() {}
 extern "C" LEAN_EXPORT void lean_deferred_free_barrier() {}
 extern "C" LEAN_EXPORT void lean_deferred_free_runtime_dying() {}
+struct defer_marking_guard {};
 extern "C" LEAN_EXPORT bool lean_dec_refs_deferred(lean_object **, size_t, void (*)(void *), void *) { return false; }
 static void initialize_deferred_free() {}
 #endif
@@ -1258,6 +1282,7 @@ static bool mark_persistent_debug() {
 }
 
 extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
+    defer_marking_guard defer_guard;  // lean-perf (CJ): see `g_defer_pause`
     unsigned num_threads = mark_persistent_num_threads();
     bool dbg = mark_persistent_debug();
     auto t0 = std::chrono::steady_clock::now();
@@ -1861,6 +1886,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_io_get_num_std_workers() {
    use inside tasks (the result is then neither marked MT on task completion nor walked again by the
    final `markPersistent` of the environment). */
 extern "C" LEAN_EXPORT lean_obj_res lean_runtime_mark_persistent_seq(lean_obj_arg a) {
+    defer_marking_guard defer_guard;  // lean-perf (CJ): see `g_defer_pause`
     mark_persistent_seq(a);
     return a;
 }
