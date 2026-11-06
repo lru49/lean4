@@ -1242,6 +1242,9 @@ def Module.maybePrestart (mod : Module) : FetchM Unit := do
   if input.header.isModule then return
   let imps := input.imports.filterMap (·.module?)
   if imps.isEmpty then return
+  -- a module that imports itself: leave the error to the stock path (fetching its own export
+  -- info here would report a build cycle instead of "module imports itself")
+  if imps.any (·.name == mod.name) then return
   let jobs ← imps.mapM (·.fetchExportInfo)
   let presetups ← imps.mapM (·.presetup.fetch)
   let leanPath ← getLeanPath
