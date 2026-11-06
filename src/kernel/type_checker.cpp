@@ -71,6 +71,24 @@ void type_checker::state::retarget(environment const & env) {
        would accept. Everything else is a function of the environment and of this state's own fvars. */
     m_infer_type[0].clear();
     m_failure.clear();
+    m_unmarked_pairs.clear();  // empty anyway: `commit` drained it before the state entered the pool
+}
+
+/* lean-perf (race #2 fix): the caches of a checker hold single-threaded (ST) objects created on the checking thread
+   (whnf/infer/unfold results, instantiated terms), some of them also referenced by that thread's own data (its
+   thread-local kernel caches, the terms it still holds). The pool hands the state to whichever thread checks against
+   the same environment next and destroys evicted states on the putting thread: without this marking, two threads
+   would then update the same counts with plain (non-atomic) arithmetic, lose an update, and free an object that is
+   still referenced (cores: mimalloc free-list corruption long after the check, e.g. in a linter). Marking is done
+   here, on the owning thread, before the pool's mutex publishes the state (release by `put`, acquire by `take`), so
+   every later count update on these objects is atomic. Only the entries inserted since the previous commit are walked
+   (`lean_mark_mt` stops at objects that are already thread-shared), so the cost is proportional to the new entries. */
+void type_checker::state::mark_new_mt() {
+    lean_mark_mt(m_env.raw());
+    m_infer_type[0].mark_new_mt(); m_infer_type[1].mark_new_mt();
+    m_whnf_core.mark_new_mt(); m_whnf.mark_new_mt(); m_unfold.mark_new_mt(); m_rec_rhs.mark_new_mt();
+    for (lean_object * o : m_unmarked_pairs) lean_mark_mt(o);
+    m_unmarked_pairs.clear();
 }
 
 /* Process-wide pool of kernel states, keyed by the kernel environment object a state is valid for.
@@ -161,6 +179,8 @@ void type_checker::pooled_state::commit(environment const & in_env, environment 
         return;
     if (m_st->num_entries() > g_pool_max_entries)
         return;
+    m_st->mark_new_mt();
+    lean_mark_mt(in_env.raw()); lean_mark_mt(out_env.raw());  // the pool keeps references to its keys
     g_kernel_state_pool->put(m_st, in_env, out_env, g_pool_slots);
 }
 
@@ -1074,10 +1094,9 @@ bool type_checker::failed_before(expr const & t, expr const & s) const {
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
-    if (hash(t) <= hash(s))
-        m_st->m_failure.insert(mk_pair(t, s));
-    else
-        m_st->m_failure.insert(mk_pair(s, t));
+    // lean-perf (race #2): log new pairs for `state::mark_new_mt`
+    bool ins = hash(t) <= hash(s) ? m_st->m_failure.insert(mk_pair(t, s)).second : m_st->m_failure.insert(mk_pair(s, t)).second;
+    if (ins) { m_st->m_unmarked_pairs.push_back(t.raw()); m_st->m_unmarked_pairs.push_back(s.raw()); }
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
@@ -1093,10 +1112,9 @@ bool type_checker::succeeded_before(expr const & t, expr const & s) const {
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
-    if (hash(t) <= hash(s))
-        m_st->m_success.insert(mk_pair(t, s));
-    else
-        m_st->m_success.insert(mk_pair(s, t));
+    // lean-perf (race #2): log new pairs for `state::mark_new_mt`
+    bool ins = hash(t) <= hash(s) ? m_st->m_success.insert(mk_pair(t, s)).second : m_st->m_success.insert(mk_pair(s, t)).second;
+    if (ins) { m_st->m_unmarked_pairs.push_back(t.raw()); m_st->m_unmarked_pairs.push_back(s.raw()); }
 }
 
 /**
