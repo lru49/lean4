@@ -1223,11 +1223,26 @@ def Module.buildLean
         HeaderSnapshot.plan (mod.pkg.buildDir / "headers") srcText setup importHash args
           (← getLean) (← getLeanInstall).githash #[("LEAN_PATH", some leanPath.toString)]
           (allowSave := (← IO.getEnv "LAKE_HEADER_SNAPSHOT_BUILD_SAVES") == some "1")
+          (inlineTag? := some (Hash.ofString mod.name.toString).hex)
       | .error _ => pure {}
     | none => pure {}
   hsnap.startSave
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts (args ++ hsnap.loadArgs)
-    leanPath (← getLean)
+  let logPos ← getLogPos
+  try
+    compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts
+      (args ++ hsnap.loadArgs ++ hsnap.inlineArgs) leanPath (← getLean)
+  catch e =>
+    hsnap.publishInline false
+    throw e
+  if hsnap.inline?.isSome then
+    -- a message about the header would be replayed with this module's file name by every loader
+    let hdrLines := match (← (IO.FS.readFile presetup.srcFile).toBaseIO) with
+      | .ok src => (HeaderSnapshot.headerPrefix? src).map HeaderSnapshot.lineCount |>.getD 0
+      | .error _ => 0
+    let pfx := s!"{mkRelPathString relSrcFile}:"
+    let hdrMsg := (← getLog).takeFrom logPos |>.any fun e =>
+      (HeaderSnapshot.messageLine? e.message pfx).any (· ≤ hdrLines)
+    hsnap.publishInline (!hdrMsg)
   mod.computeArtifacts setup.isModule presetup.postponeCompile
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
