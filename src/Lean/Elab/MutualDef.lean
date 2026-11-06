@@ -7,6 +7,7 @@ module
 prelude
 public import Lean.Elab.Deriving.Basic
 public import Lean.Elab.PreDefinition.Main
+public import Lean.Elab.SpecStore
 import Lean.Elab.ErrorUtils
 public section
 namespace Lean.Elab
@@ -1242,6 +1243,9 @@ where
           -- holes in theorem types is not a fatal error, but it does make parallelism impossible
           !headers[0]!.type.hasMVar then
         elabAsync headers[0]! view declId
+      else if view.kind.isExample && (← SpecStore.isOn) then
+        -- lean-perf (DT2): speculative elaboration across a module boundary (docs/levers/L-dt2-spec.md)
+        specExample view headers[0]!
       else if Elab.async.get (← getOptions) && view.kind.isExample && !Elab.inServer.get (← getOptions) &&
           !deprecated.oldSectionVars.get (← getOptions) && view.modifiers.attrs.isEmpty &&
           !headers[0]!.type.hasMVar && (← isProp headers[0]!.type) then
@@ -1300,6 +1304,77 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
           let ctx ← CommandContextInfo.save
           infoPromise.resolve <| .context (.commandCtx ctx) <| .node info (← getInfoTrees)
     Core.logSnapshotTask { stx? := none, task := (← BaseIO.asTask (act ())), cancelTk? := cancelTk }
+  /-- lean-perf (DT2): record (speculation thread) or replay (real run) a `Prop` example; see `Lean.Elab.SpecStore`. -/
+  specExample (view : DefView) (header : DefViewElabHeader) : TermElabM Unit := do
+    let eligible := view.modifiers.attrs.isEmpty && !header.type.hasMVar && (← isProp header.type)
+    let dcEligible := eligible && Elab.async.get (← getOptions) && !Elab.inServer.get (← getOptions) &&
+      !deprecated.oldSectionVars.get (← getOptions)
+    let fallback : TermElabM Unit := if dcEligible then elabExampleAsync header else elabSync #[header]
+    unless eligible do return ← fallback
+    let mode ← SpecStore.currentMode
+    if mode == .off then return ← fallback
+    let k := SpecStore.key view.ref
+    let s0 ← getThe Core.State
+    -- the closed statement, computed without consuming fresh names (Meta may create temporary fvars;
+    -- compiled code embeds the fresh-name counter, so the real run must consume exactly as before)
+    let type ← instantiateMVars header.type
+    let closed ← mkForallFVars (← getLCtx).getFVars type
+    modifyThe Core.State fun s => { s with ngen := s0.ngen, nextMacroScope := s0.nextMacroScope, auxDeclNGen := s0.auxDeclNGen }
+    match mode with
+    | .record =>
+      let treesBefore := s0.infoState.trees.size
+      let snapsBefore := s0.snapshotTasks.size
+      fallback
+      let s1 ← getThe Core.State
+      let trees := s1.infoState.trees.toArray.extract treesBefore s1.infoState.trees.size
+      let snaps := s1.snapshotTasks.extract snapsBefore s1.snapshotTasks.size
+      let mut holeTask? : Option (Task InfoTree) := none
+      if dcEligible then
+        if let some (.hole id) := trees.back? then
+          holeTask? := s1.infoState.lazyAssignment.find? id
+      SpecStore.setPending k {
+        closedType := closed, opts := (← getOptions), ns := (← getCurrNamespace), openDecls := (← getOpenDecls)
+        levelNames := (← getLevelNames), async := dcEligible
+        ngenBefore := s0.ngen, ngenAfter := s1.ngen, msBefore := s0.nextMacroScope, msAfter := s1.nextMacroScope
+        dngBefore := s0.auxDeclNGen, dngAfter := s1.auxDeclNGen
+        trees := if dcEligible then #[] else trees
+        holeTask?, snapTask? := if dcEligible then snaps.back?.map (·.task) else none }
+    | .consume =>
+      let some r ← SpecStore.lookup k | fallback
+      let reason? : Option String ← do
+        if !r.closedType.equal closed then pure (some "statement")
+        else if r.async != dcEligible then pure (some "path")
+        else if r.opts != (← getOptions) || r.ns != (← getCurrNamespace) || r.openDecls != (← getOpenDecls) ||
+            r.levelNames != (← getLevelNames) then pure (some "scope")
+        else if !(r.dngBefore.namePrefix == s0.auxDeclNGen.namePrefix && r.dngBefore.idx == s0.auxDeclNGen.idx &&
+            r.dngBefore.parentIdxs == s0.auxDeclNGen.parentIdxs) then pure (some "auxDeclNGen")
+        else if r.ngenBefore.idx > r.ngenAfter.idx || r.msBefore > r.msAfter then pure (some "counters")
+        else if r.async && (r.holeTask?.isNone || r.snapTask?.isNone) then pure (some "no task result")
+        else pure (SpecStore.validate (← SpecStore.deltaInfo (← getEnv)) r)
+      if let some why := reason? then
+        SpecStore.noteReject why
+        return ← fallback
+      if r.async then
+        -- the main-thread steps of `elabExampleAsync`, with the recorded task results
+        let infoHole ← mkFreshMVarId
+        let infoPromise ← IO.Promise.new
+        modifyInfoState fun s => { s with
+          trees := s.trees.push <| .hole infoHole
+          lazyAssignment := s.lazyAssignment.insert infoHole <| infoPromise.resultD default
+        }
+        infoPromise.resolve (← IO.wait r.holeTask?.get!)
+        Core.logSnapshotTask { stx? := none, task := .pure (← IO.wait r.snapTask?.get!), cancelTk? := none }
+      else
+        modifyThe Core.State fun s => { s with
+          infoState := { s.infoState with trees := r.trees.foldl (·.push ·) s.infoState.trees } }
+      -- counters: exactly what the elaboration consumed on this thread (sync: the proof's fresh names
+      -- and macro scopes; async: the info hole, `wrapAsync`'s child generators)
+      modifyThe Core.State fun s => { s with
+        ngen := { s.ngen with idx := s0.ngen.idx + (r.ngenAfter.idx - r.ngenBefore.idx) }
+        nextMacroScope := s0.nextMacroScope + (r.msAfter - r.msBefore)
+        auxDeclNGen := r.dngAfter }
+      SpecStore.noteCommit
+    | .off => fallback
   elabAsync header view declId := do
     assert! view.kind.isTheorem
     let env ← getEnv

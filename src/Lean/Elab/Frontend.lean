@@ -14,6 +14,8 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.Elab.SpecStore  -- lean-perf (DT2): speculation store
+import Lean.Meta.Instances
 
 public section
 
@@ -466,3 +468,207 @@ def runFrontend
     incrHeaderSaveFileName?
 
 end Lean.Elab
+
+
+/-!
+lean-perf (lane DT2): the speculation loop of a pre-started `lean` (see `Lean.Elab.SpecStore`): called by
+the `LEAN_PRESTART_STDIN` driver (`Lean.Shell.prestartMain`) with the environment of the ready imports
+right after the pre-import (`start`) and when the last late import is ready (`stop`).
+-/
+namespace Lean.Elab.Speculation
+open Lean.Elab.Command (State)
+
+private def msgsEmpty (log : MessageLog) : Bool :=
+  log.reportedPlusUnreported.size == 0
+
+private partial def treeClean (t : Language.SnapshotTree) : BaseIO Bool := do
+  unless msgsEmpty t.element.diagnostics.msgLog do return false
+  for c in t.children do
+    unless ← treeClean (← IO.wait c.task) do return false
+  return true
+
+private def finishCommand (clean : Bool) : BaseIO Unit := do
+  let log ← SpecRec.logRef.modifyGet fun l => (l, { loop := true })
+  let queries ← Lean.Meta.specInstQueriesRef.modifyGet fun q => (q, #[])
+  SpecStore.stateRef.modify fun s =>
+    let s := { s with deadline := 0, cancelTk? := none }
+    match s.pending? with
+    | some (k, r) =>
+      if clean then
+        let r := { r with
+          misses := log.misses
+          nsMisses := log.nsMisses
+          exts := log.exts
+          added := log.added
+          instQueries := queries }
+        { s with
+          pending? := none
+          nRecorded := s.nRecorded + 1
+          records := s.records.insert k r }
+      else { s with pending? := none }
+    | none => s
+  let s ← SpecStore.stateRef.get
+  if let some (_, p) := s.inProgress? then
+    p.resolve ()
+  SpecStore.stateRef.modify fun s => { s with inProgress? := none }
+
+private def endLoop (why : String) : IO Unit := do
+  let now ← IO.monoMsNow
+  SpecStore.stateRef.modify fun s => { s with loopEnd := why, loopMs := now - s.loopMs }
+
+/-- The process-global registries a speculative command must not grow. -/
+private def registrySizes : IO (Array Nat) := do
+  return #[(← persistentEnvExtensionsRef.get).size, (← scopedEnvExtensionsRef.get).size,
+    (← attributeMapRef.get).size, (← getOptionDecls).size]
+
+/-- Commands whose elaboration has effects outside the environment (initializers, evaluation): the
+loop stops before them. -/
+private def isUnspeculatable (cmd : Syntax) : Bool :=
+  let k := cmd.getKind
+  k == ``Parser.Command.initialize || k == ``Parser.Command.eval || k == ``Parser.Command.evalBang ||
+  k == ``Parser.Command.exit || k == ``Parser.Command.import || k.toString.endsWith "runCmd" ||
+  k.toString.endsWith "runMeta" || k.toString.endsWith "runTac" || k.toString.endsWith "initialize"
+
+private partial def loop (ictx : Parser.InputContext) (pstate : Parser.ModuleParserState) (cmdState : State) : IO Unit := do
+  if (← SpecStore.stateRef.get).stop then return ← endLoop "stop"
+  let scope := cmdState.scopes.head!
+  let pmctx := { env := cmdState.env, options := scope.opts, currNamespace := scope.currNamespace, openDecls := scope.openDecls }
+  -- the parse is part of the command's read set (parser tables, notation)
+  SpecRec.logRef.set { active := true, loop := true }
+  Lean.Meta.specInstQueriesRef.set #[]
+  let (cmd, ps, messages) ← pure (Parser.parseCommand ictx pmctx pstate cmdState.messages)
+  if Parser.isTerminalCommand cmd then
+    SpecRec.logRef.set { loop := true }
+    return ← endLoop "end of file"
+  if isUnspeculatable cmd then
+    SpecRec.logRef.set { loop := true }
+    return ← endLoop s!"unspeculatable command {cmd.getKind}"
+  SpecStore.stateRef.modify fun s => { s with nCmds := s.nCmds + 1 }
+  let tk ← IO.CancelToken.new
+  let p ← IO.Promise.new
+  let now ← IO.monoMsNow
+  SpecStore.stateRef.modify fun s => { s with
+    inProgress? := some (SpecStore.key cmd, p)
+    cancelTk? := some tk
+    deadline := now + s.budgetMs
+    pending? := none }
+  let cmdCtx : Command.Context := {
+    cmdPos := pstate.pos
+    fileName := ictx.fileName
+    fileMap := ictx.fileMap
+    snap? := none
+    cancelTk? := some tk }
+  -- the command runs on an explicit state ref, so that its state (and its tasks) are reachable even
+  -- when an exception escapes: `Command.tryCatch` rethrows interrupts, so the cancel token set by
+  -- `stop` or the budget surfaces here as an error
+  let stRef ← IO.mkRef { cmdState with messages }
+  let r ← EIO.toIO' (Command.elabCommandTopLevel cmd cmdCtx stRef)
+  let s ← stRef.get
+  let stopped := (← SpecStore.stateRef.get).stop
+  let failed := r matches .error _
+  -- `stop` (the late imports are ready), the budget or an error ended this command: its tasks are
+  -- cancelled, and everything is awaited before the real run proceeds (nothing speculative may run
+  -- concurrently with the real elaboration: the olean is only identical without overlap)
+  if stopped || failed then
+    for t in s.snapshotTasks do
+      if let some tk := t.cancelTk? then tk.set
+  let mut clean := !failed
+  for t in s.snapshotTasks do
+    let tree ← IO.wait t.task
+    unless ← treeClean tree do clean := false
+  unless msgsEmpty s.messages do clean := false
+  finishCommand (clean && !stopped)
+  -- a command that registered something process-wide taints the process (see `SpecStore.State.tainted`)
+  let sizes ← registrySizes
+  if sizes != (← SpecStore.stateRef.get).registrySizes then
+    SpecStore.stateRef.modify fun s => { s with tainted := true }
+    return ← endLoop s!"tainted: registries grew {(← SpecStore.stateRef.get).registrySizes} -> {sizes}"
+  match r with
+  | .error e =>
+    if e.isInterrupt then
+      endLoop "interrupted"
+    else
+      let n := (← SpecStore.stateRef.get).nCmds
+      let msg ← e.toMessageData.toString
+      endLoop s!"error at command {n}: {msg}"
+  | .ok _ =>
+    if stopped then return ← endLoop "stop"
+    loop ictx ps { s with messages := {}, snapshotTasks := #[], infoState := { s.infoState with trees := {} } }
+
+private partial def watchdog : IO Unit := do
+  IO.sleep 50
+  let s ← SpecStore.stateRef.get
+  if s.mode == .off then return
+  if s.deadline != 0 && (← IO.monoMsNow) > s.deadline then
+    if let some tk := s.cancelTk? then tk.set
+  if s.mode == .record then watchdog
+
+/-- Starts the speculative elaboration of `fileName` in `env` (the environment of the ready imports,
+main module not yet set) on a dedicated thread; returns at once. -/
+def start (env : Environment) (fileName : String) (opts : Options) (mainModuleName : Name) : IO Unit := do
+  let contents ← IO.FS.readFile fileName
+  let inputCtx := Parser.mkInputContext contents fileName
+  let (_, parserState, msgs) ← Parser.parseHeader inputCtx
+  if msgs.hasErrors then return
+  let env := env.setMainModule mainModuleName |>.setRecordingDeps true
+  let cmdState := Command.mkState env {} opts
+  let cmdState := { cmdState with infoState := { enabled := true }, ngen := { namePrefix := `_spec } }
+  let debug := (← IO.getEnv "LEAN_PRESTART_DEBUG").isSome
+  let registrySizes ← registrySizes
+  SpecStore.stateRef.modify fun s => { s with mode := .record, env0Modules := env.header.moduleNames, debug, registrySizes }
+  let _ ← IO.asTask (prio := .dedicated) do
+    SpecStore.stateRef.modify fun s => { s with specTid := 0 }
+    let tid ← IO.getTID
+    SpecStore.stateRef.modify fun s => { s with specTid := tid }
+    SpecRec.logRef.set { loop := true }
+    let t0 ← IO.monoMsNow
+    SpecStore.stateRef.modify fun s => { s with loopMs := t0 }
+    try loop inputCtx parserState cmdState catch e => endLoop s!"exception: {e}"
+    SpecRec.logRef.set {}
+    SpecStore.stateRef.modify fun s => { s with mode := .consume, specTid := 0 }
+  let _ ← IO.asTask (prio := .dedicated) watchdog
+  return
+
+/-- The late imports are ready: no further speculative command is started (the current one finishes
+within its budget; the real run waits for it only if it reaches that command). -/
+inductive StopResult where
+  /-- nothing was elaborated speculatively: the held import may be extended -/
+  | extend
+  /-- commands were elaborated in the pre-imported environment: `importModulesExtend` requires that
+  nothing elaborated since the held import (it reuses its extension slots: a scoped-extension slot
+  of the extended environment held a scalar, SIGSEGV at the first `namespace`), and a second
+  `importModules (loadExts := true)` in the same process is refused (initializers would run twice),
+  so until the extend tolerates elaboration between the held import and the extension, the caller
+  must run a fresh plain process (the records are lost: the lever cannot pay yet) -/
+  | plainInProcess
+  /-- a speculative command registered something process-wide: only a fresh process is exact -/
+  | freshProcess
+  deriving BEq, Repr
+
+/-- Joins the speculation and says how the caller must continue (see `StopResult`). -/
+def stop : IO StopResult := do
+  let s ← SpecStore.stateRef.modifyGet fun s => (s, { s with stop := true })
+  if let some tk := s.cancelTk? then tk.set
+  -- join: the real run must not overlap any speculative work (see `loop`)
+  let t0 ← IO.monoMsNow
+  while (← SpecStore.stateRef.get).mode == .record do
+    IO.sleep 2
+  let t1 ← IO.monoMsNow
+  let s ← SpecStore.stateRef.modifyGet fun s => (s, { s with joinMs := t1 - t0 })
+  if s.tainted then
+    SpecStore.stateRef.modify fun s => { s with mode := .off }
+    if s.debug then IO.eprintln s!"[spec] loop: {s.nCmds} commands, {s.loopEnd}: fresh plain process"
+    return .freshProcess
+  if s.nCmds > 0 then
+    SpecStore.stateRef.modify fun s => { s with mode := .off }
+    if s.debug then IO.eprintln s!"[spec] loop: {s.nCmds} commands, {s.loopEnd}: fresh plain process (extend after elaboration unsupported)"
+    return .freshProcess
+  return .extend
+
+/-- Debug summary (only with `LEAN_PRESTART_DEBUG`). -/
+def report : IO Unit := do
+  let s ← SpecStore.stateRef.get
+  if s.debug then
+    IO.eprintln s!"[spec] loop: {s.nCmds} commands in {s.loopMs} ms, ended by {s.loopEnd}, join {s.joinMs} ms; recorded {s.nRecorded}, committed {s.nCommitted}, rejected {s.nRejected} {s.rejections}"
+
+end Lean.Elab.Speculation
