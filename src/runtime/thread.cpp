@@ -38,6 +38,32 @@ Author: Leonardo de Moura
 #endif
 
 namespace lean {
+#if defined(LEAN_MULTI_THREAD)
+unsigned hardware_concurrency() {
+#if defined(__linux__)
+    /* lean-perf (affinity-aware default pool, OPT-IN): `std::thread::hardware_concurrency()` counts every online CPU
+       and ignores the affinity mask, so under `taskset -c 0-31` on a 64-thread host the default pool (`lean` without
+       `-j`, LEAN_NUM_THREADS unset) has 64 workers on 32 usable CPUs. LEAN_HW_CONCURRENCY_HONOR_AFFINITY=1 makes it
+       count the mask instead. Default off: in a build where many lean processes run at once, the 2:1 oversubscription
+       fills the waits that a pool sized to the mask leaves idle (measured: 32 workers cost ~0.7 % structural wall). */
+    static unsigned const g_n = []() {
+        unsigned n = 0;
+        char const * e = std::getenv("LEAN_HW_CONCURRENCY_HONOR_AFFINITY");
+        if (e && e[0] == '1') {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+                n = CPU_COUNT(&set);
+        }
+        if (n == 0) n = std::thread::hardware_concurrency();
+        return n == 0 ? 1u : n;
+    }();
+    return g_n;
+#else
+    return std::thread::hardware_concurrency();
+#endif
+}
+#endif
 using runnable = std::function<void()>;
 
 extern "C" LEAN_EXPORT void lean_initialize_thread() {
