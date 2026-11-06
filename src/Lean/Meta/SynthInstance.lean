@@ -213,6 +213,11 @@ def getInstances (type : Expr) : MetaM (Array Instance) := do
     | none   => throwError "type class instance expected{indentExpr type}"
     | some className =>
       let globalInstances ← getGlobalInstancesIndex
+      -- lean-perf (DT2): the query's key path is part of the read set of a speculative command
+      if (← getEnv).isRecordingDeps then
+        if (← SpecRec.logRef.get).active then
+          let keys ← DiscrTree.mkPath type
+          specInstQueriesRef.modify (·.push keys)
       let result ← globalInstances.getUnify type
       -- Using insertion sort because it is stable and the array `result` should be mostly sorted.
       -- Most instances have default priority.

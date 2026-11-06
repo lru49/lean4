@@ -32,6 +32,78 @@ import Std.Sync.Mutex -- lean-perf (L01c): the region-prefetch map
 public section
 
 /-!
+lean-perf (lane DT2): read-set recorder for speculative elaboration (docs/levers/L-dt2-spec.md).
+A speculative run of a module's commands in the environment without its late imports records, per command, the constant names it
+looked up and did not find, the namespaces it queried and did not find, the environment extensions whose state it read and the
+constants it added. `Environment.isRecordingDeps` on the speculative environment switches the hooks on (the real run never sets it
+outside type class resolution, so the hooks cost one branch there). The log is a process-global ref reached only from natively
+compiled code (stage0 rule, L05 precedent); the recording functions are pure to their callers and their results are used, so the
+compiler keeps the calls.
+-/
+namespace Lean.SpecRec
+
+structure Log where
+  /-- constant lookups that found nothing (name resolution probes, auxiliary-name probes, autoImplicit fallbacks) -/
+  misses   : Array Name := #[]
+  /-- namespace queries that found nothing -/
+  nsMisses : Array Name := #[]
+  /-- names of the environment extensions whose state was read -/
+  exts     : Array Name := #[]
+  /-- bitmap over `EnvExtension.idx` for the deduplication of `exts` -/
+  extSeen  : Array Bool := #[]
+  /-- constants added (`addDecl`) or realized -/
+  added    : Array Name := #[]
+  /-- recording is on: set by the speculation loop for the duration of one command -/
+  active   : Bool := false
+  /-- the speculation loop runs: extension reads on the recording environment are allowed (logged only while `active`) -/
+  loop     : Bool := false
+  deriving Inhabited
+
+builtin_initialize logRef : IO.Ref Log ← IO.mkRef {}
+
+@[noinline] private unsafe def missNoneUnsafe {α : Type} (n : Name) : Option α :=
+  unsafeBaseIO do
+    logRef.modify fun l => if l.active then { l with misses := l.misses.push n } else l
+    return none
+/-- Records the miss of `n` and returns `none`. -/
+@[implemented_by missNoneUnsafe] def missNone {α : Type} (_n : Name) : Option α := none
+
+@[noinline] private unsafe def missFalseUnsafe (n : Name) : Bool :=
+  unsafeBaseIO do
+    logRef.modify fun l => if l.active then { l with misses := l.misses.push n } else l
+    return false
+/-- Records the miss of `n` and returns `false`. -/
+@[implemented_by missFalseUnsafe] def missFalse (_n : Name) : Bool := false
+
+@[noinline] private unsafe def nsMissFalseUnsafe (n : Name) : Bool :=
+  unsafeBaseIO do
+    logRef.modify fun l => if l.active then { l with nsMisses := l.nsMisses.push n } else l
+    return false
+/-- Records the namespace miss of `n` and returns `false`. -/
+@[implemented_by nsMissFalseUnsafe] def nsMissFalse (_n : Name) : Bool := false
+
+@[noinline] private unsafe def noteExtReadUnsafe (name : Name) (idx : Nat) : Bool :=
+  unsafeBaseIO do
+    let l ← logRef.get
+    if !l.active then
+      return l.loop
+    if h : idx < l.extSeen.size then
+      if l.extSeen[idx] then
+        return true
+    logRef.modify fun l =>
+      let seen := if idx < l.extSeen.size then l.extSeen else l.extSeen ++ Array.replicate (idx + 1 - l.extSeen.size) false
+      { l with exts := l.exts.push name, extSeen := seen.set! idx true }
+    return true
+/-- Records a read of the extension `name` (index `idx`) when the recorder is active; returns whether the read is allowed (recorder active or speculation loop running). -/
+@[implemented_by noteExtReadUnsafe] def noteExtRead (_name : Name) (_idx : Nat) : Bool := false
+
+/-- Records constants added or realized by the recorded command. -/
+def noteAdded (ns : List Name) : BaseIO Unit :=
+  logRef.modify fun l => if l.active then { l with added := ns.foldl (·.push ·) l.added } else l
+
+end Lean.SpecRec
+
+/-!
 # Note [Environment Branches]
 
 The kernel environment type `Lean.Kernel.Environment` enforces a linear order on the addition of
@@ -106,6 +178,7 @@ instance : Nonempty EnvExtensionEntry := EnvExtensionEntrySpec.property
 
 /-- Content of a .olean file.
    We use `compact.cpp` to generate the image of this object in disk. -/
+
 structure ModuleData where
   /-- Participating in the module system? -/
   isModule        : Bool
@@ -943,12 +1016,16 @@ private opaque isReservedName (env : Environment) (name : Name) : Bool
 
 /-- `findAsync?` after `base` access -/
 private def findAsyncCore? (env : Environment) (n : Name) (skipRealize := false) :
-    Option AsyncConstantInfo := do
+    Option AsyncConstantInfo := Id.run do
   if let some c := env.findAsyncConst? n (skipRealize := skipRealize) then
     return c.constInfo
   -- Also query local kernel map eventually; this should only be needed on `ofKernelEnv` results as
   -- after importing, the `base` local map is and stays empty.
-  return .ofConstantInfo (← env.base.get env |>.constants.map₂.find? n)
+  match env.base.get env |>.constants.map₂.find? n with
+  | some c => return some (.ofConstantInfo c)
+  | none =>
+    -- lean-perf (DT2): a miss is part of the read set of a speculative command
+    if env.isRecordingDeps then return SpecRec.missNone n else return none
 
 /-- Like `findAsyncCore?`; allocating tasks is (currently?) too costly to do always. -/
 private def findTaskCore (env : Environment) (n : Name) (skipRealize := false) :
@@ -1343,7 +1420,9 @@ Checks whether the given declaration is known on the current branch, in which ca
 not block.
 -/
 def containsOnBranch (env : Environment) (n : Name) : Bool :=
-  (env.asyncConsts.find? n |>.isSome) || (env.base.get env).constants.contains n
+  let r := (env.asyncConsts.find? n |>.isSome) || (env.base.get env).constants.contains n
+  -- lean-perf (DT2): auxiliary-name probes (`DeclNameGenerator.mkUniqueName`) are part of the read set
+  if !r && env.isRecordingDeps then SpecRec.missFalse n else r
 
 /--
 Returns whether `realizeConst forConst` callbacks can access `c` in the private scope, i.e. whether
@@ -1757,7 +1836,10 @@ different environment branches are reconciled.
 private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ)
     (env : Environment) (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous)
     (genRecorded := false) : σ := Id.run do
-  if env.isRecordingDeps && (if ext.isGenTracked then !genRecorded else !ext.logWrites) then
+  -- lean-perf (DT2): while a speculative command is recorded, every extension read is logged instead
+  -- of the panic below (which only concerns type class resolution's own recorder)
+  if env.isRecordingDeps && !SpecRec.noteExtRead ext.name ext.idx &&
+      (if ext.isGenTracked then !genRecorded else !ext.logWrites) then
     return panicUnrecordedRead ext
   -- safety: `ext`'s constructor is private, so we can assume the entry at `ext.idx` is of type `σ`
   match asyncMode with
@@ -3731,6 +3813,8 @@ deriving Nonempty, TypeName
 def realizeConst (env : Environment) (forConst : Name) (constName : Name)
     (realize : Environment → Options → BaseIO (Environment × Dynamic)) :
     IO (Environment × Task (Option Kernel.Exception) × Dynamic) := do
+  -- lean-perf (DT2): a realization is a write the speculative command depends on
+  if env.isRecordingDeps then SpecRec.noteAdded [constName]
   -- `realizeValue` checks this as well but can only name the key type in its error message
   unless env.areRealizationsEnabledForConst forConst do
     throw <| .userError s!"trying to realize `{constName}` but `enableRealizationsForConst` must \

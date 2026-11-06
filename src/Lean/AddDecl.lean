@@ -239,6 +239,8 @@ is true, exposes the declaration body, i.e. preserves the full representation in
 independently of `Environment.isExporting` and even for theorems.
 -/
 def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
+  -- lean-perf (DT2): the constants a speculative command adds are part of its record
+  if (← getEnv).isRecordingDeps then SpecRec.noteAdded decl.getNames
   addDeclCore decl forceExpose
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
