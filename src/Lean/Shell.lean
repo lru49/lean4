@@ -781,9 +781,19 @@ def prestartMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
     execPlain argv setupFile (complete setup arts)
   | .ok (some (env₁, s₁)) =>
     let t1 ← IO.monoNanosNow
+    -- lean-perf (DT2): speculative elaboration while waiting for the late imports (agreed with DY)
+    Elab.Speculation.start env₁ fileName res.opts setup.name
     let arts ← waitReady stdin budgetMs pending {}
+    let specRes ← Elab.Speculation.stop
     let t2 ← IO.monoNanosNow
     let full := complete setup arts
+    match specRes with
+    | .freshProcess => return ← execPlain argv setupFile full
+    | .plainInProcess =>
+      -- not reachable today (see `Elab.Speculation.StopResult.plainInProcess`): a second
+      -- `importModules (loadExts := true)` in this process is refused
+      return ← execPlain argv setupFile full
+    | .extend => pure ()
     -- (cleared by the pre-import's `withImporting`)
     unsafe enableInitializersExecution
     match (← (importModulesExtend s₁ header res.opts res.trustLevel full.importArts
@@ -794,6 +804,7 @@ def prestartMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
         IO.eprintln s!"[prestart] served: pre-import {(t1 - t0).toFloat / 1e9} s ({env₁.header.moduleNames.size} modules), \
           wait {(t2 - t1).toFloat / 1e9} s, extend {(t3 - t2).toFloat / 1e9} s ({env.header.moduleNames.size} modules)"
       let rc ← shellMainCore args opts (some env) (setupOverride? := some full)
+      Elab.Speculation.report
       if Internal.hasAddressSanitizer () then
         return rc
       IO.Process.exit rc.toUInt8
