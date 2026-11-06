@@ -15,7 +15,8 @@ for `--load-dynlib` / Lake's `precompileModules`. This file adds a cache lookup 
     /<githash>-<target>/bundles/<id>.manifest  "lean-native-bundle 2 <githash> <toolchain id>" then one line per module
                                                of S: "<st_dev> <st_ino> <size> <mtime_ns> <.olean path>"
 
-A bundle is produced by a populate step (compile the C that Lake already emits for every module, link
+Bundles are produced by `lake build`'s background populate job (src/lake/Lake/CLI/NativeCache.lean) or by
+tools/dj-native-populate.py; a bundle is produced by a populate step (compile the C that Lake already emits for every module, link
 the objects; S must be closed under imports, apart from modules of the toolchain itself). At the first
 `runModInit` of a process (all `.olean` files of the import have been read at that point), every
 manifest is checked: a bundle is usable iff EVERY module of S was imported by this process from the
@@ -44,9 +45,13 @@ import; the cmdline frontend and Lake's worker processes import once.
 #include <sys/stat.h>
 #include "library/native_cache.h"
 #include "githash.h"
+#include "runtime/object.h"
+#include "runtime/io.h"
 #if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN)
 #include <dirent.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <time.h>
 #define LEAN_NATIVE_CACHE_SUPPORTED 1
 #endif
 
@@ -218,6 +223,12 @@ void native_cache_load_once() {
         if (best_n == 0) return;
         if (void * h = dlopen(best.c_str(), RTLD_LAZY | RTLD_GLOBAL)) {
             (void)h;  // never closed: its code may be referenced until exit
+            // recency for the cache's LRU eviction: refresh the manifest's mtime at most once an hour
+            std::string man = best.substr(0, best.size() - 3) + ".manifest";
+            struct stat mst; struct timespec now;
+            if (stat(man.c_str(), &mst) == 0 && clock_gettime(CLOCK_REALTIME, &now) == 0 &&
+                now.tv_sec - static_cast<long long>(mst.st_mtime) > 3600)
+                utimensat(AT_FDCWD, man.c_str(), nullptr, 0);
             if (s.m_verbose) std::cerr << "[native-cache] loaded " << best << " (" << best_n << " modules)\n";
         } else if (s.m_verbose) {
             std::cerr << "[native-cache] dlopen failed: " << dlerror() << "\n";
@@ -247,10 +258,29 @@ bool native_cache_load_recorded_bundle(std::string const & path) {
 void native_cache_snapshot_loaded() {
     std::call_once(g_load_once, [] {});
 }
+
+/* Lake.NativeCache.fileKey (path : @& String) : IO String: the identity the loader checks */
+extern "C" LEAN_EXPORT obj_res lean_native_cache_file_key(b_obj_arg path, obj_arg) {
+    struct stat st;
+    if (stat(lean_string_cstr(path), &st) != 0)
+        return io_result_mk_error((std::string("native cache: cannot stat ") + lean_string_cstr(path)).c_str());
+#if defined(__APPLE__)
+    struct timespec const & mt = st.st_mtimespec;
+#else
+    struct timespec const & mt = st.st_mtim;
+#endif
+    std::string k = std::to_string(static_cast<unsigned long long>(st.st_dev)) + " " +
+        std::to_string(static_cast<unsigned long long>(st.st_ino)) + " " + std::to_string(static_cast<long long>(st.st_size)) + " " +
+        std::to_string(static_cast<long long>(mt.tv_sec) * 1000000000LL + mt.tv_nsec);
+    return io_result_mk_ok(lean_mk_string(k.c_str()));
+}
 #else
 void native_cache_note_olean(std::string const &, struct stat const &) {}
 void native_cache_load_once() {}
 bool native_cache_load_recorded_bundle(std::string const &) { return false; }
 void native_cache_snapshot_loaded() {}
+extern "C" LEAN_EXPORT obj_res lean_native_cache_file_key(b_obj_arg, obj_arg) {
+    return io_result_mk_error("native cache: not supported on this platform");
+}
 #endif
 }

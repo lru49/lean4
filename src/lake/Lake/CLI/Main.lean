@@ -32,6 +32,7 @@ import Lake.CLI.Translate
 import Lake.CLI.Serve
 public import Lake.CLI.BuiltinLint
 import Lake.CLI.Samply
+import Lake.CLI.NativeCache
 import Init.Data.String.Modify
 
 -- # CLI
@@ -997,6 +998,19 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
+  -- background, lowest-priority population of the native-code cache for dependency modules
+  -- (Lake/CLI/NativeCache.lean); waits for this build to exit, off with LEAN_NATIVE_CACHE=0
+  NativeCache.spawnPopulate ws.lakeEnv.lake.lake {
+    githash := ws.lakeEnv.lean.githash
+    cc := ws.lakeEnv.lean.cc.toString
+    ccFlags := #["-I", ws.lakeEnv.lean.includeDir.toString] ++ ws.lakeEnv.lean.ccFlags
+    -- no Lean libraries on the link line: the bundle's symbols resolve against the lean process that loads
+    -- it; only Lake's shared library (called by a few dependency modules) is recorded as needed
+    linkFlags := #["-Wl,--no-as-needed", ws.lakeEnv.lake.sharedLib.toString, s!"-Wl,-rpath,{ws.lakeEnv.lake.libDir}"]
+    leanLibDir := ws.lakeEnv.lean.leanLibDir.toString
+    includeDir := ws.lakeEnv.lean.includeDir.toString
+    rootIrDir := ws.root.irDir.toString
+  }
   ws.runBuild (buildSpecs specs) buildConfig
 
 protected def checkBuild : CliM PUnit := do
@@ -1298,6 +1312,12 @@ protected def exe : CliM PUnit := do
   let exeFile ← ws.runBuild exe.fetch (mkBuildConfig opts)
   exit <| ← (Lake.env exeFile.toString args.toArray).run <| mkLakeContext ws
 
+protected def nativeCachePopulate : CliM PUnit := do
+  let cfgFile ← takeArg "populate configuration file"
+  let cfg ← NativeCache.Config.load cfgFile
+  try IO.FS.removeFile cfgFile catch _ => pure ()
+  discard <| NativeCache.populate cfg (log' := fun s => IO.eprintln s)
+
 protected def samply : CliM PUnit := do
   processOptions lakeOption
   let opts ← getThe LakeOptions
@@ -1431,6 +1451,7 @@ def lakeCli : (cmd : String) → CliM PUnit
 | "env"                 => lake.env
 | "exe" | "exec"        => lake.exe
 | "samply"              => lake.samply
+| "native-cache-populate" => lake.nativeCachePopulate
 | "lean"                => lake.lean
 | "translate-config"    => lake.translateConfig
 | "reservoir-config"    => lake.reservoirConfig
