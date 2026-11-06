@@ -13,6 +13,7 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
+import Lake.Build.HeaderSnapshot
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -997,7 +998,10 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
-  ws.runBuild (buildSpecs specs) buildConfig
+  -- no background header-snapshot save of this build outlives it (see `Lake.HeaderSnapshot.reap`)
+  tryFinally (ws.runBuild (buildSpecs specs) buildConfig) do
+    for pkg in ws.packages do
+      HeaderSnapshot.reap (pkg.buildDir / "headers")
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
