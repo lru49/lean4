@@ -83,6 +83,12 @@ void type_checker::state::retarget(environment const & env) {
    here, on the owning thread, before the pool's mutex publishes the state (release by `put`, acquire by `take`), so
    every later count update on these objects is atomic. Only the entries inserted since the previous commit are walked
    (`lean_mark_mt` stops at objects that are already thread-shared), so the cost is proportional to the new entries. */
+void type_checker::state::drop_unmarked_log() {
+    m_infer_type[0].drop_unmarked_log(); m_infer_type[1].drop_unmarked_log();
+    m_whnf_core.drop_unmarked_log(); m_whnf.drop_unmarked_log(); m_unfold.drop_unmarked_log(); m_rec_rhs.drop_unmarked_log();
+    m_unmarked_pairs.clear();
+}
+
 void type_checker::state::mark_new_mt() {
     lean_mark_mt(m_env.raw());
     m_infer_type[0].mark_new_mt(); m_infer_type[1].mark_new_mt();
@@ -151,8 +157,21 @@ kernel_state_pool * g_kernel_state_pool = nullptr;
 size_t g_pool_slots       = 8;
 size_t g_pool_max_entries = 1u << 24;
 bool   g_pool_enabled     = true;
+/* lean-perf (race2fix, LEAN_KERNEL_CACHE_POOL_TLS=1): a pool per thread instead of the process-wide one. A state is then
+   reused only by the thread that produced it, so its single-threaded cache entries never cross a thread and need no
+   MT marking at all (the marking costs ~1.3 % wall on a kernel-heavy module); the price is a miss whenever the next
+   check of a chain lands on another task-manager worker. The per-thread pool is never freed (a few states per worker
+   thread, bounded by the slots). */
+bool   g_pool_tls         = false;
+LEAN_THREAD_PTR(kernel_state_pool, g_tls_pool);
+static kernel_state_pool * current_pool() {
+    if (!g_pool_tls) return g_kernel_state_pool;
+    if (!g_tls_pool) g_tls_pool = new kernel_state_pool();
+    return g_tls_pool;
+}
 void init_kernel_state_pool_config() {
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL")) g_pool_enabled = !(s[0] == '0' && s[1] == 0);
+    if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_TLS")) g_pool_tls = (s[0] == '1' && s[1] == 0);
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_MAX_ENTRIES")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0) g_pool_max_entries = v; }
     if (char const * s = getenv("LEAN_KERNEL_CACHE_POOL_SLOTS")) { char * end = nullptr; unsigned long long v = strtoull(s, &end, 10); if (end && *end == 0 && v > 0) g_pool_slots = v; }
 }
@@ -160,7 +179,7 @@ void init_kernel_state_pool_config() {
 
 type_checker::pooled_state::pooled_state(environment const & env, bool enabled):m_fresh(true) {
     if (enabled && g_pool_enabled && g_kernel_state_pool) {
-        m_st = g_kernel_state_pool->take(env);
+        m_st = current_pool()->take(env);
         if (m_st) {
             m_st->retarget(env);
             m_fresh = false;
@@ -179,9 +198,13 @@ void type_checker::pooled_state::commit(environment const & in_env, environment 
         return;
     if (m_st->num_entries() > g_pool_max_entries)
         return;
-    m_st->mark_new_mt();
-    lean_mark_mt(in_env.raw()); lean_mark_mt(out_env.raw());  // the pool keeps references to its keys
-    g_kernel_state_pool->put(m_st, in_env, out_env, g_pool_slots);
+    if (!g_pool_tls) {
+        m_st->mark_new_mt();
+        lean_mark_mt(in_env.raw()); lean_mark_mt(out_env.raw());  // the pool keeps references to its keys
+    } else {
+        m_st->drop_unmarked_log();
+    }
+    current_pool()->put(m_st, in_env, out_env, g_pool_slots);
 }
 
 /** \brief Make sure \c e "is" a sort, and return the corresponding sort.

@@ -82,6 +82,7 @@ public:
         for (lean_object * o : m_unmarked) lean_mark_mt(o);
         m_unmarked.clear();
     }
+    void drop_unmarked_log() { m_unmarked.clear(); }
     /** \brief Release every entry and the table (the next `insert` starts from the initial capacity again). */
     void clear() {
         if (m_tab == nullptr) return;
