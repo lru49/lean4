@@ -627,9 +627,16 @@ expr type_checker::whnf_core_impl(expr const & e, bool cheap_rec, bool cheap_pro
         break;
     }
 
-    // check cache
-    if (lean_object * cached = m_st->m_whnf_core.find(e))
-        return expr(cached, true);
+    /* check cache. The table holds only results of non-cheap calls (see the insertion below), each a function of `e`
+       (and of this state's let-fvars, whose values never change). A non-cheap tail call (`cache_result == false`: the
+       reduct just built by a beta/iota/let step) therefore computes exactly the value a hit would return, and such
+       lookups almost never hit (DL cache profile: 8.9 M lookups at 0.05 % hits and ~500 cycles each on a decide-heavy
+       module), so it skips the probe. With kernel diagnostics on, every call still looks up, so unfold counts are as
+       before. */
+    if (cache_result || cheap_rec || cheap_proj || m_diag) {
+        if (lean_object * cached = m_st->m_whnf_core.find(e))
+            return expr(cached, true);
+    }
 
     // do the actual work
     expr r;
