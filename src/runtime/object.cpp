@@ -3139,6 +3139,38 @@ extern "C" LEAN_EXPORT object * lean_array_push(obj_arg a, obj_arg v) {
 // =======================================
 // Name primitives
 
+// String equality for `Name.str` components, which are almost always short identifiers. Up to 16 bytes (the size
+// includes the terminating NUL) are compared as two masked 64-bit words instead of calling `memcmp` through the PLT.
+// Reading whole words is in bounds: every heap or compacted object occupies a multiple of 8 bytes
+// (`LEAN_OBJECT_SIZE_DELTA`), so the 8-byte words that cover the first `size` bytes of the character data lie inside the
+// string object; bytes past `size` are masked out, so their (unspecified) contents never affect the result.
+static inline bool lean_name_component_eq(b_lean_obj_arg s1, b_lean_obj_arg s2) {
+    if (s1 == s2)
+        return true;
+    size_t sz = lean_string_size(s1);
+    if (sz != lean_string_size(s2))
+        return false;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && !defined(__SANITIZE_ADDRESS__) && LEAN_OBJECT_SIZE_DELTA % 8 == 0
+    if (sz <= 16) {
+        char const * a = lean_string_cstr(s1);
+        char const * b = lean_string_cstr(s2);
+        uint64_t a0, b0;
+        memcpy(&a0, a, 8);
+        memcpy(&b0, b, 8);
+        if (sz <= 8) {
+            uint64_t m = sz == 8 ? ~(uint64_t)0 : (((uint64_t)1 << (8 * sz)) - 1);
+            return ((a0 ^ b0) & m) == 0;
+        }
+        uint64_t a1, b1;
+        memcpy(&a1, a + 8, 8);
+        memcpy(&b1, b + 8, 8);
+        uint64_t m = sz == 16 ? ~(uint64_t)0 : (((uint64_t)1 << (8 * (sz - 8))) - 1);
+        return (a0 ^ b0) == 0 && ((a1 ^ b1) & m) == 0;
+    }
+#endif
+    return lean_string_eq_cold(s1, s2);
+}
+
 // Component-by-component comparison, entered only when the two names are distinct objects with equal hashes.
 // Kept out of line so that the common exits of `lean_name_eq` (pointer equality, scalar/non-scalar or hash
 // mismatch) need no stack frame or callee-saved registers: the loop below calls `memcmp` / `mpz` compare and
@@ -3151,7 +3183,7 @@ __attribute__((noinline)) static uint8 lean_name_eq_components(b_lean_obj_arg n1
         if (lean_ptr_tag(n1) != lean_ptr_tag(n2))
             return false;
         if (lean_ptr_tag(n1) == 1) {
-            if (!lean_string_eq(lean_ctor_get(n1, 1), lean_ctor_get(n2, 1)))
+            if (!lean_name_component_eq(lean_ctor_get(n1, 1), lean_ctor_get(n2, 1)))
                 return false;
         } else {
             if (!lean_nat_eq(lean_ctor_get(n1, 1), lean_ctor_get(n2, 1)))
