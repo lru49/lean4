@@ -1389,6 +1389,34 @@ where
         (acc, seen) ← go c.aconstsGet acc seen
     return (acc, seen)
 
+/-
+The realization context also stores an environment (`setMainModule` stores the current one, whose
+own context points to the same map), so every nested context gets the fresh map as well.
+-/
+private partial def resetImportRealizationsCore (ref : IO.Ref (NameMap NonScalar))
+    (env : Environment) : Environment :=
+  match env.importRealizationCtx? with
+  | none => env
+  | some ctx =>
+    -- safety: `RealizationContext` is private
+    let inner : Environment := unsafe unsafeCast ctx.env
+    { env with importRealizationCtx? := some { ctx with
+        realizeMapRef := ref
+        env := unsafe unsafeCast (resetImportRealizationsCore ref inner) } }
+
+/--
+Returns a function that gives an environment a fresh, empty realization map for imported constants
+(the same new map for every environment it is applied to).
+
+The map lives in an `IO.Ref` that every environment derived from the post-import environment
+shares, so realizations performed while elaborating a module also show up in the post-import
+environment. A snapshot of the post-import state taken after elaboration (`--incr-header-save`
+on a full module) must not capture them: they hold tasks of unresolved promises, which block the
+compactor.
+-/
+def mkImportRealizationsReset : BaseIO (Environment → Environment) := do
+  return resetImportRealizationsCore (← IO.mkRef {})
+
 def setMainModule (env : Environment) (m : Name) : Environment := Id.run do
   let env := env.modifyCheckedAsync ({ · with
     header.mainModule := m
