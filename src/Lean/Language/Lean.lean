@@ -830,14 +830,41 @@ where
     let acc := f acc snap
     if let some next := snap.nextCmdSnap? then go next.get acc else acc
 
+/-- Applies `f` to every environment stored in the context nodes of an info tree. -/
+partial def _root_.Lean.Elab.InfoTree.mapEnvs (f : Environment → Environment) :
+    Elab.InfoTree → Elab.InfoTree
+  | .context (.commandCtx i) t =>
+    .context (.commandCtx { i with env := f i.env, cmdEnv? := i.cmdEnv?.map f }) (t.mapEnvs f)
+  | .context ctx t => .context ctx (t.mapEnvs f)
+  | .node i cs => .node i (cs.map (·.mapEnvs f))
+  | .hole m => .hole m
+
 /--
 Returns `snap` with all elaborated command data discarded, retaining only the imported
 environment from the header.
 -/
-def truncateToHeader (snap : InitialSnapshot) : InitialSnapshot := Id.run do
+def truncateToHeader (snap : InitialSnapshot) : BaseIO InitialSnapshot := do
   let some parsed := snap.result? | return snap
   let processed := parsed.processedSnap.get
   let some hps := processed.result? | return snap
+  -- The post-import environment shares its imported-constant realization map (an `IO.Ref`) with
+  -- everything elaborated after it; every copy of it kept in the header state (command state, info
+  -- trees) starts from one fresh, empty map instead, as after a fresh import (see
+  -- `Environment.mkImportRealizationsReset`).
+  let reset ← Environment.mkImportRealizationsReset
+  let resetLeaf (t : SnapshotTask SnapshotLeaf) : SnapshotTask SnapshotLeaf :=
+    let leaf := t.get
+    { t with task := .pure { leaf with infoTree? := leaf.infoTree?.map (Elab.InfoTree.mapEnvs reset ·) } }
+  let infoState := hps.cmdState.infoState
+  let hps := { hps with cmdState.env := reset hps.cmdState.env, cmdState.infoState := { infoState with
+    trees := infoState.trees.map (Elab.InfoTree.mapEnvs reset ·)
+    assignment := infoState.assignment.map (Elab.InfoTree.mapEnvs reset ·) } }
+  let processed := { processed with
+    infoTree? := processed.infoTree?.map (Elab.InfoTree.mapEnvs reset ·)
+    metaSnap := resetLeaf processed.metaSnap }
+  let snap := { snap with
+    infoTree? := snap.infoTree?.map (Elab.InfoTree.mapEnvs reset ·)
+    metaSnap := resetLeaf snap.metaSnap }
   -- Construct a synthetic terminal CommandParsedSnapshot whose cmdState is the
   -- initial post-import state, effectively representing "no commands elaborated".
   let resultSnap : CommandResultSnapshot := {
@@ -861,7 +888,7 @@ def truncateToHeader (snap : InitialSnapshot) : InitialSnapshot := Id.run do
   let newProcessed : HeaderProcessedSnapshot := { processed with
     result? := some { hps with
       firstCmdSnap := .finished none termCmd } }
-  { snap with
+  return { snap with
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
