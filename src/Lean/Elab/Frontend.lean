@@ -376,7 +376,7 @@ def runFrontend
 
   -- save header-only snapshot (skips elaborated command bodies)
   if let some incrFile := incrHeaderSaveFileName? then
-    saveSnap incrFile (Language.Lean.truncateToHeader snap)
+    saveSnap incrFile (← Language.Lean.truncateToHeader snap)
 
   -- stats should be displayed even if there are (non-import) errors
   if printStats then
